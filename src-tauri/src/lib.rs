@@ -2,7 +2,7 @@ mod commands;
 mod local_filesystem;
 
 use commands::AppState;
-use local_filesystem::{LocalFilesystem, LocalRoot};
+use local_filesystem::{LocalFilesystem, LocalRoot, LocationRole};
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -13,16 +13,55 @@ pub fn run() {
             let mut roots = vec![LocalRoot {
                 id: "home",
                 name: "Home",
+                role: LocationRole::Home,
                 path: paths.home_dir()?,
             }];
 
-            for (id, name, path) in [
-                ("desktop", "Desktop", paths.desktop_dir()),
-                ("documents", "Documents", paths.document_dir()),
-                ("downloads", "Downloads", paths.download_dir()),
+            let videos_name = if cfg!(target_os = "macos") {
+                "Movies"
+            } else {
+                "Videos"
+            };
+            for (id, name, role, path) in [
+                (
+                    "desktop",
+                    "Desktop",
+                    LocationRole::Desktop,
+                    paths.desktop_dir(),
+                ),
+                (
+                    "documents",
+                    "Documents",
+                    LocationRole::Documents,
+                    paths.document_dir(),
+                ),
+                (
+                    "downloads",
+                    "Downloads",
+                    LocationRole::Downloads,
+                    paths.download_dir(),
+                ),
+                (
+                    "pictures",
+                    "Pictures",
+                    LocationRole::Pictures,
+                    paths.picture_dir(),
+                ),
+                ("music", "Music", LocationRole::Music, paths.audio_dir()),
+                (
+                    "videos",
+                    videos_name,
+                    LocationRole::Videos,
+                    paths.video_dir(),
+                ),
             ] {
                 if let Ok(path) = path {
-                    roots.push(LocalRoot { id, name, path });
+                    roots.push(LocalRoot {
+                        id,
+                        name,
+                        role,
+                        path,
+                    });
                 }
             }
 

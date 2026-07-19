@@ -1,7 +1,13 @@
 <script lang="ts">
+  import DownloadIcon from "@lucide/svelte/icons/download";
+  import FileTextIcon from "@lucide/svelte/icons/file-text";
+  import FilmIcon from "@lucide/svelte/icons/film";
   import HardDriveIcon from "@lucide/svelte/icons/hard-drive";
   import HouseIcon from "@lucide/svelte/icons/house";
+  import ImagesIcon from "@lucide/svelte/icons/images";
   import LaptopIcon from "@lucide/svelte/icons/laptop";
+  import MonitorIcon from "@lucide/svelte/icons/monitor";
+  import Music2Icon from "@lucide/svelte/icons/music-2";
   import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
   import PanelLeftOpenIcon from "@lucide/svelte/icons/panel-left-open";
   import ServerIcon from "@lucide/svelte/icons/server";
@@ -10,15 +16,24 @@
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
   import * as Sheet from "$lib/components/ui/sheet";
+  import type { LocationRole } from "$lib/contracts/explorer";
   import { cn } from "$lib/utils";
 
   let { state }: { state: ExplorerState } = $props();
 
-  const iconFor = (kind: "local" | "volume" | "ssh") => {
-    if (kind === "ssh") return ServerIcon;
-    if (kind === "volume") return HardDriveIcon;
-    return HouseIcon;
-  };
+  const iconsByRole = {
+    home: HouseIcon,
+    desktop: MonitorIcon,
+    documents: FileTextIcon,
+    downloads: DownloadIcon,
+    pictures: ImagesIcon,
+    music: Music2Icon,
+    videos: FilmIcon,
+    volume: HardDriveIcon,
+    ssh: ServerIcon,
+  } satisfies Record<LocationRole, typeof HouseIcon>;
+
+  const iconFor = (role: LocationRole) => iconsByRole[role];
 </script>
 
 {#snippet navigation(compact: boolean)}
@@ -45,7 +60,7 @@
       {/if}
       <nav aria-label="Favorites" class="space-y-1">
         {#each state.locations.filter(({ kind }) => kind === "local") as location (location.id)}
-          {@const Icon = iconFor(location.kind)}
+          {@const Icon = iconFor(location.role)}
           <Button
             variant={state.activeLocation?.id === location.id
               ? "secondary"
@@ -71,7 +86,7 @@
       {/if}
       <nav aria-label="Mounted locations" class="space-y-1">
         {#each state.locations.filter(({ kind }) => kind === "volume") as location (location.id)}
-          {@const Icon = iconFor(location.kind)}
+          {@const Icon = iconFor(location.role)}
           <Button
             variant={state.activeLocation?.id === location.id
               ? "secondary"
@@ -98,7 +113,7 @@
       {/if}
       <nav aria-label="SSH locations" class="space-y-1">
         {#each state.locations.filter(({ kind }) => kind === "ssh") as location (location.id)}
-          {@const Icon = iconFor(location.kind)}
+          {@const Icon = iconFor(location.role)}
           <Button
             variant={state.activeLocation?.id === location.id
               ? "secondary"

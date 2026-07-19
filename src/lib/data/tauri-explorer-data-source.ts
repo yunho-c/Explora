@@ -7,6 +7,7 @@ import type {
   EntryKind,
   FileEntrySummary,
   LocationKind,
+  LocationRole,
   LocationStatus,
   LocationSummary,
   PreviewSummary,
@@ -34,6 +35,17 @@ const entryKinds = new Set<EntryKind>([
   "other",
 ]);
 const locationKinds = new Set<LocationKind>(["local", "volume", "ssh"]);
+const locationRoles = new Set<LocationRole>([
+  "home",
+  "desktop",
+  "documents",
+  "downloads",
+  "pictures",
+  "music",
+  "videos",
+  "volume",
+  "ssh",
+]);
 const locationStatuses = new Set<LocationStatus>([
   "available",
   "connected",
@@ -75,6 +87,7 @@ const parseLocation = (value: unknown): LocationSummary => {
   }
 
   const kind = requireString(value, "kind");
+  const role = requireString(value, "role");
   const status = requireString(value, "status");
   if (!locationKinds.has(kind as LocationKind)) {
     throw new Error(
@@ -86,11 +99,17 @@ const parseLocation = (value: unknown): LocationSummary => {
       `Invalid filesystem response: unknown location status ${status}.`,
     );
   }
+  if (!locationRoles.has(role as LocationRole)) {
+    throw new Error(
+      `Invalid filesystem response: unknown location role ${role}.`,
+    );
+  }
 
   return {
     id: requireString(value, "id"),
     name: requireString(value, "name"),
     kind: kind as LocationKind,
+    role: role as LocationRole,
     status: status as LocationStatus,
     displayPath: requireString(value, "displayPath"),
     detail: requireString(value, "detail"),

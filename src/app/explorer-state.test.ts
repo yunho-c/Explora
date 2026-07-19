@@ -40,7 +40,20 @@ describe("ExplorerState", () => {
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
 
-    expect(state.locations).toHaveLength(6);
+    expect(state.locations).toHaveLength(10);
+    expect(
+      state.locations
+        .filter(({ kind }) => kind === "local")
+        .map(({ role }) => role),
+    ).toEqual([
+      "home",
+      "desktop",
+      "documents",
+      "downloads",
+      "pictures",
+      "music",
+      "videos",
+    ]);
     expect(state.activeLocation?.name).toBe("Home");
     expect(state.entries).toHaveLength(10);
     expect(state.activeDirectory?.name).toBe("Home");

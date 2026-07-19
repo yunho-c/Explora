@@ -1,4 +1,14 @@
 export type LocationKind = "local" | "volume" | "ssh";
+export type LocationRole =
+  | "home"
+  | "desktop"
+  | "documents"
+  | "downloads"
+  | "pictures"
+  | "music"
+  | "videos"
+  | "volume"
+  | "ssh";
 export type LocationStatus = "available" | "connected" | "offline";
 export type EntryKind = "directory" | "file" | "symlink" | "other";
 export type ContentKind =
@@ -33,6 +43,7 @@ export interface LocationSummary {
   id: string;
   name: string;
   kind: LocationKind;
+  role: LocationRole;
   status: LocationStatus;
   displayPath: string;
   detail: string;

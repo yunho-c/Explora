@@ -21,6 +21,25 @@ describe("ExplorerShell", () => {
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
   });
 
+  it("uses distinct semantic icons for default favorite folders", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    render(ExplorerShell, { state });
+
+    for (const [name, iconClass] of [
+      ["Home", "lucide-house"],
+      ["Desktop", "lucide-monitor"],
+      ["Documents", "lucide-file-text"],
+      ["Downloads", "lucide-download"],
+      ["Pictures", "lucide-images"],
+      ["Music", "lucide-music-2"],
+      ["Movies", "lucide-film"],
+    ] as const) {
+      const button = screen.getByRole("button", { name });
+      expect(button.querySelector(`.${iconClass}`)).toBeInTheDocument();
+    }
+  });
+
   it("opens Quick Preview with the Space key", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

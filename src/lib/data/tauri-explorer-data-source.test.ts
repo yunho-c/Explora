@@ -16,6 +16,7 @@ const locationPayload = {
   id: "home",
   name: "Home",
   kind: "local",
+  role: "home",
   status: "available",
   displayPath: "/Users/test",
   detail: "Local",
@@ -132,6 +133,20 @@ describe("TauriExplorerDataSource", () => {
     await expect(
       source.listLocations(new AbortController().signal),
     ).rejects.toThrow("unknown location kind");
+  });
+
+  it("rejects unknown semantic location roles", async () => {
+    mockIPC((command) => {
+      if (command === "list_local_locations") {
+        return [{ ...locationPayload, role: "untrusted" }];
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    await expect(
+      source.listLocations(new AbortController().signal),
+    ).rejects.toThrow("unknown location role");
   });
 
   it("forwards AbortSignal cancellation to the active Rust listing", async () => {

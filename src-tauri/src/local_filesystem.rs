@@ -20,7 +20,20 @@ const LISTING_BATCH_SIZE: usize = 256;
 pub struct LocalRoot {
     pub id: &'static str,
     pub name: &'static str,
+    pub role: LocationRole,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocationRole {
+    Home,
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -52,6 +65,7 @@ pub struct LocationSummaryDto {
     pub id: String,
     pub name: String,
     pub kind: &'static str,
+    pub role: LocationRole,
     pub status: &'static str,
     pub display_path: String,
     pub detail: &'static str,
@@ -221,6 +235,7 @@ impl LocalFilesystem {
                 id: root.id.to_owned(),
                 name: root.name.to_owned(),
                 kind: "local",
+                role: root.role,
                 status: "available",
                 display_path: directory.display_path.clone(),
                 detail: "Local",
@@ -480,6 +495,7 @@ mod tests {
         let filesystem = LocalFilesystem::new(vec![LocalRoot {
             id: "home",
             name: "Home",
+            role: LocationRole::Home,
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
@@ -549,6 +565,7 @@ mod tests {
         let filesystem = LocalFilesystem::new(vec![LocalRoot {
             id: "home",
             name: "Home",
+            role: LocationRole::Home,
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
@@ -632,16 +649,19 @@ mod tests {
             LocalRoot {
                 id: "home",
                 name: "Home",
+                role: LocationRole::Home,
                 path: temp.path().to_path_buf(),
             },
             LocalRoot {
                 id: "desktop",
                 name: "Desktop",
+                role: LocationRole::Desktop,
                 path: temp.path().to_path_buf(),
             },
             LocalRoot {
                 id: "missing",
                 name: "Missing",
+                role: LocationRole::Downloads,
                 path: temp.path().join("missing"),
             },
         ])
@@ -649,6 +669,9 @@ mod tests {
 
         assert_eq!(filesystem.locations().len(), 1);
         assert_eq!(filesystem.locations()[0].id, "home");
+        assert_eq!(filesystem.locations()[0].role, LocationRole::Home);
+        let wire = serde_json::to_value(&filesystem.locations()[0]).expect("serializable location");
+        assert_eq!(wire["role"], "home");
     }
 
     #[cfg(target_os = "linux")]
@@ -662,6 +685,7 @@ mod tests {
         let filesystem = LocalFilesystem::new(vec![LocalRoot {
             id: "home",
             name: "Home",
+            role: LocationRole::Home,
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
@@ -704,6 +728,7 @@ mod tests {
         let filesystem = LocalFilesystem::new(vec![LocalRoot {
             id: "home",
             name: "Home",
+            role: LocationRole::Home,
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
