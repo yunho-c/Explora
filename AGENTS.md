@@ -86,6 +86,7 @@ Use the following baseline unless an accepted ADR changes it:
 - Stable Rust for filesystem, SSH, transfer, trust, and preview orchestration.
 - Svelte 5 with TypeScript and Vite for the UI.
 - Bun for JavaScript dependency management and repository-level scripts.
+- Tailwind CSS 4 and stock shadcn-svelte Vega components for the UI system.
 - The platform's native facilities, reached through small Rust adapters, when
   behavior genuinely differs by operating system.
 
@@ -267,8 +268,9 @@ than one-off component values.
 
 - Distinguish hover, focus, selection, inactive selection, drop target, loading,
   disabled, and destructive states.
-- Use the system font stack and platform-appropriate iconography. Icons require
-  accessible names or adjacent text; never rely on color alone.
+- Use the font and platform-appropriate Lucide iconography supplied by the stock
+  shadcn-svelte preset. Icons require accessible names or adjacent text; never
+  rely on color alone.
 - Follow platform conventions for primary modifier keys, menus, context menus,
   file-name editing, double-click behavior, and window controls.
 - Preserve user context across routine errors and reconnects. Do not replace a
@@ -342,29 +344,30 @@ focused security review and an ADR.
 
 ## Commands and repository state
 
-At the time this charter was written, the repository contains no application
-scaffold or package manifest. Therefore no build, lint, test, or development
-command is currently verified. Do not claim otherwise.
+The repository provides this stable command surface through Bun scripts,
+delegating to Rust or other tools as needed:
 
-The initial scaffold should provide this stable repository-level command surface
-through Bun scripts, delegating to Rust or other tools as needed:
+| Command                | Required purpose                                                                        |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| `bun install`          | Install the locked JavaScript dependencies.                                             |
+| `bun run dev`          | Launch the complete Tauri application in development mode.                              |
+| `bun run format`       | Format owned Rust, Svelte, TypeScript, and config files.                                |
+| `bun run format:check` | Check formatting without rewriting files.                                               |
+| `bun run lint`         | Run non-formatting linters.                                                             |
+| `bun run check`        | Run TypeScript/Svelte checks and Rust static checks.                                    |
+| `bun run test`         | Run the fast frontend and Rust unit/contract suites.                                    |
+| `bun run test:e2e`     | Run browser-shell Playwright workflows; do not describe these as packaged-native proof. |
+| `bun run build`        | Produce a release build/package for the current platform.                               |
 
-| Command | Required purpose |
-| --- | --- |
-| `bun install` | Install the locked JavaScript dependencies. |
-| `bun run dev` | Launch the complete Tauri application in development mode. |
-| `bun run format` | Format owned Rust, Svelte, TypeScript, and config files. |
-| `bun run format:check` | Check formatting without rewriting files. |
-| `bun run lint` | Run non-formatting linters. |
-| `bun run check` | Run TypeScript/Svelte checks and Rust static checks. |
-| `bun run test` | Run the fast frontend and Rust unit/contract suites. |
-| `bun run test:e2e` | Run packaged or driver-backed end-to-end workflows. |
-| `bun run build` | Produce a release build/package for the current platform. |
+Exact prerequisites and scoped web/Rust variants are documented in `README.md`.
+Keep the command names above stable where possible so local development and CI
+share one interface. Never run a mutating formatter when the task only calls for
+inspection or validation.
 
-Once scaffolding exists, replace this paragraph with exact prerequisites and any
-necessary platform-specific commands. Keep the command names above stable where
-possible so local development and CI share one interface. Never run a mutating
-formatter when the task only calls for inspection or validation.
+Generated shadcn-svelte components live under `src/lib/components/ui`. Add or
+refresh them through the CLI and keep their visual styling stock. Product
+distinctiveness belongs in composition, behavior, and application layout rather
+than edits to generated component tokens or variants.
 
 ## Testing strategy
 

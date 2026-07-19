@@ -1,0 +1,6 @@
+/** @type {import("prettier").Config} */
+export default {
+  plugins: ["prettier-plugin-svelte", "prettier-plugin-tailwindcss"],
+  tailwindStylesheet: "./src/app.css",
+  overrides: [{ files: "*.svelte", options: { parser: "svelte" } }],
+};

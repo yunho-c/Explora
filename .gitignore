@@ -1,0 +1,11 @@
+.DS_Store
+node_modules
+/dist
+/playwright-report
+/test-results
+/coverage
+/src-tauri/target
+.env
+.env.*
+!.env.example
+vite.config.ts.timestamp-*
