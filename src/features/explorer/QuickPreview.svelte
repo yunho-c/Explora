@@ -19,7 +19,7 @@
     {#if state.previewLoading}
       <Dialog.Header>
         <Dialog.Title>Preparing preview</Dialog.Title>
-        <Dialog.Description>Reading a bounded demo preview…</Dialog.Description>
+        <Dialog.Description>Reading file metadata…</Dialog.Description>
       </Dialog.Header>
       <div class="space-y-3">
         <Skeleton class="h-40 w-full" />
@@ -47,10 +47,8 @@
       <dl class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
         {#each state.preview.details as detail (detail.label)}
           <dt class="text-muted-foreground">{detail.label}</dt>
-          <dd class="truncate text-right">
-            {detail.label === "Modified"
-              ? new Date(detail.value).toLocaleString()
-              : detail.value}
+          <dd class="truncate text-right" title={detail.value}>
+            {detail.value}
           </dd>
         {/each}
       </dl>

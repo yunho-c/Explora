@@ -3,28 +3,24 @@
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
-  import type { FileEntrySummary, SortColumn } from "$lib/contracts/explorer";
+  import type { SortColumn } from "$lib/contracts/explorer";
   import * as ContextMenu from "$lib/components/ui/context-menu";
+  import { formatFileSize } from "$lib/file-metadata";
   import * as Table from "$lib/components/ui/table";
 
   import FileGlyph from "./FileGlyph.svelte";
 
   let { state }: { state: ExplorerState } = $props();
 
-  const formatSize = (entry: FileEntrySummary) => {
-    if (entry.size === null) return "—";
-    if (entry.size < 1_000) return `${entry.size} B`;
-    if (entry.size < 1_000_000) return `${(entry.size / 1_000).toFixed(1)} KB`;
-    return `${(entry.size / 1_000_000).toFixed(1)} MB`;
-  };
-
-  const formatDate = (value: string) =>
-    new Intl.DateTimeFormat(undefined, {
-      month: "short",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-    }).format(new Date(value));
+  const formatDate = (value: number | null) =>
+    value === null
+      ? "—"
+      : new Intl.DateTimeFormat(undefined, {
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        }).format(new Date(value));
 
   const sortLabel = (column: SortColumn) => {
     if (state.sort.column !== column) return "";
@@ -82,18 +78,21 @@
         </Table.Row>
       </Table.Header>
       <Table.Body>
-        {#each state.visibleEntries as entry (entry.id)}
+        {#each state.visibleEntries as entry (entry.reference.id)}
           <Table.Row
-            data-state={state.selectedEntryId === entry.id
+            data-state={state.selectedEntryId === entry.reference.id
               ? "selected"
               : undefined}
-            aria-selected={state.selectedEntryId === entry.id}
+            aria-selected={state.selectedEntryId === entry.reference.id}
             tabindex={0}
-            oncontextmenu={() => state.selectEntry(entry.id)}
-            onclick={() => state.selectEntry(entry.id)}
-            ondblclick={() => void state.openPreview(entry.id)}
+            oncontextmenu={() => state.selectEntry(entry.reference.id)}
+            onclick={() => state.selectEntry(entry.reference.id)}
+            ondblclick={() => void state.openEntry(entry.reference.id)}
             onkeydown={(event) => {
-              if (event.key === "Enter") void state.openPreview(entry.id);
+              if (event.key === "Enter") {
+                event.preventDefault();
+                void state.openEntry(entry.reference.id);
+              }
             }}
           >
             <Table.Cell>
@@ -113,7 +112,7 @@
               >{formatDate(entry.modifiedAt)}</Table.Cell
             >
             <Table.Cell class="text-right text-muted-foreground"
-              >{formatSize(entry)}</Table.Cell
+              >{formatFileSize(entry.size)}</Table.Cell
             >
           </Table.Row>
         {/each}

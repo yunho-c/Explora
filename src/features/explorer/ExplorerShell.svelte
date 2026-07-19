@@ -72,7 +72,18 @@
         >
           {state.errorMessage}
         </div>
-      {:else if !state.loading && state.visibleEntries.length === 0}
+      {/if}
+
+      {#if state.warningMessage}
+        <div
+          class="mx-4 mt-4 rounded-lg border bg-muted/50 p-3 text-sm text-muted-foreground"
+          role="status"
+        >
+          {state.warningMessage}
+        </div>
+      {/if}
+
+      {#if !state.errorMessage && !state.loading && state.visibleEntries.length === 0}
         <div class="grid min-h-72 place-items-center p-8 text-center">
           <div>
             <p class="font-medium">
@@ -83,7 +94,7 @@
             <p class="mt-1 text-sm text-muted-foreground">
               {state.searchQuery
                 ? "Try a different search term."
-                : "The demo adapter has no entries for this location."}
+                : "There are no items in this folder."}
             </p>
           </div>
         </div>
@@ -102,7 +113,7 @@
         {state.visibleEntries.length === 1 ? "item" : "items"}</span
       >
       <span class="truncate pl-4"
-        >{state.activeLocation?.detail ?? "Loading locations…"}</span
+        >{state.activeDirectory?.displayPath ?? "Loading locations…"}</span
       >
     </footer>
   </main>

@@ -1,9 +1,11 @@
 # Explora
 
 Explora is a calm, modern desktop file explorer for local and SSH locations. The
-current repository is the initial Tauri/Svelte application scaffold: it provides
-an interactive demo shell and a typed frontend data boundary, but it does not yet
-read or modify the real filesystem.
+packaged Tauri application now provides read-only local filesystem navigation
+through a Rust-owned backend. It opens at Home, streams directory listings,
+supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
+metadata-only Quick Preview. The browser-only Vite application retains a
+deterministic demo backend for UI development and tests.
 
 ## Technology
 
@@ -28,13 +30,19 @@ src/
     ├── data/            replaceable data-source boundary and demo adapter
     └── hooks/           generated component hooks
 
-src-tauri/               Tauri configuration and minimal Rust builder
+src-tauri/               Tauri configuration, typed IPC, and local filesystem backend
 tests/                   browser-level shell smoke tests
+docs/adr/                consequential architecture and security decisions
 ```
 
-The next filesystem slice should implement the existing `ExplorerDataSource`
-boundary with typed Tauri IPC rather than adding path access directly to Svelte
-components.
+Local paths remain in Rust and cross IPC as opaque, session-scoped references;
+display paths are never authoritative. See
+[`docs/adr/0001-opaque-local-path-references.md`](docs/adr/0001-opaque-local-path-references.md)
+for the authorization and security model.
+
+The current filesystem backend is deliberately read-only. File watching, mounted
+volume discovery, hidden-file controls, mutations, content previews, and SSH/SFTP
+remain later vertical slices.
 
 ## Prerequisites
 

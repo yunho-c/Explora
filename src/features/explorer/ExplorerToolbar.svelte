@@ -1,6 +1,7 @@
 <script lang="ts">
   import ArrowLeftIcon from "@lucide/svelte/icons/arrow-left";
   import ArrowRightIcon from "@lucide/svelte/icons/arrow-right";
+  import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import GridIcon from "@lucide/svelte/icons/grid-2x2";
   import ListIcon from "@lucide/svelte/icons/list";
@@ -46,24 +47,49 @@
     >
       <ArrowRightIcon />
     </Button>
+    <Button
+      variant="ghost"
+      size="icon-sm"
+      disabled={!state.canGoUp}
+      aria-label="Go to parent folder"
+      onclick={() => void state.goUp()}
+    >
+      <ArrowUpIcon />
+    </Button>
   </div>
 
   <div class="min-w-0 flex-1 overflow-hidden px-1">
     <Breadcrumb.Root>
       <Breadcrumb.List class="flex-nowrap">
-        <Breadcrumb.Item>
-          <Breadcrumb.Page
-            >{state.activeLocation?.kind === "ssh"
-              ? "SSH"
-              : "This computer"}</Breadcrumb.Page
+        {#each state.breadcrumbs as segment, index (segment.directory.id)}
+          {#if index > 0}
+            <Breadcrumb.Separator><ChevronRightIcon /></Breadcrumb.Separator>
+          {/if}
+          <Breadcrumb.Item
+            class={index === state.breadcrumbs.length - 1
+              ? "min-w-0"
+              : "shrink-0"}
           >
-        </Breadcrumb.Item>
-        <Breadcrumb.Separator><ChevronRightIcon /></Breadcrumb.Separator>
-        <Breadcrumb.Item class="min-w-0">
-          <Breadcrumb.Page class="truncate"
-            >{state.activeLocation?.name ?? "Loading"}</Breadcrumb.Page
-          >
-        </Breadcrumb.Item>
+            {#if index === state.breadcrumbs.length - 1}
+              <Breadcrumb.Page class="truncate">{segment.label}</Breadcrumb.Page
+              >
+            {:else}
+              <button
+                type="button"
+                class="max-w-36 truncate transition-colors hover:text-foreground"
+                title={segment.directory.displayPath}
+                onclick={() => void state.openDirectory(segment.directory)}
+              >
+                {segment.label}
+              </button>
+            {/if}
+          </Breadcrumb.Item>
+        {/each}
+        {#if state.breadcrumbs.length === 0}
+          <Breadcrumb.Item>
+            <Breadcrumb.Page>Loading</Breadcrumb.Page>
+          </Breadcrumb.Item>
+        {/if}
       </Breadcrumb.List>
     </Breadcrumb.Root>
   </div>
@@ -115,7 +141,7 @@
       {/snippet}
     </DropdownMenu.Trigger>
     <DropdownMenu.Content align="end">
-      <DropdownMenu.Label>Demo actions</DropdownMenu.Label>
+      <DropdownMenu.Label>Actions</DropdownMenu.Label>
       <DropdownMenu.Item disabled>New folder</DropdownMenu.Item>
       <DropdownMenu.Item disabled>Connect to server</DropdownMenu.Item>
       <DropdownMenu.Separator />

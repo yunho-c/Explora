@@ -32,7 +32,7 @@
       {#if !compact}
         <div class="min-w-0">
           <p class="truncate text-sm font-semibold">Explora</p>
-          <p class="truncate text-xs text-muted-foreground">Demo workspace</p>
+          <p class="truncate text-xs text-muted-foreground">Local & remote</p>
         </div>
       {/if}
     </div>
@@ -90,7 +90,7 @@
         {/each}
       </nav>
 
-      {#if !compact}
+      {#if !compact && state.locations.some(({ kind }) => kind === "ssh")}
         <div class="flex items-center justify-between px-2 pt-5 pb-1">
           <p class="text-xs font-medium text-muted-foreground">SSH</p>
           <Badge variant="outline">Demo</Badge>
@@ -168,7 +168,7 @@
   <Sheet.Content side="left">
     <Sheet.Header>
       <Sheet.Title>Locations</Sheet.Title>
-      <Sheet.Description>Choose a local or SSH demo location.</Sheet.Description
+      <Sheet.Description>Choose a favorite or saved location.</Sheet.Description
       >
     </Sheet.Header>
     <div class="min-h-0 flex-1">{@render navigation(false)}</div>

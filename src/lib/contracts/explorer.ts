@@ -1,6 +1,6 @@
 export type LocationKind = "local" | "volume" | "ssh";
 export type LocationStatus = "available" | "connected" | "offline";
-export type EntryKind = "directory" | "file";
+export type EntryKind = "directory" | "file" | "symlink" | "other";
 export type ContentKind =
   | "folder"
   | "image"
@@ -14,6 +14,21 @@ export type ViewMode = "list" | "grid";
 export type SortColumn = "name" | "modifiedAt" | "size";
 export type SortDirection = "ascending" | "descending";
 
+export interface EntryRef {
+  id: string;
+  locationId: string;
+}
+
+export interface DirectoryRef extends EntryRef {
+  name: string;
+  displayPath: string;
+}
+
+export interface BreadcrumbSegment {
+  label: string;
+  directory: DirectoryRef;
+}
+
 export interface LocationSummary {
   id: string;
   name: string;
@@ -21,16 +36,18 @@ export interface LocationSummary {
   status: LocationStatus;
   displayPath: string;
   detail: string;
+  root: DirectoryRef;
 }
 
 export interface FileEntrySummary {
-  id: string;
-  locationId: string;
+  reference: EntryRef;
   name: string;
   kind: EntryKind;
   contentKind: ContentKind;
-  size: number | null;
-  modifiedAt: string;
+  size: string | null;
+  modifiedAt: number | null;
+  displayPath: string;
+  directory: DirectoryRef | null;
   detail?: string;
 }
 
@@ -38,7 +55,8 @@ export interface ExplorerTab {
   id: string;
   title: string;
   locationId: string;
-  history: string[];
+  directory: DirectoryRef;
+  history: DirectoryRef[];
   historyIndex: number;
 }
 

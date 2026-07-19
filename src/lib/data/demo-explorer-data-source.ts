@@ -1,5 +1,6 @@
 import type {
   ContentKind,
+  DirectoryRef,
   FileEntrySummary,
   LocationSummary,
   PreviewSummary,
@@ -9,6 +10,45 @@ import type {
   ListDirectoryOptions,
 } from "$lib/data/explorer-data-source";
 
+const roots: Readonly<Record<string, DirectoryRef>> = {
+  home: {
+    id: "home",
+    locationId: "home",
+    name: "Home",
+    displayPath: "Home",
+  },
+  desktop: {
+    id: "desktop",
+    locationId: "desktop",
+    name: "Desktop",
+    displayPath: "Home/Desktop",
+  },
+  documents: {
+    id: "documents",
+    locationId: "documents",
+    name: "Documents",
+    displayPath: "Home/Documents",
+  },
+  workspace: {
+    id: "workspace",
+    locationId: "workspace",
+    name: "Workspace",
+    displayPath: "Workspace",
+  },
+  "staging-box": {
+    id: "staging-box",
+    locationId: "staging-box",
+    name: "staging-box",
+    displayPath: "staging-box:~/projects",
+  },
+  "render-node": {
+    id: "render-node",
+    locationId: "render-node",
+    name: "render-node",
+    displayPath: "render-node:~",
+  },
+};
+
 const locations: readonly LocationSummary[] = [
   {
     id: "home",
@@ -17,6 +57,7 @@ const locations: readonly LocationSummary[] = [
     status: "available",
     displayPath: "Home",
     detail: "Local",
+    root: roots.home,
   },
   {
     id: "desktop",
@@ -25,6 +66,7 @@ const locations: readonly LocationSummary[] = [
     status: "available",
     displayPath: "Home/Desktop",
     detail: "Local",
+    root: roots.desktop,
   },
   {
     id: "documents",
@@ -33,6 +75,7 @@ const locations: readonly LocationSummary[] = [
     status: "available",
     displayPath: "Home/Documents",
     detail: "Local",
+    root: roots.documents,
   },
   {
     id: "workspace",
@@ -41,6 +84,7 @@ const locations: readonly LocationSummary[] = [
     status: "available",
     displayPath: "Workspace",
     detail: "1.2 TB available",
+    root: roots.workspace,
   },
   {
     id: "staging-box",
@@ -49,6 +93,7 @@ const locations: readonly LocationSummary[] = [
     status: "connected",
     displayPath: "staging-box:~/projects",
     detail: "SSH · Connected",
+    root: roots["staging-box"],
   },
   {
     id: "render-node",
@@ -57,6 +102,7 @@ const locations: readonly LocationSummary[] = [
     status: "offline",
     displayPath: "render-node:~",
     detail: "SSH · Offline",
+    root: roots["render-node"],
   },
 ];
 
@@ -69,13 +115,22 @@ const makeEntry = (
   modifiedAt: string,
   detail?: string,
 ): FileEntrySummary => ({
-  id: `${locationId}:${name}`,
-  locationId,
+  reference: { id: `${locationId}:${name}`, locationId },
   name,
   kind,
   contentKind,
-  size,
-  modifiedAt,
+  size: size?.toString() ?? null,
+  modifiedAt: Date.parse(modifiedAt),
+  displayPath: `${roots[locationId].displayPath}/${name}`,
+  directory:
+    kind === "directory"
+      ? {
+          id: `${locationId}:${name}`,
+          locationId,
+          name,
+          displayPath: `${roots[locationId].displayPath}/${name}`,
+        }
+      : null,
   detail,
 });
 
@@ -362,23 +417,42 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   }
 
   async listDirectory(
-    locationId: string,
-    { signal, onBatch }: ListDirectoryOptions,
+    directory: DirectoryRef,
+    { signal, onStart, onBatch, onComplete }: ListDirectoryOptions,
   ): Promise<void> {
-    const entries = entriesByLocation[locationId];
+    const root = roots[directory.locationId];
+    const rootEntries = entriesByLocation[directory.id];
+    const isKnownChild = Object.values(entriesByLocation)
+      .flat()
+      .some((entry) => entry.directory?.id === directory.id);
+    const entries = rootEntries ?? (isKnownChild ? [] : undefined);
 
-    if (!entries) {
-      throw new Error(`Unknown demo location: ${locationId}`);
+    if (!entries || !root) {
+      throw new Error(`Unknown demo directory: ${directory.id}`);
     }
 
     await wait(90, signal);
+    onStart({
+      directory,
+      parent: directory.id === root.id ? null : root,
+      breadcrumbs:
+        directory.id === root.id
+          ? [{ label: root.name, directory: root }]
+          : [
+              { label: root.name, directory: root },
+              { label: directory.name, directory },
+            ],
+    });
     const splitAt = Math.min(4, entries.length);
-    onBatch({ entries: entries.slice(0, splitAt), replace: true });
+    if (splitAt > 0) {
+      onBatch({ entries: entries.slice(0, splitAt), replace: true });
+    }
 
     if (entries.length > splitAt) {
       await wait(110, signal);
       onBatch({ entries: entries.slice(splitAt), replace: false });
     }
+    onComplete({ skippedEntries: 0 });
   }
 
   async getPreview(
@@ -387,9 +461,11 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   ): Promise<PreviewSummary> {
     await wait(80, signal);
 
-    const location = locations.find(({ id }) => id === entry.locationId);
+    const location = locations.find(
+      ({ id }) => id === entry.reference.locationId,
+    );
     return {
-      entryId: entry.id,
+      entryId: entry.reference.id,
       kind: entry.contentKind,
       title: entry.name,
       subtitle:
@@ -398,8 +474,17 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
           : (entry.detail ?? "File"),
       excerpt: excerpts[entry.contentKind],
       details: [
-        { label: "Location", value: location?.displayPath ?? entry.locationId },
-        { label: "Modified", value: entry.modifiedAt },
+        {
+          label: "Location",
+          value: location?.displayPath ?? entry.reference.locationId,
+        },
+        {
+          label: "Modified",
+          value:
+            entry.modifiedAt === null
+              ? "Unknown"
+              : new Date(entry.modifiedAt).toLocaleString(),
+        },
         {
           label: "Size",
           value: entry.size === null ? "—" : `${entry.size} bytes`,

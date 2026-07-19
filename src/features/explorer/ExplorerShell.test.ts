@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { describe, expect, it } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
@@ -35,5 +35,24 @@ describe("ExplorerShell", () => {
         "Use ↑ and ↓ to move between items · Esc to close",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("opens folders on double-click and returns with the Up action", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    render(ExplorerShell, { state });
+
+    await fireEvent.dblClick(screen.getByText("Projects"));
+    await waitFor(() => expect(state.activeDirectory?.name).toBe("Projects"));
+    expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Go to parent folder" }),
+    ).toBeEnabled();
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Go to parent folder" }),
+    );
+    await waitFor(() => expect(state.activeDirectory?.name).toBe("Home"));
+    expect(await screen.findByText("explora-notes.md")).toBeInTheDocument();
   });
 });

@@ -14,17 +14,20 @@
       role="grid"
       aria-label="Files"
     >
-      {#each state.visibleEntries as entry (entry.id)}
+      {#each state.visibleEntries as entry (entry.reference.id)}
         <button
           type="button"
           role="gridcell"
-          aria-selected={state.selectedEntryId === entry.id}
-          class={state.selectedEntryId === entry.id
+          aria-selected={state.selectedEntryId === entry.reference.id}
+          class={state.selectedEntryId === entry.reference.id
             ? "flex min-h-32 flex-col items-center justify-center gap-3 rounded-xl bg-muted p-3 text-center ring-2 ring-ring"
             : "flex min-h-32 flex-col items-center justify-center gap-3 rounded-xl p-3 text-center hover:bg-muted/60"}
-          oncontextmenu={() => state.selectEntry(entry.id)}
-          onclick={() => state.selectEntry(entry.id)}
-          ondblclick={() => void state.openPreview(entry.id)}
+          oncontextmenu={() => state.selectEntry(entry.reference.id)}
+          onclick={() => state.selectEntry(entry.reference.id)}
+          ondblclick={() => void state.openEntry(entry.reference.id)}
+          onkeydown={(event) => {
+            if (event.key === "Enter") void state.openEntry(entry.reference.id);
+          }}
         >
           <FileGlyph kind={entry.contentKind} />
           <span class="line-clamp-2 max-w-full text-sm font-medium"
