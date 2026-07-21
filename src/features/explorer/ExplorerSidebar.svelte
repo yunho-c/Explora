@@ -74,7 +74,9 @@
       {/if}
     </div>
 
-    <div class="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
+    <div
+      class="explora-sidebar-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-4"
+    >
       {#if !compact}
         <p class="px-2 pt-3 pb-1 text-xs font-medium text-muted-foreground">
           Favorites

@@ -42,6 +42,9 @@ describe("ExplorerShell", () => {
     expect(titlebarLeft).not.toHaveClass("border-b");
     expect(titlebarLeft?.textContent?.trim()).toBe("");
     expect(titlebarLeft?.querySelector("svg")).toBeNull();
+    expect(document.querySelector(".explora-sidebar-scroll")).toHaveClass(
+      "overflow-y-auto",
+    );
 
     await fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();

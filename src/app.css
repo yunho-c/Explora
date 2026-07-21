@@ -168,6 +168,58 @@
     );
   }
 
+  .explora-sidebar-scroll {
+    --explora-sidebar-scrollbar-thumb: color-mix(
+      in oklch,
+      var(--muted-foreground) 20%,
+      transparent
+    );
+
+    scrollbar-width: thin;
+    scrollbar-color: var(--explora-sidebar-scrollbar-thumb) transparent;
+  }
+
+  .explora-sidebar-scroll:hover {
+    --explora-sidebar-scrollbar-thumb: color-mix(
+      in oklch,
+      var(--muted-foreground) 40%,
+      transparent
+    );
+
+    scrollbar-color: var(--explora-sidebar-scrollbar-thumb) transparent;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar {
+    width: 0.5rem;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar-track,
+  .explora-sidebar-scroll::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar-thumb {
+    min-height: 2rem;
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-color: var(--explora-sidebar-scrollbar-thumb);
+    background-clip: content-box;
+  }
+
+  @media (forced-colors: active) {
+    .explora-sidebar-scroll,
+    .explora-sidebar-scroll:hover {
+      --explora-sidebar-scrollbar-thumb: CanvasText;
+
+      scrollbar-width: auto;
+      scrollbar-color: auto;
+    }
+
+    .explora-sidebar-scroll::-webkit-scrollbar-thumb {
+      border-color: Canvas;
+    }
+  }
+
   .explora-titlebar-tabs {
     padding-right: max(
       0.5rem,
