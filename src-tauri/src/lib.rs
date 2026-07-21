@@ -3,6 +3,8 @@ mod filesystem;
 mod local_filesystem;
 mod ssh;
 mod ssh_targets;
+#[cfg(test)]
+mod ssh_test_server;
 
 use commands::AppState;
 use filesystem::LocationRole;

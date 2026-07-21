@@ -2,13 +2,18 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc, Mutex,
     },
 };
 
+const SESSION_CONNECTING: u8 = 0;
+const SESSION_ACTIVE: u8 = 1;
+const SESSION_DISCONNECTING: u8 = 2;
+const SESSION_DISCONNECTED: u8 = 3;
+
 use russh::{
-    client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse},
+    client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse},
     keys::{self, agent::client::AgentClient, HashAlg, PrivateKeyWithHashAlg, PublicKey},
     MethodKind,
 };
@@ -26,9 +31,10 @@ use crate::{
     filesystem::{
         BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
         FileEntrySummaryDto, LocationRole, LocationSummaryDto, CONNECTION_TIMEOUT,
-        LISTING_BATCH_SIZE, PROMPT_TIMEOUT,
+        LISTING_BATCH_SIZE, PROMPT_TIMEOUT, SFTP_REQUEST_TIMEOUT_SECONDS, SSH_KEEPALIVE_INTERVAL,
+        SSH_KEEPALIVE_MAX,
     },
-    ssh_targets::{ResolvedSshTarget, SshTargetSummaryDto},
+    ssh_targets::{location_id, ResolvedSshTarget, SshTargetSummaryDto},
 };
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +60,10 @@ pub enum SshConnectionEventDto {
         title: String,
         instructions: String,
         fields: Vec<SshPromptFieldDto>,
+    },
+    Disconnected {
+        target_id: String,
+        message: String,
     },
 }
 
@@ -172,6 +182,7 @@ struct HostKeyHandler {
     target: ResolvedSshTarget,
     prompts: Arc<PromptBroker>,
     events: Arc<Channel<SshConnectionEventDto>>,
+    lifecycle: Arc<AtomicU8>,
 }
 
 impl client::Handler for HostKeyHandler {
@@ -236,6 +247,24 @@ impl client::Handler for HostKeyHandler {
         })?;
         Ok(true)
     }
+
+    async fn disconnected(
+        &mut self,
+        reason: DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let previous = self.lifecycle.swap(SESSION_DISCONNECTED, Ordering::SeqCst);
+        if previous == SESSION_ACTIVE {
+            let _ = self.events.send(SshConnectionEventDto::Disconnected {
+                target_id: self.target.id.clone(),
+                message: "The SSH connection was lost. Reconnect to continue browsing.".to_owned(),
+            });
+        }
+
+        match reason {
+            DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            DisconnectReason::Error(error) => Err(error),
+        }
+    }
 }
 
 impl From<russh::Error> for ExplorerError {
@@ -285,12 +314,32 @@ struct SshSession {
     target: ResolvedSshTarget,
     location_id: String,
     root: DirectoryRefDto,
-    paths: RemotePathRegistry,
+    paths: Arc<RemotePathRegistry>,
     handle: AsyncMutex<Handle<HostKeyHandler>>,
     sftp: Arc<SftpSession>,
+    lifecycle: Arc<AtomicU8>,
+    events: Arc<Channel<SshConnectionEventDto>>,
 }
 
 impl SshSession {
+    fn mark_offline(&self) {
+        if self
+            .lifecycle
+            .compare_exchange(
+                SESSION_ACTIVE,
+                SESSION_DISCONNECTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let _ = self.events.send(SshConnectionEventDto::Disconnected {
+                target_id: self.target.id.clone(),
+                message: "The SSH connection was lost. Reconnect to continue browsing.".to_owned(),
+            });
+        }
+    }
+
     fn location(&self) -> LocationSummaryDto {
         LocationSummaryDto {
             id: self.location_id.clone(),
@@ -339,11 +388,10 @@ impl SshSession {
             breadcrumbs,
         })?;
 
-        let read_dir = self
-            .sftp
-            .read_dir(path.clone())
-            .await
-            .map_err(map_sftp_error)?;
+        let read_dir = tokio::select! {
+            result = self.sftp.read_dir(path.clone()) => result.map_err(map_sftp_error)?,
+            () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+        };
         let mut batch = Vec::with_capacity(LISTING_BATCH_SIZE);
         let mut first_batch = true;
         for entry in read_dir {
@@ -353,11 +401,14 @@ impl SshSession {
             let metadata = entry.metadata();
             let is_symlink = metadata.is_symlink();
             let is_directory = if is_symlink {
-                self.sftp
-                    .metadata(entry_path.clone())
-                    .await
-                    .map(|metadata| metadata.is_dir())
-                    .unwrap_or(false)
+                tokio::select! {
+                    metadata = self.sftp.metadata(entry_path.clone()) => {
+                        metadata.map(|metadata| metadata.is_dir()).unwrap_or(false)
+                    }
+                    () = wait_for_cancellation(cancelled) => {
+                        return Err(ExplorerError::Cancelled);
+                    }
+                }
             } else {
                 metadata.is_dir()
             };
@@ -407,6 +458,7 @@ impl SshSession {
 
 pub struct SshConnectionManager {
     sessions: Mutex<HashMap<String, Arc<SshSession>>>,
+    path_registries: Mutex<HashMap<String, Arc<RemotePathRegistry>>>,
     connections: Mutex<HashMap<String, ActiveConnection>>,
     prompts: Arc<PromptBroker>,
 }
@@ -420,6 +472,7 @@ impl Default for SshConnectionManager {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            path_registries: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             prompts: Arc::new(PromptBroker::default()),
         }
@@ -433,6 +486,7 @@ impl SshConnectionManager {
             .map(|sessions| {
                 sessions
                     .values()
+                    .filter(|session| session.lifecycle.load(Ordering::SeqCst) == SESSION_ACTIVE)
                     .map(|session| session.location())
                     .collect()
             })
@@ -446,6 +500,7 @@ impl SshConnectionManager {
             if let Some(session) = sessions
                 .as_ref()
                 .and_then(|sessions| sessions.get(&target.id))
+                .filter(|session| session.lifecycle.load(Ordering::SeqCst) == SESSION_ACTIVE)
             {
                 target.status = "connected";
                 target.connected_location_id = Some(session.location_id.clone());
@@ -468,14 +523,17 @@ impl SshConnectionManager {
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(ExplorerError::InvalidReference);
         }
-        if let Some(session) = self
-            .sessions
-            .lock()
-            .map_err(|_| ExplorerError::StateUnavailable)?
-            .get(&target.id)
-            .cloned()
         {
-            return Ok(session.location());
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ExplorerError::StateUnavailable)?;
+            if let Some(session) = sessions.get(&target.id) {
+                if session.lifecycle.load(Ordering::SeqCst) == SESSION_ACTIVE {
+                    return Ok(session.location());
+                }
+                sessions.remove(&target.id);
+            }
         }
         let cancellation = Arc::new(AtomicBool::new(false));
         {
@@ -517,13 +575,15 @@ impl SshConnectionManager {
         cancelled: &AtomicBool,
     ) -> Result<LocationSummaryDto, ExplorerError> {
         emit_state(&events, "connecting")?;
+        let lifecycle = Arc::new(AtomicU8::new(SESSION_CONNECTING));
         let handler = HostKeyHandler {
             request_id: request_id.to_owned(),
             target: target.clone(),
             prompts: self.prompts.clone(),
             events: events.clone(),
+            lifecycle: lifecycle.clone(),
         };
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(ssh_client_config());
         let connect = client::connect(config, (target.host.as_str(), target.port), handler);
         let mut handle = tokio::time::timeout(CONNECTION_TIMEOUT, connect)
             .await
@@ -576,23 +636,32 @@ impl SshConnectionManager {
         ensure_not_cancelled(cancelled)?;
         emit_state(&events, "openingSftp")?;
         let channel = handle.channel_open_session().await?;
-        channel.request_subsystem(true, "sftp").await?;
-        let sftp = Arc::new(
-            SftpSession::new(channel.into_stream())
-                .await
-                .map_err(|error| {
-                    ExplorerError::Unsupported(format!(
-                        "The SSH server did not provide a usable SFTP subsystem: {error}"
-                    ))
-                })?,
-        );
-        sftp.set_timeout(30);
+        channel.request_subsystem(true, "sftp").await.map_err(|_| {
+            ExplorerError::Unsupported(
+                "The SSH server does not provide an SFTP subsystem.".to_owned(),
+            )
+        })?;
+        let sftp = Arc::new(SftpSession::new(channel.into_stream()).await.map_err(|_| {
+            ExplorerError::Unsupported(
+                "The SSH server did not provide a usable SFTP subsystem.".to_owned(),
+            )
+        })?);
+        sftp.set_timeout(SFTP_REQUEST_TIMEOUT_SECONDS);
         let initial_path = sftp
             .canonicalize(target.initial_path.clone())
             .await
             .map_err(map_sftp_error)?;
-        let location_id = format!("ssh:{}", target.id);
-        let paths = RemotePathRegistry::default();
+        let location_id = location_id(&target.id);
+        let paths = {
+            let mut registries = self
+                .path_registries
+                .lock()
+                .map_err(|_| ExplorerError::StateUnavailable)?;
+            registries
+                .entry(target.id.clone())
+                .or_insert_with(|| Arc::new(RemotePathRegistry::default()))
+                .clone()
+        };
         let root = DirectoryRefDto {
             id: paths.register(initial_path.clone())?,
             location_id: location_id.clone(),
@@ -607,7 +676,21 @@ impl SshConnectionManager {
             paths,
             handle: AsyncMutex::new(handle),
             sftp,
+            lifecycle: lifecycle.clone(),
+            events: events.clone(),
         });
+        lifecycle
+            .compare_exchange(
+                SESSION_CONNECTING,
+                SESSION_ACTIVE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| {
+                ExplorerError::Offline(
+                    "The SSH connection closed while Explora was opening SFTP.".to_owned(),
+                )
+            })?;
         let location = session.location();
         self.sessions
             .lock()
@@ -809,13 +892,20 @@ impl SshConnectionManager {
     }
 
     pub async fn disconnect(&self, target_id: &str) -> Result<(), ExplorerError> {
-        let Some(session) = self
-            .sessions
-            .lock()
-            .map_err(|_| ExplorerError::StateUnavailable)?
-            .remove(target_id)
-        else {
-            return Ok(());
+        let session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ExplorerError::StateUnavailable)?;
+            let Some(session) = sessions.get(target_id) else {
+                return Ok(());
+            };
+            session
+                .lifecycle
+                .store(SESSION_DISCONNECTING, Ordering::SeqCst);
+            sessions
+                .remove(target_id)
+                .ok_or(ExplorerError::StateUnavailable)?
         };
         let _ = session.sftp.close().await;
         let handle = session.handle.lock().await;
@@ -826,6 +916,15 @@ impl SshConnectionManager {
                 "en",
             )
             .await;
+        Ok(())
+    }
+
+    pub async fn forget_target(&self, target_id: &str) -> Result<(), ExplorerError> {
+        self.disconnect(target_id).await?;
+        self.path_registries
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .remove(target_id);
         Ok(())
     }
 
@@ -847,7 +946,21 @@ impl SshConnectionManager {
             .find(|session| session.location_id == location_id)
             .cloned()
             .ok_or_else(|| ExplorerError::Offline("This SSH target is disconnected.".to_owned()))?;
-        session.list_directory(directory_id, cancelled, emit).await
+        if session.lifecycle.load(Ordering::SeqCst) != SESSION_ACTIVE {
+            return Err(ExplorerError::Offline(
+                "This SSH target is disconnected.".to_owned(),
+            ));
+        }
+        let result = session.list_directory(directory_id, cancelled, emit).await;
+        if matches!(result, Err(ExplorerError::Offline(_)))
+            || (result.is_err() && session.lifecycle.load(Ordering::SeqCst) != SESSION_ACTIVE)
+        {
+            session.mark_offline();
+            return Err(ExplorerError::Offline(
+                "The SSH connection was lost. Reconnect to continue browsing.".to_owned(),
+            ));
+        }
+        result
     }
 }
 
@@ -859,6 +972,15 @@ fn require_answers(
         SshPromptResponseDto::Answers { answers } if answers.len() == expected => Ok(answers),
         SshPromptResponseDto::Reject => Err(ExplorerError::Cancelled),
         _ => Err(ExplorerError::InvalidReference),
+    }
+}
+
+fn ssh_client_config() -> client::Config {
+    client::Config {
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: SSH_KEEPALIVE_MAX,
+        nodelay: true,
+        ..client::Config::default()
     }
 }
 
@@ -963,11 +1085,15 @@ fn map_sftp_error(error: SftpError) -> ExplorerError {
             StatusCode::OpUnsupported => ExplorerError::Unsupported(
                 "The SSH server does not support this SFTP operation.".to_owned(),
             ),
-            _ => {
-                ExplorerError::Unexpected(format!("The SFTP server returned an error: {status:?}"))
-            }
+            _ => ExplorerError::Unexpected(format!(
+                "The SFTP server returned status {}.",
+                status.status_code
+            )),
         },
         SftpError::Timeout => ExplorerError::Offline("The SFTP request timed out.".to_owned()),
+        SftpError::IO(_) | SftpError::UnexpectedBehavior(_) => {
+            ExplorerError::Offline("The SSH connection was lost.".to_owned())
+        }
         other => ExplorerError::Unexpected(format!("The SFTP request failed: {other}")),
     }
 }
@@ -1057,6 +1183,183 @@ fn content_kind(name: &str, is_directory: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use serde_json::Value;
+    use tauri::ipc::InvokeResponseBody;
+
+    use crate::ssh_test_server::{TestAuthMode, TestSshServer};
+
+    #[cfg(unix)]
+    static SSH_AGENT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(unix)]
+    struct EnvironmentVariableGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvironmentVariableGuard {
+        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: SSH-agent tests serialize all access to this process-wide variable
+            // with SSH_AGENT_ENV_LOCK and restore the previous value in Drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            // SAFETY: The matching lock guard is held until after this value is dropped.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct PromptAnswers {
+        accept_host_key: bool,
+        passphrase: Option<String>,
+        password: Option<String>,
+        keyboard_interactive: Option<String>,
+    }
+
+    fn target_for(
+        server: &TestSshServer,
+        identity_files: Vec<std::path::PathBuf>,
+        identities_only: bool,
+    ) -> ResolvedSshTarget {
+        ResolvedSshTarget {
+            id: "test-target".to_owned(),
+            name: "Test server".to_owned(),
+            host: server.host().to_owned(),
+            port: server.port(),
+            username: server.username().to_owned(),
+            initial_path: "/".to_owned(),
+            identity_files,
+            identities_only,
+            known_hosts_path: server.known_hosts_path(),
+        }
+    }
+
+    fn event_channel(
+        manager: Arc<SshConnectionManager>,
+        request_id: &str,
+        answers: PromptAnswers,
+    ) -> (Channel<SshConnectionEventDto>, Arc<Mutex<Vec<Value>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        let request_id = request_id.to_owned();
+        let channel = Channel::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("SSH events must be JSON");
+            };
+            let event: Value = serde_json::from_str(&json).expect("valid SSH event JSON");
+            captured_events
+                .lock()
+                .expect("captured SSH events")
+                .push(event.clone());
+
+            let response = match event.get("event").and_then(Value::as_str) {
+                Some("hostKeyPrompt") => Some(if answers.accept_host_key {
+                    SshPromptResponseDto::Accept
+                } else {
+                    SshPromptResponseDto::Reject
+                }),
+                Some("authenticationPrompt") => {
+                    let answer = match event.get("kind").and_then(Value::as_str) {
+                        Some("passphrase") => answers.passphrase.clone(),
+                        Some("password") => answers.password.clone(),
+                        Some("keyboardInteractive") => answers.keyboard_interactive.clone(),
+                        _ => None,
+                    };
+                    Some(match answer {
+                        Some(answer) => SshPromptResponseDto::Answers {
+                            answers: vec![answer],
+                        },
+                        None => SshPromptResponseDto::Reject,
+                    })
+                }
+                _ => None,
+            };
+            if let Some(response) = response {
+                let prompt_id = event
+                    .get("promptId")
+                    .and_then(Value::as_str)
+                    .expect("prompt id");
+                manager
+                    .respond(&request_id, prompt_id, response)
+                    .expect("respond to test SSH prompt");
+            }
+            Ok(())
+        });
+        (channel, events)
+    }
+
+    fn has_event(events: &Arc<Mutex<Vec<Value>>>, event_name: &str) -> bool {
+        events
+            .lock()
+            .expect("SSH events")
+            .iter()
+            .any(|event| event.get("event").and_then(Value::as_str) == Some(event_name))
+    }
+
+    async fn wait_for_event(events: &Arc<Mutex<Vec<Value>>>, event_name: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !has_event(events, event_name) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timely SSH event");
+    }
+
+    async fn listing_events(
+        manager: &SshConnectionManager,
+        location_id: &str,
+        directory_id: &str,
+    ) -> Result<Vec<DirectoryListingEvent>, ExplorerError> {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = events.clone();
+        manager
+            .list_directory(
+                location_id,
+                directory_id,
+                &AtomicBool::new(false),
+                move |event| {
+                    captured_events
+                        .lock()
+                        .map_err(|_| ExplorerError::StateUnavailable)?
+                        .push(event);
+                    Ok(())
+                },
+            )
+            .await?;
+        let result = events
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .clone();
+        Ok(result)
+    }
+
+    fn listed_entries(events: &[DirectoryListingEvent]) -> Vec<FileEntrySummaryDto> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                DirectoryListingEvent::Entries { entries, .. } => Some(entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
 
     #[test]
     fn remote_path_references_are_opaque_and_scoped_to_the_registry() {
@@ -1119,5 +1422,338 @@ mod tests {
         assert_eq!(remote_name("/srv/app/"), "app");
         assert_eq!(content_kind("main.rs", false), "code");
         assert_eq!(content_kind("assets", true), "folder");
+    }
+
+    #[test]
+    fn ssh_transport_uses_bounded_keepalives_and_low_latency_sockets() {
+        let config = ssh_client_config();
+        assert_eq!(config.keepalive_interval, Some(SSH_KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, SSH_KEEPALIVE_MAX);
+        assert!(config.nodelay);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_sftp_listing_disconnect_and_reconnect_preserve_directory_identity() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, events) = event_channel(manager.clone(), "connect-1", answers.clone());
+        let location = manager
+            .connect(target.clone(), "connect-1".to_owned(), channel)
+            .await
+            .expect("connect through a real SSH handshake");
+        assert!(has_event(&events, "hostKeyPrompt"));
+
+        let root_events = listing_events(&manager, &location.id, &location.root.id)
+            .await
+            .expect("list real SFTP root");
+        let entries = listed_entries(&root_events);
+        assert!(entries.iter().any(|entry| entry.name == "README.md"));
+        let symlink = entries
+            .iter()
+            .find(|entry| entry.name == "project-link")
+            .expect("symlink entry");
+        assert_eq!(symlink.kind, "symlink");
+        assert!(symlink.directory.is_some());
+
+        let private = entries
+            .iter()
+            .find(|entry| entry.name == "private")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("private directory");
+        assert!(matches!(
+            listing_events(&manager, &location.id, &private.id).await,
+            Err(ExplorerError::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+
+        let projects = entries
+            .iter()
+            .find(|entry| entry.name == "projects")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("projects directory")
+            .clone();
+        let project_events = listing_events(&manager, &location.id, &projects.id)
+            .await
+            .expect("list nested directory");
+        assert!(listed_entries(&project_events)
+            .iter()
+            .any(|entry| entry.name == "notes.txt"));
+
+        server.disconnect_clients().await;
+        wait_for_event(&events, "disconnected").await;
+        assert!(manager.locations().is_empty());
+
+        let (reconnect_channel, reconnect_events) =
+            event_channel(manager.clone(), "connect-2", answers);
+        let reconnected = manager
+            .connect(target, "connect-2".to_owned(), reconnect_channel)
+            .await
+            .expect("reconnect to real SSH server");
+        assert_eq!(reconnected.id, location.id);
+        assert!(!has_event(&reconnect_events, "hostKeyPrompt"));
+        let restored_events = listing_events(&manager, &reconnected.id, &projects.id)
+            .await
+            .expect("reuse opaque directory reference after reconnect");
+        assert!(listed_entries(&restored_events)
+            .iter()
+            .any(|entry| entry.name == "notes.txt"));
+
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn changed_host_key_is_blocked_without_a_routine_accept_prompt() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let rejected_answers = PromptAnswers::default();
+        let (channel, rejected_events) =
+            event_channel(manager.clone(), "trust-rejected", rejected_answers);
+        let error = manager
+            .connect(target.clone(), "trust-rejected".to_owned(), channel)
+            .await
+            .expect_err("unknown host key rejection must cancel");
+        assert!(matches!(error, ExplorerError::Cancelled));
+        assert!(has_event(&rejected_events, "hostKeyPrompt"));
+        assert!(std::fs::read_to_string(&target.known_hosts_path)
+            .unwrap_or_default()
+            .is_empty());
+
+        let (channel, _) = event_channel(manager.clone(), "trust-1", answers.clone());
+        manager
+            .connect(target.clone(), "trust-1".to_owned(), channel)
+            .await
+            .expect("establish trusted host key");
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.rotate_host_key().await;
+
+        let (channel, events) = event_channel(manager.clone(), "trust-2", answers);
+        let error = manager
+            .connect(target, "trust-2".to_owned(), channel)
+            .await
+            .expect_err("changed host key must be blocked");
+        assert!(matches!(error, ExplorerError::HostKeyFailure(_)));
+        assert!(!has_event(&events, "hostKeyPrompt"));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn encrypted_private_key_prompts_without_exposing_the_passphrase() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(
+            &server,
+            vec![server.encrypted_identity_file().to_owned()],
+            true,
+        );
+        let rejected_passphrase = "wrong private key passphrase";
+        let rejected_answers = PromptAnswers {
+            accept_host_key: true,
+            passphrase: Some(rejected_passphrase.to_owned()),
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "passphrase-rejected", rejected_answers);
+        let error = manager
+            .connect(target.clone(), "passphrase-rejected".to_owned(), channel)
+            .await
+            .expect_err("wrong private-key passphrase must fail");
+        assert!(matches!(error, ExplorerError::AuthenticationFailed(_)));
+        assert!(!error.to_string().contains(rejected_passphrase));
+
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            passphrase: Some(server.passphrase().to_owned()),
+            ..PromptAnswers::default()
+        };
+        let (channel, events) = event_channel(manager.clone(), "passphrase", answers);
+        manager
+            .connect(target, "passphrase".to_owned(), channel)
+            .await
+            .expect("unlock encrypted identity and connect");
+        let serialized_events = serde_json::to_string(&*events.lock().expect("passphrase events"))
+            .expect("serialize events");
+        assert!(serialized_events.contains("passphrase"));
+        assert!(serialized_events.contains("\"secret\":true"));
+        assert!(!serialized_events.contains(server.passphrase()));
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ssh_agent_identity_authenticates_without_a_secret_prompt() {
+        let _environment_lock = SSH_AGENT_ENV_LOCK.lock().await;
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let agent = server.start_agent().await;
+        let environment =
+            EnvironmentVariableGuard::set("SSH_AUTH_SOCK", agent.socket_path().as_os_str());
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, Vec::new(), false);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, events) = event_channel(manager.clone(), "agent", answers);
+        manager
+            .connect(target, "agent".to_owned(), channel)
+            .await
+            .expect("authenticate with the disposable SSH agent");
+        assert!(!has_event(&events, "authenticationPrompt"));
+        manager.disconnect("test-target").await.expect("disconnect");
+        drop(environment);
+        agent.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn password_and_keyboard_interactive_authenticate_without_secret_leakage() {
+        let password_server = TestSshServer::start(TestAuthMode::Password).await;
+        let password_manager = Arc::new(SshConnectionManager::default());
+        let password_target = target_for(&password_server, Vec::new(), true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            password: Some(password_server.password().to_owned()),
+            ..PromptAnswers::default()
+        };
+        let (channel, events) = event_channel(password_manager.clone(), "password-ok", answers);
+        password_manager
+            .connect(password_target.clone(), "password-ok".to_owned(), channel)
+            .await
+            .expect("password authentication");
+        assert!(
+            !serde_json::to_string(&*events.lock().expect("password events"))
+                .expect("serialize password events")
+                .contains(password_server.password())
+        );
+        password_manager
+            .disconnect("test-target")
+            .await
+            .expect("disconnect");
+
+        let rejected_secret = "definitely-wrong-secret";
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            password: Some(rejected_secret.to_owned()),
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(password_manager.clone(), "password-bad", answers);
+        let error = password_manager
+            .connect(password_target, "password-bad".to_owned(), channel)
+            .await
+            .expect_err("wrong password must fail");
+        assert!(matches!(error, ExplorerError::AuthenticationFailed(_)));
+        assert!(!error.to_string().contains(rejected_secret));
+        password_server.shutdown().await;
+
+        let challenge_server = TestSshServer::start(TestAuthMode::KeyboardInteractive).await;
+        let challenge_manager = Arc::new(SshConnectionManager::default());
+        let challenge_target = target_for(&challenge_server, Vec::new(), true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            keyboard_interactive: Some(challenge_server.challenge_answer().to_owned()),
+            ..PromptAnswers::default()
+        };
+        let (channel, events) = event_channel(challenge_manager.clone(), "challenge", answers);
+        challenge_manager
+            .connect(challenge_target, "challenge".to_owned(), channel)
+            .await
+            .expect("keyboard-interactive authentication");
+        assert!(events
+            .lock()
+            .expect("challenge events")
+            .iter()
+            .any(|event| {
+                event.get("event").and_then(Value::as_str) == Some("authenticationPrompt")
+                    && event.get("kind").and_then(Value::as_str) == Some("keyboardInteractive")
+            }));
+        challenge_manager
+            .disconnect("test-target")
+            .await
+            .expect("disconnect");
+        challenge_server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_sftp_is_actionable_and_slow_listing_is_cancellable() {
+        let unsupported_server =
+            TestSshServer::start_with_options(TestAuthMode::PublicKey, false, Duration::ZERO).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(
+            &unsupported_server,
+            vec![unsupported_server.identity_file().to_owned()],
+            true,
+        );
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "no-sftp", answers);
+        let error = manager
+            .connect(target, "no-sftp".to_owned(), channel)
+            .await
+            .expect_err("server without SFTP must fail");
+        assert!(matches!(error, ExplorerError::Unsupported(_)));
+        unsupported_server.shutdown().await;
+
+        let slow_server = TestSshServer::start_with_options(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::from_secs(5),
+        )
+        .await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(
+            &slow_server,
+            vec![slow_server.identity_file().to_owned()],
+            true,
+        );
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "slow-connect", answers);
+        let location = manager
+            .connect(target, "slow-connect".to_owned(), channel)
+            .await
+            .expect("connect to slow SFTP fixture");
+        let root = listing_events(&manager, &location.id, &location.root.id)
+            .await
+            .expect("list root");
+        let slow = listed_entries(&root)
+            .into_iter()
+            .find(|entry| entry.name == "slow")
+            .and_then(|entry| entry.directory)
+            .expect("slow directory");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task_manager = manager.clone();
+        let task_cancelled = cancelled.clone();
+        let location_id = location.id.clone();
+        let slow_id = slow.id.clone();
+        let listing = tokio::spawn(async move {
+            task_manager
+                .list_directory(&location_id, &slow_id, &task_cancelled, |_| Ok(()))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancelled.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(1), listing)
+            .await
+            .expect("cancellation must not wait for the server delay")
+            .expect("listing task");
+        assert!(matches!(result, Err(ExplorerError::Cancelled)));
+        manager.disconnect("test-target").await.expect("disconnect");
+        slow_server.shutdown().await;
     }
 }

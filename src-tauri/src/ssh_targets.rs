@@ -27,6 +27,7 @@ pub enum SshTargetSource {
 #[serde(rename_all = "camelCase")]
 pub struct SshTargetSummaryDto {
     pub id: String,
+    pub location_id: String,
     pub name: String,
     pub source: SshTargetSource,
     pub endpoint: String,
@@ -119,6 +120,7 @@ impl SshTargetStore {
                 Err(_) => (format!("config:{alias}"), "SSH config".to_owned()),
             };
             SshTargetSummaryDto {
+                location_id: location_id(&id),
                 id,
                 name: alias,
                 source: SshTargetSource::OpenSshConfig,
@@ -267,6 +269,7 @@ fn normalized_optional(value: Option<String>) -> Option<String> {
 fn summary_for_stored(target: &StoredTarget) -> SshTargetSummaryDto {
     SshTargetSummaryDto {
         id: target.id.clone(),
+        location_id: location_id(&target.id),
         name: target.name.clone(),
         source: SshTargetSource::Manual,
         endpoint: endpoint(&target.username, &target.host, target.port),
@@ -283,6 +286,10 @@ fn summary_for_stored(target: &StoredTarget) -> SshTargetSummaryDto {
             identities_only: target.identities_only,
         }),
     }
+}
+
+pub fn location_id(target_id: &str) -> String {
+    format!("ssh:{target_id}")
 }
 
 fn endpoint(username: &str, host: &str, port: u16) -> String {

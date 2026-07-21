@@ -13,6 +13,7 @@
   import PanelLeftOpenIcon from "@lucide/svelte/icons/panel-left-open";
   import PencilIcon from "@lucide/svelte/icons/pencil";
   import PlusIcon from "@lucide/svelte/icons/plus";
+  import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import ServerIcon from "@lucide/svelte/icons/server";
   import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import UnplugIcon from "@lucide/svelte/icons/unplug";
@@ -135,15 +136,14 @@
         {#each state.sshTargets as target (target.id)}
           <div class="group flex min-w-0 items-center">
             <Button
-              variant={target.connectedLocationId === state.activeLocation?.id
+              variant={target.locationId === state.activeLocation?.id
                 ? "secondary"
                 : "ghost"}
               size={compact ? "icon" : "sm"}
               class={compact
                 ? "relative w-full"
                 : "min-w-0 flex-1 justify-start"}
-              aria-current={target.connectedLocationId ===
-              state.activeLocation?.id
+              aria-current={target.locationId === state.activeLocation?.id
                 ? "page"
                 : undefined}
               title={`${target.name} · ${target.endpoint} · ${target.status}`}
@@ -204,6 +204,18 @@
                   {/snippet}
                 </DropdownMenu.Trigger>
                 <DropdownMenu.Content align="start">
+                  {#if target.status !== "connected" && target.status !== "connecting"}
+                    <DropdownMenu.Item
+                      onclick={() => void state.connectSshTarget(target.id)}
+                    >
+                      <RefreshCwIcon />
+                      {state.locations.some(
+                        (location) => location.id === target.locationId,
+                      )
+                        ? "Reconnect"
+                        : "Connect"}
+                    </DropdownMenu.Item>
+                  {/if}
                   {#if target.editable}
                     <DropdownMenu.Item
                       onclick={() => state.openEditSshTarget(target.id)}

@@ -24,7 +24,10 @@ const nameCollator = new Intl.Collator(undefined, {
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
 
-type SshPromptEvent = Exclude<SshConnectionEvent, { event: "state" }>;
+type SshPromptEvent = Extract<
+  SshConnectionEvent,
+  { event: "hostKeyPrompt" | "authenticationPrompt" }
+>;
 
 export interface PendingSshPrompt {
   targetId: string;
@@ -74,6 +77,16 @@ export class ExplorerState {
   get activeLocation(): LocationSummary | undefined {
     const locationId = this.activeTab?.locationId;
     return this.locations.find(({ id }) => id === locationId);
+  }
+
+  get activeSshTarget(): SshTargetSummary | undefined {
+    const locationId = this.activeTab?.locationId;
+    return this.sshTargets.find((target) => target.locationId === locationId);
+  }
+
+  get activeSshLocationOffline(): boolean {
+    const target = this.activeSshTarget;
+    return Boolean(target && target.status !== "connected");
   }
 
   get activeDirectory(): DirectoryRef | undefined {
@@ -207,7 +220,7 @@ export class ExplorerState {
         const previous = this.sshTargets.find(
           ({ id }) => id === this.editingSshTargetId,
         );
-        await this.removeConnectedLocation(previous?.connectedLocationId);
+        await this.removeConnectedLocation(previous?.locationId);
         this.sshTargets = this.sshTargets.map((target) =>
           target.id === saved.id ? saved : target,
         );
@@ -258,6 +271,10 @@ export class ExplorerState {
       const location = await this.dataSource.connectSshTarget(targetId, {
         signal: controller.signal,
         onEvent: (event, respond) => {
+          if (event.event === "disconnected") {
+            this.handleUnexpectedSshDisconnect(event.targetId, event.message);
+            return;
+          }
           if (this.sshConnectionController !== controller) return;
           if (event.event === "state") {
             this.sshConnectionMessage =
@@ -280,7 +297,31 @@ export class ExplorerState {
       ];
       this.setSshTargetStatus(targetId, "connected", location.id);
       this.pendingSshPrompt = null;
-      await this.selectLocation(location.id);
+      const preservedTab =
+        this.activeTab?.locationId === location.id
+          ? this.activeTab
+          : this.tabs.find((tab) => tab.locationId === location.id);
+      if (preservedTab) {
+        this.activeTabId = preservedTab.id;
+        const restored = await this.loadDirectory(
+          preservedTab.directory,
+          (directory) => {
+            preservedTab.directory = directory;
+            preservedTab.history[preservedTab.historyIndex] = directory;
+            preservedTab.title = directory.name;
+          },
+        );
+        if (!restored) {
+          await this.loadDirectory(location.root, (directory) => {
+            preservedTab.directory = directory;
+            preservedTab.history = [directory];
+            preservedTab.historyIndex = 0;
+            preservedTab.title = directory.name;
+          });
+        }
+      } else {
+        await this.selectLocation(location.id);
+      }
     } catch (error) {
       if (!isAbortError(error) && this.sshConnectionController === controller) {
         this.setSshTargetStatus(targetId, "error", null);
@@ -329,7 +370,7 @@ export class ExplorerState {
         targetId,
         new AbortController().signal,
       );
-      await this.removeConnectedLocation(target.connectedLocationId);
+      await this.removeConnectedLocation(target.locationId);
       this.setSshTargetStatus(targetId, "disconnected", null);
     } catch (error) {
       this.sshErrorMessage =
@@ -347,7 +388,7 @@ export class ExplorerState {
         targetId,
         new AbortController().signal,
       );
-      await this.removeConnectedLocation(target.connectedLocationId);
+      await this.removeConnectedLocation(target.locationId);
       this.sshTargets = this.sshTargets.filter(({ id }) => id !== targetId);
     } catch (error) {
       this.sshErrorMessage =
@@ -367,6 +408,31 @@ export class ExplorerState {
         ? { ...target, status, connectedLocationId }
         : target,
     );
+  }
+
+  private handleUnexpectedSshDisconnect(
+    targetId: string,
+    message: string,
+  ): void {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target) return;
+
+    this.setSshTargetStatus(targetId, "disconnected", null);
+    this.locations = this.locations.map((location) =>
+      location.id === target.locationId
+        ? {
+            ...location,
+            status: "offline",
+            detail: "SSH · Connection lost",
+          }
+        : location,
+    );
+    this.sshErrorMessage = message;
+    if (this.activeTab?.locationId === target.locationId) {
+      this.directoryController?.abort();
+      this.loading = false;
+      this.warningMessage = message;
+    }
   }
 
   private async removeConnectedLocation(
@@ -510,6 +576,23 @@ export class ExplorerState {
 
   async goUp(): Promise<void> {
     if (this.parentDirectory) await this.openDirectory(this.parentDirectory);
+  }
+
+  async refreshDirectory(): Promise<void> {
+    const tab = this.activeTab;
+    if (!tab || this.activeSshLocationOffline) return;
+
+    await this.loadDirectory(tab.directory, (directory) => {
+      tab.directory = directory;
+      tab.history[tab.historyIndex] = directory;
+      tab.title = directory.name;
+    });
+  }
+
+  async reconnectActiveSshLocation(): Promise<void> {
+    const target = this.activeSshTarget;
+    if (!target || target.status === "connected") return;
+    await this.connectSshTarget(target.id);
   }
 
   async openEntry(entryId: string): Promise<void> {

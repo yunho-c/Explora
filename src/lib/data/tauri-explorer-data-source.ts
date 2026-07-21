@@ -196,6 +196,7 @@ const parseSshTarget = (value: unknown): SshTargetSummary => {
   }
   return {
     id: requireString(value, "id"),
+    locationId: requireString(value, "locationId"),
     name: requireString(value, "name"),
     source: source as SshTargetSource,
     endpoint: requireString(value, "endpoint"),
@@ -259,6 +260,13 @@ const parseSshConnectionEvent = (value: unknown): SshConnectionEvent => {
         }
         return { label: requireString(field, "label"), secret: field.secret };
       }),
+    };
+  }
+  if (value.event === "disconnected") {
+    return {
+      event: "disconnected",
+      targetId: requireString(value, "targetId"),
+      message: requireString(value, "message"),
     };
   }
   throw new Error("Invalid SSH response: unknown connection event.");
@@ -358,6 +366,8 @@ const requestId = () =>
   `listing-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 export class TauriExplorerDataSource implements ExplorerDataSource {
+  private readonly sshChannels = new Map<string, Channel<unknown>>();
+
   async listLocations(
     signal: AbortSignal,
   ): Promise<readonly LocationSummary[]> {
@@ -415,7 +425,9 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         input,
       });
       if (signal.aborted) throw abortError();
-      return parseSshTarget(payload);
+      const target = parseSshTarget(payload);
+      if (targetId) this.sshChannels.delete(targetId);
+      return target;
     } catch (error) {
       if (signal.aborted) throw abortError();
       throw commandError(error);
@@ -424,6 +436,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
 
   async deleteSshTarget(targetId: string, signal: AbortSignal): Promise<void> {
     await this.simpleSshCommand("delete_ssh_target", targetId, signal);
+    this.sshChannels.delete(targetId);
   }
 
   async disconnectSshTarget(
@@ -431,6 +444,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     signal: AbortSignal,
   ): Promise<void> {
     await this.simpleSshCommand("disconnect_ssh_target", targetId, signal);
+    this.sshChannels.delete(targetId);
   }
 
   private async simpleSshCommand(
@@ -455,6 +469,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     if (signal.aborted) throw abortError();
     const id = requestId();
     let payloadError: Error | null = null;
+    let connected = false;
     const channel = new Channel<unknown>();
     const cancel = () => {
       void invoke("cancel_ssh_connection", { requestId: id }).catch(() => {
@@ -465,18 +480,30 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       if (signal.aborted || payloadError) return;
       try {
         const event = parseSshConnectionEvent(payload);
+        if (event.event === "disconnected") {
+          if (event.targetId !== targetId) {
+            throw new Error(
+              "Invalid SSH response: disconnect target does not match the connection.",
+            );
+          }
+          this.sshChannels.delete(event.targetId);
+        }
         onEvent(event, async (response: SshPromptResponse) => {
           if (signal.aborted) throw abortError();
           try {
             await invoke("respond_ssh_prompt", {
               requestId: id,
-              promptId: event.event === "state" ? "" : event.promptId,
+              promptId: "promptId" in event ? event.promptId : "",
               response,
             });
           } catch (error) {
             throw commandError(error);
           }
         });
+        if (event.event === "disconnected") {
+          payloadError = new Error(event.message);
+          cancel();
+        }
       } catch (error) {
         payloadError =
           error instanceof Error ? error : new Error("Invalid SSH response.");
@@ -493,13 +520,19 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       });
       if (signal.aborted) throw abortError();
       if (payloadError) throw payloadError;
-      return parseLocation(payload);
+      const location = parseLocation(payload);
+      connected = true;
+      if (!this.sshChannels.has(targetId)) {
+        this.sshChannels.set(targetId, channel);
+      }
+      return location;
     } catch (error) {
       if (signal.aborted) throw abortError();
       if (payloadError) throw payloadError;
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);
+      if (!connected) this.sshChannels.delete(targetId);
     }
   }
 

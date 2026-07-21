@@ -74,3 +74,26 @@ test("adds an SSH target and connects a configured demo remote", async ({
   await expect(page.getByRole("tab", { name: "render-node" })).toBeVisible();
   await expect(page.getByText("This location is empty")).toBeVisible();
 });
+
+test("preserves an SSH tab through disconnect, reconnect, and refresh", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByRole("button", { name: /render-node Config/ }).click();
+  const remoteTab = page.getByRole("tab", { name: "render-node" });
+  await expect(remoteTab).toBeVisible();
+
+  await page.getByRole("button", { name: "Manage render-node" }).click();
+  await page.getByRole("menuitem", { name: "Disconnect" }).click();
+  await expect(page.getByText("Remote location is offline")).toBeVisible();
+  await expect(remoteTab).toBeVisible();
+
+  await page.getByRole("button", { name: "Reconnect" }).click();
+  await expect(page.getByText("Remote location is offline")).toBeHidden();
+  await expect(remoteTab).toBeVisible();
+
+  await page.getByRole("button", { name: "Refresh current folder" }).click();
+  await expect(page.getByText("This location is empty")).toBeVisible();
+  await expect(remoteTab).toBeVisible();
+});

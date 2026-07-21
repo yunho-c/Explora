@@ -1,8 +1,10 @@
 <script lang="ts">
   import SearchIcon from "@lucide/svelte/icons/search";
+  import ServerOffIcon from "@lucide/svelte/icons/server-off";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
   import { Input } from "$lib/components/ui/input";
+  import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
 
   import ExplorerSidebar from "./ExplorerSidebar.svelte";
@@ -17,6 +19,16 @@
   let { state }: { state: ExplorerState } = $props();
 
   const handleKeydown = (event: KeyboardEvent) => {
+    const refreshShortcut =
+      event.key === "F5" ||
+      (event.key.toLocaleLowerCase() === "r" &&
+        (event.metaKey || event.ctrlKey));
+    if (refreshShortcut) {
+      event.preventDefault();
+      void state.refreshDirectory();
+      return;
+    }
+
     const target = event.target;
     const isTextInput =
       target instanceof Element &&
@@ -66,6 +78,28 @@
           class="pl-8"
         />
       </div>
+
+      {#if state.activeSshLocationOffline}
+        <div
+          class="mx-4 mt-4 flex items-center gap-3 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+        >
+          <ServerOffIcon class="size-4 shrink-0 text-muted-foreground" />
+          <div class="min-w-0 flex-1">
+            <p class="font-medium">Remote location is offline</p>
+            <p class="truncate text-xs text-muted-foreground">
+              Your folder and tab history are preserved.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            disabled={Boolean(state.connectingTargetId)}
+            onclick={() => void state.reconnectActiveSshLocation()}
+          >
+            Reconnect
+          </Button>
+        </div>
+      {/if}
 
       {#if state.errorMessage}
         <div

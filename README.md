@@ -49,8 +49,19 @@ supports agents, standard or configured identity files, encrypted-key
 passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
 `known_hosts` files, requires confirmation for unknown keys, and blocks changed
 keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
-silently executed. File watching, mounted-volume discovery, hidden-file controls,
-mutations, and content previews remain later vertical slices.
+silently executed. Bounded keepalives detect dropped sessions, offline tabs retain
+their current folder and history, and an explicit reconnect resumes the same
+opaque directory reference when it is still valid. Refresh reloads the active
+folder without changing navigation history. File watching, mounted-volume
+discovery, hidden-file controls, mutations, and content previews remain later
+vertical slices.
+
+Rust integration tests start disposable loopback SSH/SFTP servers and cover host
+trust, supported authentication methods, secret-safe prompts and errors,
+permission and symlink behavior, missing SFTP, delayed-request cancellation,
+disconnect detection, and reconnect continuity. The disposable SSH-agent test is
+Unix-only; the Windows Pageant and named-pipe paths remain platform-gated code
+that require Windows validation.
 
 ## Prerequisites
 

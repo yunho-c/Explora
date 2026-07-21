@@ -37,6 +37,7 @@ const entryPayload = {
 
 const sshTargetPayload = {
   id: "manual:target-1",
+  locationId: "ssh:manual:target-1",
   name: "Staging",
   source: "manual",
   endpoint: "deploy@staging.example.com",
@@ -57,6 +58,7 @@ const sshTargetPayload = {
 const sendChannelMessages = (
   channel: unknown,
   messages: readonly unknown[],
+  end = true,
 ) => {
   const toJson =
     typeof channel === "object" && channel !== null
@@ -80,7 +82,9 @@ const sendChannelMessages = (
   messages.forEach((message, index) => {
     internals.runCallback(callbackId, { index, message });
   });
-  internals.runCallback(callbackId, { index: messages.length, end: true });
+  if (end) {
+    internals.runCallback(callbackId, { index: messages.length, end: true });
+  }
 };
 
 afterEach(() => clearMocks());
@@ -257,5 +261,51 @@ describe("TauriExplorerDataSource", () => {
       promptId: "prompt-1",
       response: { response: "accept" },
     });
+  });
+
+  it("keeps the SSH event channel alive for disconnects after connect resolves", async () => {
+    let eventChannel: unknown;
+    mockIPC((command, payload) => {
+      if (command === "connect_ssh_target") {
+        if (
+          !payload ||
+          Array.isArray(payload) ||
+          payload instanceof ArrayBuffer ||
+          payload instanceof Uint8Array
+        ) {
+          throw new Error("Expected SSH command arguments.");
+        }
+        eventChannel = payload.onEvent;
+        return { ...locationPayload, kind: "ssh", role: "ssh" };
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const onEvent = vi.fn();
+    await source.connectSshTarget("manual:target-1", {
+      signal: new AbortController().signal,
+      onEvent,
+    });
+    sendChannelMessages(
+      eventChannel,
+      [
+        {
+          event: "disconnected",
+          targetId: "manual:target-1",
+          message: "The SSH connection was lost.",
+        },
+      ],
+      false,
+    );
+
+    expect(onEvent).toHaveBeenCalledWith(
+      {
+        event: "disconnected",
+        targetId: "manual:target-1",
+        message: "The SSH connection was lost.",
+      },
+      expect.any(Function),
+    );
   });
 });

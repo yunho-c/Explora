@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { DirectoryRef } from "$lib/contracts/explorer";
+import type { SshConnectionEvent } from "$lib/contracts/explorer";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
-import type { ListDirectoryOptions } from "$lib/data/explorer-data-source";
+import type {
+  ConnectSshOptions,
+  ListDirectoryOptions,
+} from "$lib/data/explorer-data-source";
 
 import { ExplorerState } from "./explorer-state.svelte";
 
@@ -33,6 +37,31 @@ class StaleResultDataSource extends DemoExplorerDataSource {
       breadcrumbs: [{ label: directory.name, directory }],
     });
     options.onComplete({ skippedEntries: 0 });
+  }
+}
+
+class ObservableSshDataSource extends DemoExplorerDataSource {
+  listingCount = 0;
+  private onSshEvent: ConnectSshOptions["onEvent"] | null = null;
+
+  override async connectSshTarget(
+    targetId: string,
+    options: ConnectSshOptions,
+  ) {
+    this.onSshEvent = options.onEvent;
+    return super.connectSshTarget(targetId, options);
+  }
+
+  override async listDirectory(
+    directory: DirectoryRef,
+    options: ListDirectoryOptions,
+  ): Promise<void> {
+    this.listingCount += 1;
+    return super.listDirectory(directory, options);
+  }
+
+  emitSshEvent(event: SshConnectionEvent): void {
+    this.onSshEvent?.(event, async () => {});
   }
 }
 
@@ -183,5 +212,45 @@ describe("ExplorerState", () => {
     expect(state.activeTabId).toBe(remoteTabId);
     expect(state.activeLocation?.status).toBe("offline");
     expect(state.activeDirectory?.name).toBe("render-node");
+  });
+
+  it("marks dropped SSH tabs offline and reconnects their current directory", async () => {
+    const dataSource = new ObservableSshDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectSshTarget("demo:render-node");
+    const directory = state.activeDirectory!;
+    const tabId = state.activeTabId;
+
+    dataSource.emitSshEvent({
+      event: "disconnected",
+      targetId: "demo:render-node",
+      message: "The SSH connection was lost. Reconnect to continue browsing.",
+    });
+
+    expect(state.activeTabId).toBe(tabId);
+    expect(state.activeDirectory).toEqual(directory);
+    expect(state.activeLocation?.status).toBe("offline");
+    expect(state.warningMessage).toContain("connection was lost");
+
+    await state.reconnectActiveSshLocation();
+
+    expect(state.activeTabId).toBe(tabId);
+    expect(state.activeDirectory?.id).toBe(directory.id);
+    expect(state.activeLocation?.status).toBe("connected");
+  });
+
+  it("refreshes the active directory in place without changing history", async () => {
+    const dataSource = new ObservableSshDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const history = [...state.activeTab!.history];
+    const initialListings = dataSource.listingCount;
+
+    await state.refreshDirectory();
+
+    expect(dataSource.listingCount).toBe(initialListings + 1);
+    expect(state.activeTab?.history).toEqual(history);
+    expect(state.activeTab?.historyIndex).toBe(0);
   });
 });

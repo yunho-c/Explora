@@ -6,6 +6,9 @@ use thiserror::Error;
 pub const LISTING_BATCH_SIZE: usize = 256;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub const SSH_KEEPALIVE_MAX: usize = 3;
+pub const SFTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

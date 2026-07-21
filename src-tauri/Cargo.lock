@@ -1178,7 +1178,9 @@ dependencies = [
 name = "explora"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "glob",
+ "rand",
  "russh",
  "russh-config",
  "russh-sftp",

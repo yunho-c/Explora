@@ -55,6 +55,7 @@ export interface LocationSummary {
 
 export interface SshTargetSummary {
   id: string;
+  locationId: string;
   name: string;
   source: SshTargetSource;
   endpoint: string;
@@ -99,6 +100,11 @@ export type SshConnectionEvent =
       title: string;
       instructions: string;
       fields: SshPromptField[];
+    }
+  | {
+      event: "disconnected";
+      targetId: string;
+      message: string;
     };
 
 export type SshPromptResponse =

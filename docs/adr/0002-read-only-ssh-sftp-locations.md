@@ -38,11 +38,22 @@ Known matching keys connect without prompting. Unknown keys require an explicit
 SHA256 fingerprint confirmation before being appended. A changed key is a
 blocking error and cannot be accepted through the routine first-use prompt.
 
-Every active remote session owns an opaque registry from random tokens to SFTP
-paths. Directory listings use those tokens, emit the same bounded event batches
-as local listings, and never parse shell output. Connection attempts and
-listings have explicit request IDs and cancellation paths. Disconnecting marks
-open frontend locations offline so tab and navigation intent remain visible.
+Every saved remote target owns an opaque registry from random tokens to SFTP
+paths. The registry survives routine disconnects so a manual reconnect can reopen
+the current folder and retain Back/Forward history; editing or deleting the
+target invalidates it. Directory listings use those tokens, emit the same bounded
+event batches as local listings, and never parse shell output. Connection
+attempts and listings have explicit request IDs and cancellation paths, including
+while an SFTP response is delayed.
+
+Client sessions use TCP no-delay, a 15-second idle keepalive interval, a maximum
+of three unanswered keepalives, and a 30-second SFTP request timeout. An
+unexpected transport close produces a typed disconnect event, removes the
+session from the available-location view, and marks open frontend locations
+offline without clearing their last directory contents or history. Reconnection
+is explicit and user initiated; Explora does not automatically repeat operations
+whose outcome might be uncertain. A manual refresh reloads the active directory
+in place without adding navigation history.
 
 This slice is read-only. It lists metadata and navigates directories but does not
 upload, download, rename, delete, or execute remote commands.
@@ -71,11 +82,19 @@ than executing arbitrary OpenSSH configuration behavior.
   unsupported-server error instead of falling back to shell commands.
 - Includes have a depth limit and cycle detection. Proxy commands are never
   launched.
+- A disposable in-process SSH/SFTP server exercises real socket handshakes,
+  first-use and changed host keys, identity files, encrypted keys, a Unix SSH
+  agent, password and keyboard-interactive authentication, secret redaction,
+  SFTP absence, permissions, symlinks, latency cancellation, connection loss,
+  and opaque-reference reuse after reconnect. The agent scenario is Unix-only;
+  Windows keeps its Pageant and named-pipe client paths behind platform-specific
+  code.
 
 ## Consequences
 
 OpenSSH configurations that depend on jump hosts cannot connect yet, though
 their concrete aliases remain visible with a clear error. Connection state is
-session-scoped, and users authenticate again after restarting Explora. Future
-write operations, transfers, reconnect policy, persistent secrets, or jump-host
+session-scoped, and users authenticate again after restarting Explora. Reconnect
+is manual and does not yet include an automatic retry policy. Future write
+operations, transfers, automatic retries, persistent secrets, or jump-host
 support require separate capability, progress, conflict, and threat-model work.

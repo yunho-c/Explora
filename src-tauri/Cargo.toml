@@ -31,3 +31,8 @@ thiserror = "2.0.19"
 tokio = { version = "1.48.0", features = ["sync", "time"] }
 uuid = { version = "1.24.0", features = ["v4"] }
 zeroize = "1.8.2"
+
+[dev-dependencies]
+futures = "0.3.31"
+rand = "0.10.0"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }

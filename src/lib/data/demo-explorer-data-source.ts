@@ -489,6 +489,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   private sshTargets: SshTargetSummary[] = [
     {
       id: "demo:staging-box",
+      locationId: "staging-box",
       name: "staging-box",
       source: "manual",
       endpoint: "deploy@staging.example.com",
@@ -507,6 +508,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     },
     {
       id: "demo:render-node",
+      locationId: "render-node",
       name: "render-node",
       source: "openSshConfig",
       endpoint: "yunho@render.example.com",
@@ -538,8 +540,10 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     signal: AbortSignal,
   ): Promise<SshTargetSummary> {
     await wait(40, signal);
+    const id = `demo:manual:${Date.now()}`;
     const target: SshTargetSummary = {
-      id: `demo:manual:${Date.now()}`,
+      id,
+      locationId: `ssh:${id}`,
       name: input.name,
       source: "manual",
       endpoint: `${input.username}@${input.host}${input.port === 22 ? "" : `:${input.port}`}`,

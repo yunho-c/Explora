@@ -112,7 +112,7 @@ pub async fn update_ssh_target(
         .map_err(ExplorerErrorDto::from)?;
     state
         .ssh
-        .disconnect(&target_id)
+        .forget_target(&target_id)
         .await
         .map_err(ExplorerErrorDto::from)?;
     Ok(summary)
@@ -125,7 +125,7 @@ pub async fn delete_ssh_target(
 ) -> Result<(), ExplorerErrorDto> {
     state
         .ssh
-        .disconnect(&target_id)
+        .forget_target(&target_id)
         .await
         .map_err(ExplorerErrorDto::from)?;
     state

@@ -7,6 +7,7 @@
   import ListIcon from "@lucide/svelte/icons/list";
   import MenuIcon from "@lucide/svelte/icons/menu";
   import MoreHorizontalIcon from "@lucide/svelte/icons/ellipsis";
+  import RefreshCwIcon from "@lucide/svelte/icons/refresh-cw";
   import SearchIcon from "@lucide/svelte/icons/search";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
@@ -127,6 +128,17 @@
     </Button>
   </div>
 
+  <Button
+    variant="ghost"
+    size="icon-sm"
+    disabled={state.loading || state.activeSshLocationOffline}
+    aria-label="Refresh current folder"
+    title="Refresh current folder"
+    onclick={() => void state.refreshDirectory()}
+  >
+    <RefreshCwIcon class={state.loading ? "animate-spin" : undefined} />
+  </Button>
+
   <DropdownMenu.Root>
     <DropdownMenu.Trigger>
       {#snippet child({ props })}
@@ -145,6 +157,13 @@
       <DropdownMenu.Item disabled>New folder</DropdownMenu.Item>
       <DropdownMenu.Item disabled>Connect to server</DropdownMenu.Item>
       <DropdownMenu.Separator />
+      <DropdownMenu.Item
+        disabled={state.loading || state.activeSshLocationOffline}
+        onclick={() => void state.refreshDirectory()}
+      >
+        <RefreshCwIcon />
+        Refresh
+      </DropdownMenu.Item>
       <DropdownMenu.Item onclick={() => void state.openTab()}
         >Open current location in new tab</DropdownMenu.Item
       >
