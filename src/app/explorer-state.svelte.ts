@@ -16,7 +16,12 @@ import type {
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
-import type { LayoutPreferencesPatch } from "$lib/contracts/preferences";
+import {
+  DEFAULT_FAVORITE_ROLES,
+  isFavoriteRole,
+  type FavoriteRole,
+  type LayoutPreferencesPatch,
+} from "$lib/contracts/preferences";
 import { compareFileSizes } from "$lib/file-metadata";
 
 const nameCollator = new Intl.Collator(undefined, {
@@ -76,6 +81,8 @@ export class ExplorerState {
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
   sidebarCollapsed = $state(false);
+  favoriteRoles = $state<FavoriteRole[]>([...DEFAULT_FAVORITE_ROLES]);
+  editingFavorites = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
   editingSshTargetId = $state<string | null>(null);
@@ -163,6 +170,18 @@ export class ExplorerState {
     });
   }
 
+  get availableFavoriteLocations(): LocationSummary[] {
+    return this.locations.filter(
+      ({ kind, role }) => kind === "local" && isFavoriteRole(role),
+    );
+  }
+
+  get visibleFavoriteLocations(): LocationSummary[] {
+    return this.availableFavoriteLocations.filter(({ role }) =>
+      this.favoriteRoles.includes(role as FavoriteRole),
+    );
+  }
+
   async initialize(): Promise<void> {
     await this.initializePreferences();
     const controller = new AbortController();
@@ -218,6 +237,7 @@ export class ExplorerState {
       this.sidebarCollapsed = snapshot.preferences.layout.sidebarCollapsed;
       this.viewMode = snapshot.preferences.layout.viewMode;
       this.sort = { ...snapshot.preferences.layout.sort };
+      this.favoriteRoles = [...snapshot.preferences.layout.favoriteRoles];
       this.preferencesWarningMessage = snapshot.warning?.message ?? null;
     } catch (error) {
       this.preferencesWarningMessage =
@@ -600,6 +620,14 @@ export class ExplorerState {
   setSidebarCollapsed(sidebarCollapsed: boolean): void {
     this.sidebarCollapsed = sidebarCollapsed;
     this.persistLayoutPreferences({ sidebarCollapsed });
+  }
+
+  setFavoriteVisible(role: FavoriteRole, visible: boolean): void {
+    const favoriteRoles = DEFAULT_FAVORITE_ROLES.filter((candidate) =>
+      candidate === role ? visible : this.favoriteRoles.includes(candidate),
+    );
+    this.favoriteRoles = [...favoriteRoles];
+    this.persistLayoutPreferences({ favoriteRoles: [...favoriteRoles] });
   }
 
   selectEntry(entryId: string): void {

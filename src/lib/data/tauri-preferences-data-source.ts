@@ -1,10 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type {
-  PreferencesSnapshot,
-  PreferencesWarningCode,
-  UserPreferences,
-  UserPreferencesPatch,
+import {
+  DEFAULT_FAVORITE_ROLES,
+  isFavoriteRole,
+  type FavoriteRole,
+  type PreferencesSnapshot,
+  type PreferencesWarningCode,
+  type UserPreferences,
+  type UserPreferencesPatch,
 } from "$lib/contracts/preferences";
 import type {
   SortColumn,
@@ -56,6 +59,29 @@ const parsePreferences = (value: unknown): UserPreferences => {
   ) {
     throw new Error("Invalid preference response: sort direction is unknown.");
   }
+  if (
+    !Array.isArray(layout.favoriteRoles) ||
+    layout.favoriteRoles.some(
+      (role) => typeof role !== "string" || !isFavoriteRole(role),
+    )
+  ) {
+    throw new Error(
+      "Invalid preference response: favorite roles are malformed.",
+    );
+  }
+  const favoriteRoles = layout.favoriteRoles as FavoriteRole[];
+  const favoriteRoleSet = new Set(favoriteRoles);
+  const canonicalFavoriteRoles = DEFAULT_FAVORITE_ROLES.filter((role) =>
+    favoriteRoleSet.has(role),
+  );
+  if (
+    favoriteRoleSet.size !== favoriteRoles.length ||
+    favoriteRoles.some((role, index) => role !== canonicalFavoriteRoles[index])
+  ) {
+    throw new Error(
+      "Invalid preference response: favorite roles are not canonical.",
+    );
+  }
 
   return {
     layout: {
@@ -65,6 +91,7 @@ const parsePreferences = (value: unknown): UserPreferences => {
         column: layout.sort.column as SortColumn,
         direction: layout.sort.direction as SortDirection,
       },
+      favoriteRoles: [...favoriteRoles],
     },
   };
 };

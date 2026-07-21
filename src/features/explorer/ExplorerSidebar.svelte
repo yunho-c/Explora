@@ -1,5 +1,8 @@
 <script lang="ts">
+  import CheckIcon from "@lucide/svelte/icons/check";
   import DownloadIcon from "@lucide/svelte/icons/download";
+  import CircleMinusIcon from "@lucide/svelte/icons/circle-minus";
+  import CirclePlusIcon from "@lucide/svelte/icons/circle-plus";
   import FileTextIcon from "@lucide/svelte/icons/file-text";
   import FilmIcon from "@lucide/svelte/icons/film";
   import HardDriveIcon from "@lucide/svelte/icons/hard-drive";
@@ -14,6 +17,7 @@
   import PencilIcon from "@lucide/svelte/icons/pencil";
   import PlusIcon from "@lucide/svelte/icons/plus";
   import ServerIcon from "@lucide/svelte/icons/server";
+  import Settings2Icon from "@lucide/svelte/icons/settings-2";
   import Trash2Icon from "@lucide/svelte/icons/trash-2";
   import UnplugIcon from "@lucide/svelte/icons/unplug";
   import XIcon from "@lucide/svelte/icons/x";
@@ -25,6 +29,7 @@
   import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
   import * as Sheet from "$lib/components/ui/sheet";
   import type { LocationRole } from "$lib/contracts/explorer";
+  import { isFavoriteRole } from "$lib/contracts/preferences";
   import { cn } from "$lib/utils";
 
   let {
@@ -35,6 +40,9 @@
   const customChrome = $derived(
     chromeMode === "activating" || chromeMode === "custom",
   );
+  const elementRefs = {
+    favoritesEditButton: null as HTMLButtonElement | null,
+  };
 
   const iconsByRole = {
     home: HouseIcon,
@@ -49,7 +57,28 @@
   } satisfies Record<LocationRole, typeof HouseIcon>;
 
   const iconFor = (role: LocationRole) => iconsByRole[role];
+
+  const favoriteIsVisible = (role: LocationRole) =>
+    isFavoriteRole(role) && state.favoriteRoles.includes(role);
+
+  const toggleFavorite = (role: LocationRole) => {
+    if (!isFavoriteRole(role)) return;
+    state.setFavoriteVisible(role, !state.favoriteRoles.includes(role));
+  };
+
+  const finishEditingFavorites = (restoreFocus = false) => {
+    state.editingFavorites = false;
+    if (restoreFocus) elementRefs.favoritesEditButton?.focus();
+  };
+
+  const handleKeydown = (event: KeyboardEvent) => {
+    if (!state.editingFavorites || event.key !== "Escape") return;
+    event.preventDefault();
+    finishEditingFavorites(true);
+  };
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 {#snippet navigation(compact: boolean, titlebar: boolean)}
   <div class="flex h-full min-h-0 flex-col">
@@ -78,28 +107,92 @@
       class="explora-sidebar-scroll min-h-0 flex-1 overflow-y-auto px-2 pb-4"
     >
       {#if !compact}
-        <p class="px-2 pt-3 pb-1 text-xs font-medium text-muted-foreground">
-          Favorites
-        </p>
+        <div
+          class="group/favorites flex items-center justify-between px-2 pt-3 pb-1"
+        >
+          <p class="text-xs font-medium text-muted-foreground">Favorites</p>
+          <Button
+            bind:ref={elementRefs.favoritesEditButton}
+            variant="ghost"
+            size="icon-xs"
+            class={cn(
+              "transition-opacity",
+              state.editingFavorites
+                ? "opacity-100"
+                : "opacity-100 md:opacity-0 md:group-focus-within/favorites:opacity-100 md:group-hover/favorites:opacity-100",
+            )}
+            title={state.editingFavorites
+              ? "Finish editing favorites"
+              : "Configure favorites"}
+            aria-label={state.editingFavorites
+              ? "Finish editing favorites"
+              : "Configure favorites"}
+            aria-pressed={state.editingFavorites}
+            onclick={() => {
+              if (state.editingFavorites) finishEditingFavorites();
+              else state.editingFavorites = true;
+            }}
+          >
+            {#if state.editingFavorites}<CheckIcon />{:else}<Settings2Icon
+              />{/if}
+          </Button>
+        </div>
       {/if}
       <nav aria-label="Favorites" class="space-y-1">
-        {#each state.locations.filter(({ kind }) => kind === "local") as location (location.id)}
+        {#each state.editingFavorites ? state.availableFavoriteLocations : state.visibleFavoriteLocations as location (location.id)}
           {@const Icon = iconFor(location.role)}
-          <Button
-            variant={state.activeLocation?.id === location.id
-              ? "secondary"
-              : "ghost"}
-            size={compact ? "icon" : "sm"}
-            class={compact ? "w-full" : "w-full justify-start gap-2"}
-            aria-current={state.activeLocation?.id === location.id
-              ? "page"
-              : undefined}
-            title={compact ? location.name : undefined}
-            onclick={() => void state.selectLocation(location.id)}
+          {@const activeFavorite = favoriteIsVisible(location.role)}
+          <div
+            class="flex min-w-0 items-center gap-1"
+            data-favorite-active={activeFavorite}
           >
-            <Icon />
-            {#if !compact}<span class="truncate">{location.name}</span>{/if}
-          </Button>
+            {#if activeFavorite}
+              <Button
+                variant={state.activeLocation?.id === location.id
+                  ? "secondary"
+                  : "ghost"}
+                size={compact ? "icon" : "sm"}
+                class={compact
+                  ? "w-full"
+                  : "min-w-0 flex-1 justify-start gap-2"}
+                aria-current={state.activeLocation?.id === location.id
+                  ? "page"
+                  : undefined}
+                title={compact ? location.name : undefined}
+                onclick={() => void state.selectLocation(location.id)}
+              >
+                <Icon />
+                {#if !compact}<span class="truncate">{location.name}</span>{/if}
+              </Button>
+            {:else}
+              <div
+                class="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-dashed border-border/60 bg-muted/20 px-2.5 text-sm text-muted-foreground"
+                aria-label={`${location.name}, not in Favorites`}
+              >
+                <Icon class="size-4 shrink-0 opacity-60" />
+                <span class="truncate">{location.name}</span>
+              </div>
+            {/if}
+            {#if state.editingFavorites && isFavoriteRole(location.role)}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class={activeFavorite
+                  ? "text-muted-foreground hover:text-destructive"
+                  : "text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"}
+                title={activeFavorite
+                  ? `Remove ${location.name} from Favorites`
+                  : `Add ${location.name} to Favorites`}
+                aria-label={activeFavorite
+                  ? `Remove ${location.name} from Favorites`
+                  : `Add ${location.name} to Favorites`}
+                onclick={() => toggleFavorite(location.role)}
+              >
+                {#if activeFavorite}<CircleMinusIcon />{:else}<CirclePlusIcon
+                  />{/if}
+              </Button>
+            {/if}
+          </div>
         {/each}
       </nav>
 
@@ -310,7 +403,10 @@
     class="absolute bottom-3 ml-3"
     title={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
     aria-label={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-    onclick={() => state.setSidebarCollapsed(!state.sidebarCollapsed)}
+    onclick={() => {
+      finishEditingFavorites();
+      state.setSidebarCollapsed(!state.sidebarCollapsed);
+    }}
   >
     {#if state.sidebarCollapsed}<PanelLeftOpenIcon />{:else}<PanelLeftCloseIcon
       />{/if}

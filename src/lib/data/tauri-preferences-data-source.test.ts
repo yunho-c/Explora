@@ -8,6 +8,7 @@ const preferencesPayload = {
     sidebarCollapsed: true,
     viewMode: "grid",
     sort: { column: "size", direction: "descending" },
+    favoriteRoles: ["home", "documents", "music"],
   },
 };
 
@@ -59,6 +60,23 @@ describe("TauriPreferencesDataSource", () => {
     await expect(
       new TauriPreferencesDataSource().getPreferences(),
     ).rejects.toThrow("viewMode is unknown");
+  });
+
+  it("rejects non-canonical favorite role responses", async () => {
+    mockIPC(() => ({
+      preferences: {
+        ...preferencesPayload,
+        layout: {
+          ...preferencesPayload.layout,
+          favoriteRoles: ["music", "home", "music"],
+        },
+      },
+      warning: null,
+    }));
+
+    await expect(
+      new TauriPreferencesDataSource().getPreferences(),
+    ).rejects.toThrow("favorite roles are not canonical");
   });
 
   it("rejects malformed recovery warnings", async () => {

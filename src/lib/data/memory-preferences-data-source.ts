@@ -11,6 +11,7 @@ const clonePreferences = (preferences: UserPreferences): UserPreferences => ({
     sidebarCollapsed: preferences.layout.sidebarCollapsed,
     viewMode: preferences.layout.viewMode,
     sort: { ...preferences.layout.sort },
+    favoriteRoles: [...preferences.layout.favoriteRoles],
   },
 });
 
@@ -40,6 +41,9 @@ export class MemoryPreferencesDataSource implements PreferencesDataSource {
         sort: patch.layout.sort
           ? { ...patch.layout.sort }
           : { ...this.#preferences.layout.sort },
+        favoriteRoles: patch.layout.favoriteRoles
+          ? [...patch.layout.favoriteRoles]
+          : [...this.#preferences.layout.favoriteRoles],
       },
     };
     return clonePreferences(this.#preferences);

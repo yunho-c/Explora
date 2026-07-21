@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::filesystem::ExplorerError;
 
-const PREFERENCES_FILE_VERSION: u32 = 1;
+const PREFERENCES_FILE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +37,28 @@ pub enum SortDirection {
     Descending,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FavoriteRole {
+    Home,
+    Desktop,
+    Documents,
+    Downloads,
+    Pictures,
+    Music,
+    Videos,
+}
+
+const DEFAULT_FAVORITE_ROLES: [FavoriteRole; 7] = [
+    FavoriteRole::Home,
+    FavoriteRole::Desktop,
+    FavoriteRole::Documents,
+    FavoriteRole::Downloads,
+    FavoriteRole::Pictures,
+    FavoriteRole::Music,
+    FavoriteRole::Videos,
+];
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SortDescriptorDto {
@@ -44,12 +66,24 @@ pub struct SortDescriptorDto {
     pub direction: SortDirection,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LayoutPreferencesDto {
     pub sidebar_collapsed: bool,
     pub view_mode: ViewMode,
     pub sort: SortDescriptorDto,
+    pub favorite_roles: Vec<FavoriteRole>,
+}
+
+impl Default for LayoutPreferencesDto {
+    fn default() -> Self {
+        Self {
+            sidebar_collapsed: false,
+            view_mode: ViewMode::default(),
+            sort: SortDescriptorDto::default(),
+            favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +98,7 @@ pub struct LayoutPreferencesPatchDto {
     pub sidebar_collapsed: Option<bool>,
     pub view_mode: Option<ViewMode>,
     pub sort: Option<SortDescriptorDto>,
+    pub favorite_roles: Option<Vec<FavoriteRole>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -91,6 +126,21 @@ pub struct PreferencesSnapshotDto {
 struct StoredPreferencesDocument {
     version: u32,
     layout: LayoutPreferencesDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPreferencesDocumentV1 {
+    version: u32,
+    layout: LayoutPreferencesV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LayoutPreferencesV1 {
+    sidebar_collapsed: bool,
+    view_mode: ViewMode,
+    sort: SortDescriptorDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +200,9 @@ impl PreferencesStore {
         if let Some(sort) = patch.layout.sort {
             updated.layout.sort = sort;
         }
+        if let Some(favorite_roles) = patch.layout.favorite_roles {
+            updated.layout.favorite_roles = canonical_favorite_roles(&favorite_roles);
+        }
 
         persist_preferences(&self.storage_path, &updated)?;
         state.preferences = updated.clone();
@@ -181,29 +234,56 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
             );
         }
     };
-    if version != PREFERENCES_FILE_VERSION {
-        return recovery(
+    match version {
+        1 => match serde_json::from_slice::<StoredPreferencesDocumentV1>(&bytes) {
+            Ok(document) if document.version == 1 => (
+                UserPreferencesDto {
+                    layout: LayoutPreferencesDto {
+                        sidebar_collapsed: document.layout.sidebar_collapsed,
+                        view_mode: document.layout.view_mode,
+                        sort: document.layout.sort,
+                        favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+                    },
+                },
+                None,
+            ),
+            _ => malformed_recovery(),
+        },
+        PREFERENCES_FILE_VERSION => {
+            match serde_json::from_slice::<StoredPreferencesDocument>(&bytes) {
+                Ok(document) => (
+                    UserPreferencesDto {
+                        layout: LayoutPreferencesDto {
+                            favorite_roles: canonical_favorite_roles(
+                                &document.layout.favorite_roles,
+                            ),
+                            ..document.layout
+                        },
+                    },
+                    None,
+                ),
+                Err(_) => malformed_recovery(),
+            }
+        }
+        _ => recovery(
             "unsupportedVersion",
             "Explora could not use preferences saved by a different application version and restored defaults.",
-        );
+        ),
     }
+}
 
-    let document = match serde_json::from_slice::<StoredPreferencesDocument>(&bytes) {
-        Ok(document) => document,
-        Err(_) => {
-            return recovery(
-                "malformed",
-                "Explora's saved preferences were malformed and defaults were restored.",
-            );
-        }
-    };
-
-    (
-        UserPreferencesDto {
-            layout: document.layout,
-        },
-        None,
+fn malformed_recovery() -> (UserPreferencesDto, Option<PreferencesWarningDto>) {
+    recovery(
+        "malformed",
+        "Explora's saved preferences were malformed and defaults were restored.",
     )
+}
+
+fn canonical_favorite_roles(roles: &[FavoriteRole]) -> Vec<FavoriteRole> {
+    DEFAULT_FAVORITE_ROLES
+        .into_iter()
+        .filter(|role| roles.contains(role))
+        .collect()
 }
 
 fn recovery(
@@ -270,6 +350,18 @@ mod tests {
                 sidebar_collapsed,
                 view_mode,
                 sort,
+                favorite_roles: None,
+            },
+        }
+    }
+
+    fn favorite_patch(favorite_roles: Vec<FavoriteRole>) -> UserPreferencesPatchDto {
+        UserPreferencesPatchDto {
+            layout: LayoutPreferencesPatchDto {
+                sidebar_collapsed: None,
+                view_mode: None,
+                sort: None,
+                favorite_roles: Some(favorite_roles),
             },
         }
     }
@@ -313,6 +405,56 @@ mod tests {
         assert_eq!(
             reloaded.preferences.layout.sort.direction,
             SortDirection::Descending
+        );
+        assert_eq!(
+            reloaded.preferences.layout.favorite_roles,
+            DEFAULT_FAVORITE_ROLES
+        );
+    }
+
+    #[test]
+    fn migrates_version_one_layout_preferences_with_default_favorites() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"layout":{"sidebarCollapsed":true,"viewMode":"grid","sort":{"column":"size","direction":"descending"}}}"#,
+        )
+        .expect("version one preferences");
+
+        let snapshot = PreferencesStore::new(path)
+            .snapshot()
+            .expect("migrated preferences");
+        assert!(snapshot.preferences.layout.sidebar_collapsed);
+        assert_eq!(snapshot.preferences.layout.view_mode, ViewMode::Grid);
+        assert_eq!(snapshot.preferences.layout.sort.column, SortColumn::Size);
+        assert_eq!(
+            snapshot.preferences.layout.favorite_roles,
+            DEFAULT_FAVORITE_ROLES
+        );
+        assert_eq!(snapshot.warning, None);
+    }
+
+    #[test]
+    fn favorite_updates_are_deduplicated_in_canonical_order() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        let store = PreferencesStore::new(path.clone());
+
+        store
+            .update(favorite_patch(vec![
+                FavoriteRole::Music,
+                FavoriteRole::Home,
+                FavoriteRole::Music,
+            ]))
+            .expect("favorite update");
+
+        let reloaded = PreferencesStore::new(path)
+            .snapshot()
+            .expect("reloaded favorites");
+        assert_eq!(
+            reloaded.preferences.layout.favorite_roles,
+            vec![FavoriteRole::Home, FavoriteRole::Music]
         );
     }
 

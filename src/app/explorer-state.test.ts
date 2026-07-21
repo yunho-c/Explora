@@ -51,6 +51,15 @@ class FailingPreferencesDataSource implements PreferencesDataSource {
           sidebarCollapsed: false,
           viewMode: "list",
           sort: { column: "name", direction: "ascending" },
+          favoriteRoles: [
+            "home",
+            "desktop",
+            "documents",
+            "downloads",
+            "pictures",
+            "music",
+            "videos",
+          ],
         },
       },
       warning: null,
@@ -128,6 +137,7 @@ describe("ExplorerState", () => {
         sidebarCollapsed: true,
         viewMode: "grid",
         sort: { column: "size", direction: "descending" },
+        favoriteRoles: ["home", "music"],
       },
     });
     const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
@@ -137,6 +147,28 @@ describe("ExplorerState", () => {
     expect(state.sidebarCollapsed).toBe(true);
     expect(state.viewMode).toBe("grid");
     expect(state.sort).toEqual({ column: "size", direction: "descending" });
+    expect(state.visibleFavoriteLocations.map(({ role }) => role)).toEqual([
+      "home",
+      "music",
+    ]);
+  });
+
+  it("persists favorite visibility in canonical sidebar order", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+
+    state.setFavoriteVisible("downloads", false);
+    state.setFavoriteVisible("home", false);
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout.favoriteRoles,
+      ).toEqual(["desktop", "documents", "pictures", "music", "videos"]);
+    });
+
+    expect(
+      state.visibleFavoriteLocations.map(({ role }) => role),
+    ).not.toContain("home");
   });
 
   it("serializes rapid preference writes so the latest choice wins", async () => {

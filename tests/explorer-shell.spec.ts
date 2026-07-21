@@ -40,6 +40,34 @@ test("opens a folder and returns to its parent", async ({ page }) => {
   await expect(page.getByText("explora-notes.md")).toBeVisible();
 });
 
+test("configures standard favorites from the section header", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const favorites = page.getByRole("navigation", { name: "Favorites" });
+
+  await page.getByText("Favorites", { exact: true }).hover();
+  await page.getByRole("button", { name: "Configure favorites" }).click();
+  await favorites
+    .getByRole("button", { name: "Remove Home from Favorites" })
+    .click();
+  await expect(
+    favorites.getByRole("button", { name: "Home", exact: true }),
+  ).toBeHidden();
+  await expect(favorites.getByLabel("Home, not in Favorites")).toBeVisible();
+
+  await favorites
+    .getByRole("button", { name: "Add Home to Favorites" })
+    .click();
+  await expect(
+    favorites.getByRole("button", { name: "Home", exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "Configure favorites" }),
+  ).toBeFocused();
+});
+
 test("opens the responsive locations sheet", async ({ page }) => {
   await page.setViewportSize({ width: 760, height: 720 });
   await page.goto("/");

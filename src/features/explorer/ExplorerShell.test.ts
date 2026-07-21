@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/svelte";
 import { describe, expect, it } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
@@ -7,6 +13,7 @@ import {
   type WindowChromeAdapter,
 } from "../../app/window-chrome.svelte";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
+import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 
 import ExplorerShell from "./ExplorerShell.svelte";
 
@@ -68,6 +75,64 @@ describe("ExplorerShell", () => {
       expect(button.querySelector(`.${iconClass}`)).toBeInTheDocument();
       expect(button).toHaveClass("gap-2");
     }
+  });
+
+  it("configures visible standard favorites from the section header", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+    renderShell(state);
+    const favorites = within(
+      screen.getByRole("navigation", { name: "Favorites" }),
+    );
+    const configure = screen.getByRole("button", {
+      name: "Configure favorites",
+    });
+
+    expect(configure).toHaveClass("md:opacity-0");
+    expect(favorites.getByRole("button", { name: "Home" })).toBeInTheDocument();
+    await fireEvent.click(configure);
+    const finishEditing = screen.getByRole("button", {
+      name: "Finish editing favorites",
+    });
+    expect(finishEditing).toHaveAttribute("aria-pressed", "true");
+    expect(finishEditing.querySelector(".lucide-check")).toBeInTheDocument();
+    await fireEvent.click(
+      favorites.getByRole("button", { name: "Remove Home from Favorites" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        favorites.queryByRole("button", { name: "Home" }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(async () =>
+      expect(
+        (await preferences.getPreferences()).preferences.layout.favoriteRoles,
+      ).not.toContain("home"),
+    );
+    const ghostHome = favorites.getByLabelText("Home, not in Favorites");
+    expect(ghostHome).toHaveClass("border-dashed");
+    expect(ghostHome.querySelector("svg")).toHaveClass("size-4");
+    expect(
+      favorites.getByRole("button", { name: "Add Home to Favorites" }),
+    ).toHaveClass("text-emerald-600");
+
+    await fireEvent.click(
+      favorites.getByRole("button", { name: "Add Home to Favorites" }),
+    );
+    await waitFor(() =>
+      expect(
+        favorites.getByRole("button", { name: "Home" }),
+      ).toBeInTheDocument(),
+    );
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.getByRole("button", { name: "Configure favorites" }),
+    ).toHaveFocus();
+    expect(
+      favorites.queryByRole("button", { name: "Remove Home from Favorites" }),
+    ).not.toBeInTheDocument();
   });
 
   it("opens Quick Preview with the Space key", async () => {
