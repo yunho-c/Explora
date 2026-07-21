@@ -37,6 +37,10 @@ describe("ExplorerShell", () => {
       screen.getByRole("main", { name: "File explorer" }),
     ).toBeInTheDocument();
     expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
+    const titlebarLeft = document.querySelector(".explora-titlebar-left");
+    expect(titlebarLeft).not.toBeNull();
+    expect(titlebarLeft?.textContent?.trim()).toBe("");
+    expect(titlebarLeft?.querySelector("svg")).toBeNull();
 
     await fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();

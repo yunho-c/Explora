@@ -62,22 +62,15 @@
       )}
       data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
     >
-      <div
-        class={cn(
-          "grid shrink-0 place-items-center bg-primary text-primary-foreground",
-          titlebar ? "size-5 rounded-md" : "size-8 rounded-lg",
-        )}
-        data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
-      >
-        <LaptopIcon class={titlebar ? "size-3" : "size-4"} />
-      </div>
-      {#if !compact}
-        <p
-          class={cn("truncate font-semibold", titlebar ? "text-xs" : "text-sm")}
-          data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
+      {#if !titlebar}
+        <div
+          class="grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground"
         >
-          Explora
-        </p>
+          <LaptopIcon class="size-4" />
+        </div>
+        {#if !compact}
+          <p class="truncate text-sm font-semibold">Explora</p>
+        {/if}
       {/if}
     </div>
 
