@@ -82,7 +82,7 @@ class StalePreviewDataSource extends DemoExplorerDataSource {
         entryId: entry.reference.id,
         kind: entry.contentKind,
         title: entry.name,
-        subtitle: "File",
+        accessibilityDescription: entry.displayPath,
         content: {
           type: "metadata",
           reason: "unsupported",

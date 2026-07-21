@@ -489,15 +489,14 @@ const parsePreparedPreview = (
 const previewDetails = (
   entry: FileEntrySummary,
   payload: PreparedPreviewPayload,
-): { details: PreviewSummary["details"]; subtitle: string } => {
+): PreviewSummary["details"] => {
   const size = payload.size ?? entry.size;
   const modifiedAt = payload.modifiedAt ?? entry.modifiedAt;
   const details: PreviewSummary["details"] = [
-    { label: "Path", value: entry.displayPath },
     { label: "Size", value: formatFileSize(size) },
   ];
   if (modifiedAt !== null) {
-    details.splice(1, 0, {
+    details.unshift({
       label: "Modified",
       value: new Date(modifiedAt).toLocaleString(),
     });
@@ -505,25 +504,16 @@ const previewDetails = (
 
   if (payload.content.type === "text") {
     details.push({ label: "Encoding", value: payload.content.encoding });
-    return {
-      details,
-      subtitle: entry.detail ?? `${payload.content.encoding} text`,
-    };
+    return details;
   }
   if (payload.content.type === "image") {
     details.push({
       label: "Dimensions",
       value: `${payload.content.originalWidth} × ${payload.content.originalHeight}`,
     });
-    return { details, subtitle: entry.detail ?? "Image" };
+    return details;
   }
-  return {
-    details,
-    subtitle:
-      entry.kind === "directory"
-        ? (entry.detail ?? "Folder")
-        : (entry.detail ?? "File"),
-  };
+  return details;
 };
 
 const parsePreviewBytes = (value: unknown): Uint8Array => {
@@ -863,7 +853,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       });
       if (signal.aborted) throw abortError();
       const payload = parsePreparedPreview(rawPayload, entry.reference.id);
-      const { details, subtitle } = previewDetails(entry, payload);
+      const details = previewDetails(entry, payload);
       let content: PreviewContent;
 
       if (payload.content.type === "image") {
@@ -897,7 +887,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         entryId: entry.reference.id,
         kind: entry.contentKind,
         title: entry.name,
-        subtitle,
+        accessibilityDescription: entry.displayPath,
         content,
         details,
       };

@@ -1,4 +1,10 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/svelte";
 import { describe, expect, it } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
@@ -48,7 +54,12 @@ describe("ExplorerShell", () => {
     await fireEvent.click(screen.getByText("explora-notes.md"));
     await fireEvent.keyDown(window, { key: " " });
 
-    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    const previewDialog = await screen.findByRole("dialog");
+    expect(previewDialog).toBeInTheDocument();
+    expect(within(previewDialog).queryByText("Path")).not.toBeInTheDocument();
+    expect(
+      within(previewDialog).queryByText("Location"),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("Preparing preview")).not.toBeInTheDocument();
     expect(
       screen.queryByText("Reading a safe, bounded view of this file…"),
@@ -63,6 +74,7 @@ describe("ExplorerShell", () => {
       },
     );
     expect(textPreview.value).toContain("local and remote files");
+    expect(screen.queryByText("UTF-8 text")).not.toBeInTheDocument();
 
     const selectedEntryId = state.selectedEntryId;
     textPreview.focus();
@@ -85,6 +97,7 @@ describe("ExplorerShell", () => {
         name: "Preview of summer-light.jpg",
       }),
     ).toBeInTheDocument();
+    expect(screen.queryByText("Image")).not.toBeInTheDocument();
   });
 
   it("opens folders on double-click and returns with the Up action", async () => {

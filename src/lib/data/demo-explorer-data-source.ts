@@ -743,16 +743,9 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         entryId: entry.reference.id,
         kind: entry.contentKind,
         title: entry.name,
-        subtitle:
-          entry.kind === "directory"
-            ? (entry.detail ?? "Folder")
-            : (entry.detail ?? "File"),
+        accessibilityDescription: entry.displayPath,
         content,
         details: [
-          {
-            label: "Location",
-            value: location?.displayPath ?? entry.reference.locationId,
-          },
           {
             label: "Modified",
             value:

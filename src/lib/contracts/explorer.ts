@@ -179,7 +179,7 @@ export interface PreviewSummary {
   entryId: string;
   kind: ContentKind;
   title: string;
-  subtitle: string;
+  accessibilityDescription: string;
   content: PreviewContent;
   details: PreviewDetail[];
 }

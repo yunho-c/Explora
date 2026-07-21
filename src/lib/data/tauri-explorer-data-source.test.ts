@@ -245,6 +245,12 @@ describe("TauriExplorerDataSource", () => {
       truncated: true,
       encoding: "UTF-8",
     });
+    expect(prepared.preview.accessibilityDescription).toBe(
+      previewEntry.displayPath,
+    );
+    expect(prepared.preview.details).not.toContainEqual(
+      expect.objectContaining({ label: "Path" }),
+    );
     expect(prepared.preview.details).toContainEqual({
       label: "Encoding",
       value: "UTF-8",

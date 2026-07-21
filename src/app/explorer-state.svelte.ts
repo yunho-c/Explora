@@ -660,7 +660,7 @@ export class ExplorerState {
           entryId: entry.reference.id,
           kind: entry.contentKind,
           title: entry.name,
-          subtitle: "Preview unavailable",
+          accessibilityDescription: entry.displayPath,
           content: {
             type: "metadata",
             reason: "unsupported",

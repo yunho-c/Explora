@@ -44,12 +44,12 @@
     {:else if state.preview}
       {@const preview = state.preview}
       <header class="border-b px-6 py-4 pr-14">
-        <Dialog.Header class="gap-1">
+        <Dialog.Header class="gap-0">
           <Dialog.Title class="truncate" title={preview.title}>
             {preview.title}
           </Dialog.Title>
-          <Dialog.Description class="truncate">
-            {preview.subtitle}
+          <Dialog.Description class="sr-only">
+            {preview.accessibilityDescription}
           </Dialog.Description>
         </Dialog.Header>
       </header>
