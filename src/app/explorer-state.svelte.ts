@@ -14,6 +14,9 @@ import type {
   ViewMode,
 } from "$lib/contracts/explorer";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
+import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
+import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
+import type { LayoutPreferencesPatch } from "$lib/contracts/preferences";
 import { compareFileSizes } from "$lib/file-metadata";
 
 const nameCollator = new Intl.Collator(undefined, {
@@ -23,6 +26,27 @@ const nameCollator = new Intl.Collator(undefined, {
 
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
+
+const PREFERENCES_LOAD_TIMEOUT_MS = 2_000;
+
+const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T> =>
+  new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(
+      () =>
+        reject(new Error("Explora timed out while loading saved preferences.")),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error: unknown) => {
+        window.clearTimeout(timeoutId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 
 type SshPromptEvent = Exclude<SshConnectionEvent, { event: "state" }>;
 
@@ -47,6 +71,7 @@ export class ExplorerState {
   loading = $state(false);
   errorMessage = $state<string | null>(null);
   warningMessage = $state<string | null>(null);
+  preferencesWarningMessage = $state<string | null>(null);
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
@@ -64,8 +89,13 @@ export class ExplorerState {
   private previewController: AbortController | null = null;
   private sshConnectionController: AbortController | null = null;
   private tabSequence = 0;
+  private preferencesInitialization: Promise<void> | null = null;
+  private preferenceWriteQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly dataSource: ExplorerDataSource) {}
+  constructor(
+    private readonly dataSource: ExplorerDataSource,
+    private readonly preferencesDataSource: PreferencesDataSource = new MemoryPreferencesDataSource(),
+  ) {}
 
   get activeTab(): ExplorerTab | undefined {
     return this.tabs.find(({ id }) => id === this.activeTabId);
@@ -134,6 +164,7 @@ export class ExplorerState {
   }
 
   async initialize(): Promise<void> {
+    await this.initializePreferences();
     const controller = new AbortController();
 
     try {
@@ -170,6 +201,29 @@ export class ExplorerState {
             ? error.message
             : "Explora could not load its locations.";
       }
+    }
+  }
+
+  initializePreferences(): Promise<void> {
+    this.preferencesInitialization ??= this.loadPreferences();
+    return this.preferencesInitialization;
+  }
+
+  private async loadPreferences(): Promise<void> {
+    try {
+      const snapshot = await withTimeout(
+        this.preferencesDataSource.getPreferences(),
+        PREFERENCES_LOAD_TIMEOUT_MS,
+      );
+      this.sidebarCollapsed = snapshot.preferences.layout.sidebarCollapsed;
+      this.viewMode = snapshot.preferences.layout.viewMode;
+      this.sort = { ...snapshot.preferences.layout.sort };
+      this.preferencesWarningMessage = snapshot.warning?.message ?? null;
+    } catch (error) {
+      this.preferencesWarningMessage =
+        error instanceof Error
+          ? error.message
+          : "Explora could not load saved preferences and used defaults instead.";
     }
   }
 
@@ -527,21 +581,42 @@ export class ExplorerState {
   }
 
   toggleSort(column: SortColumn): void {
-    this.sort = {
+    const sort: SortDescriptor = {
       column,
       direction:
         this.sort.column === column && this.sort.direction === "ascending"
           ? "descending"
           : "ascending",
     };
+    this.sort = sort;
+    this.persistLayoutPreferences({ sort });
   }
 
   setViewMode(viewMode: ViewMode): void {
     this.viewMode = viewMode;
+    this.persistLayoutPreferences({ viewMode });
+  }
+
+  setSidebarCollapsed(sidebarCollapsed: boolean): void {
+    this.sidebarCollapsed = sidebarCollapsed;
+    this.persistLayoutPreferences({ sidebarCollapsed });
   }
 
   selectEntry(entryId: string): void {
     this.selectedEntryId = entryId;
+  }
+
+  private persistLayoutPreferences(patch: LayoutPreferencesPatch): void {
+    this.preferenceWriteQueue = this.preferenceWriteQueue.then(async () => {
+      try {
+        await this.preferencesDataSource.updatePreferences({ layout: patch });
+      } catch (error) {
+        this.preferencesWarningMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not save the latest preference change.";
+      }
+    });
   }
 
   async openPreview(entryId = this.selectedEntryId): Promise<void> {

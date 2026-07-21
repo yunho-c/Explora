@@ -11,21 +11,30 @@ use tauri::{ipc::Channel, State};
 use crate::{
     filesystem::{DirectoryListingEvent, ExplorerError, ExplorerErrorDto, LocationSummaryDto},
     local_filesystem::LocalFilesystem,
+    preferences::{
+        PreferencesSnapshotDto, PreferencesStore, UserPreferencesDto, UserPreferencesPatchDto,
+    },
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
 };
 
 pub struct AppState {
     local: Arc<LocalFilesystem>,
+    preferences: Arc<PreferencesStore>,
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
-    pub fn new(local: LocalFilesystem, ssh_targets: SshTargetStore) -> Self {
+    pub fn new(
+        local: LocalFilesystem,
+        preferences: PreferencesStore,
+        ssh_targets: SshTargetStore,
+    ) -> Self {
         Self {
             local: Arc::new(local),
+            preferences: Arc::new(preferences),
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
             listings: Mutex::new(HashMap::new()),
@@ -71,6 +80,27 @@ fn validate_request_id(request_id: &str) -> Result<(), ExplorerError> {
     } else {
         Ok(())
     }
+}
+
+#[tauri::command]
+pub fn get_user_preferences(
+    state: State<'_, AppState>,
+) -> Result<PreferencesSnapshotDto, ExplorerErrorDto> {
+    state.preferences.snapshot().map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn update_user_preferences(
+    state: State<'_, AppState>,
+    patch: UserPreferencesPatchDto,
+) -> Result<UserPreferencesDto, ExplorerErrorDto> {
+    let preferences = state.preferences.clone();
+    tauri::async_runtime::spawn_blocking(move || preferences.update(patch))
+        .await
+        .map_err(|error| {
+            ExplorerError::Unexpected(format!("The preference update task failed: {error}"))
+        })?
+        .map_err(ExplorerErrorDto::from)
 }
 
 #[tauri::command]

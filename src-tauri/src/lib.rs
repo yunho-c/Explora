@@ -1,12 +1,14 @@
 mod commands;
 mod filesystem;
 mod local_filesystem;
+mod preferences;
 mod ssh;
 mod ssh_targets;
 
 use commands::AppState;
 use filesystem::LocationRole;
 use local_filesystem::{LocalFilesystem, LocalRoot};
+use preferences::PreferencesStore;
 use serde::Serialize;
 use ssh_targets::SshTargetStore;
 use tauri::{Manager, WebviewWindow};
@@ -134,16 +136,20 @@ pub fn run() {
             }
 
             let filesystem = LocalFilesystem::new(roots)?;
+            let preferences =
+                PreferencesStore::new(paths.app_config_dir()?.join("preferences.json"));
             let ssh_targets = SshTargetStore::new(
                 paths.app_config_dir()?.join("ssh-targets.json"),
                 paths.home_dir()?,
             )?;
-            app.manage(AppState::new(filesystem, ssh_targets));
+            app.manage(AppState::new(filesystem, preferences, ssh_targets));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             activate_custom_titlebar,
             show_native_titlebar_fallback,
+            commands::get_user_preferences,
+            commands::update_user_preferences,
             commands::list_locations,
             commands::list_ssh_targets,
             commands::create_ssh_target,

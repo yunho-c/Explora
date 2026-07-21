@@ -310,7 +310,7 @@
     class="absolute bottom-3 ml-3"
     title={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
     aria-label={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-    onclick={() => (state.sidebarCollapsed = !state.sidebarCollapsed)}
+    onclick={() => state.setSidebarCollapsed(!state.sidebarCollapsed)}
   >
     {#if state.sidebarCollapsed}<PanelLeftOpenIcon />{:else}<PanelLeftCloseIcon
       />{/if}

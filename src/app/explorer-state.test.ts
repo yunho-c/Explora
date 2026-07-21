@@ -1,8 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { DirectoryRef } from "$lib/contracts/explorer";
+import type {
+  PreferencesSnapshot,
+  UserPreferences,
+  UserPreferencesPatch,
+} from "$lib/contracts/preferences";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
 import type { ListDirectoryOptions } from "$lib/data/explorer-data-source";
+import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
+import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
 
 import { ExplorerState } from "./explorer-state.svelte";
 
@@ -33,6 +40,42 @@ class StaleResultDataSource extends DemoExplorerDataSource {
       breadcrumbs: [{ label: directory.name, directory }],
     });
     options.onComplete({ skippedEntries: 0 });
+  }
+}
+
+class FailingPreferencesDataSource implements PreferencesDataSource {
+  async getPreferences(): Promise<PreferencesSnapshot> {
+    return {
+      preferences: {
+        layout: {
+          sidebarCollapsed: false,
+          viewMode: "list",
+          sort: { column: "name", direction: "ascending" },
+        },
+      },
+      warning: null,
+    };
+  }
+
+  async updatePreferences(): Promise<UserPreferences> {
+    throw new Error("The preference file is read-only.");
+  }
+}
+
+class DelayedPreferencesDataSource extends MemoryPreferencesDataSource {
+  override async updatePreferences(
+    patch: UserPreferencesPatch,
+  ): Promise<UserPreferences> {
+    if (patch.layout.viewMode === "grid") {
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
+    }
+    return super.updatePreferences(patch);
+  }
+}
+
+class HangingPreferencesDataSource extends MemoryPreferencesDataSource {
+  override async getPreferences(): Promise<PreferencesSnapshot> {
+    return new Promise(() => {});
   }
 }
 
@@ -77,6 +120,76 @@ describe("ExplorerState", () => {
     expect(state.entries).toHaveLength(originalCount);
     expect(state.viewMode).toBe("grid");
     expect(state.sort.column).toBe("modifiedAt");
+  });
+
+  it("restores global layout preferences before loading explorer data", async () => {
+    const preferences = new MemoryPreferencesDataSource({
+      layout: {
+        sidebarCollapsed: true,
+        viewMode: "grid",
+        sort: { column: "size", direction: "descending" },
+      },
+    });
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+
+    await state.initialize();
+
+    expect(state.sidebarCollapsed).toBe(true);
+    expect(state.viewMode).toBe("grid");
+    expect(state.sort).toEqual({ column: "size", direction: "descending" });
+  });
+
+  it("serializes rapid preference writes so the latest choice wins", async () => {
+    const preferences = new DelayedPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initializePreferences();
+
+    state.setViewMode("grid");
+    state.setViewMode("list");
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout.viewMode,
+      ).toBe("list");
+    });
+
+    expect(state.viewMode).toBe("list");
+  });
+
+  it("keeps optimistic layout state and reports preference write failures", async () => {
+    const state = new ExplorerState(
+      new DemoExplorerDataSource(),
+      new FailingPreferencesDataSource(),
+    );
+    await state.initializePreferences();
+
+    state.setSidebarCollapsed(true);
+    await vi.waitFor(() =>
+      expect(state.preferencesWarningMessage).toBe(
+        "The preference file is read-only.",
+      ),
+    );
+
+    expect(state.sidebarCollapsed).toBe(true);
+  });
+
+  it("bounds preference loading so a hidden application can still recover", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = new ExplorerState(
+        new DemoExplorerDataSource(),
+        new HangingPreferencesDataSource(),
+      );
+      const initialization = state.initializePreferences();
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await initialization;
+
+      expect(state.preferencesWarningMessage).toBe(
+        "Explora timed out while loading saved preferences.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maintains independent tab state and navigation history", async () => {
