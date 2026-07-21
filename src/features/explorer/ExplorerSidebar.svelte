@@ -19,6 +19,7 @@
   import XIcon from "@lucide/svelte/icons/x";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
+  import type { WindowChromeMode } from "../../app/window-chrome.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
   import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
@@ -26,7 +27,14 @@
   import type { LocationRole } from "$lib/contracts/explorer";
   import { cn } from "$lib/utils";
 
-  let { state }: { state: ExplorerState } = $props();
+  let {
+    state,
+    chromeMode,
+  }: { state: ExplorerState; chromeMode: WindowChromeMode } = $props();
+
+  const customChrome = $derived(
+    chromeMode === "activating" || chromeMode === "custom",
+  );
 
   const iconsByRole = {
     home: HouseIcon,
@@ -43,19 +51,33 @@
   const iconFor = (role: LocationRole) => iconsByRole[role];
 </script>
 
-{#snippet navigation(compact: boolean)}
+{#snippet navigation(compact: boolean, titlebar: boolean)}
   <div class="flex h-full min-h-0 flex-col">
-    <div class="flex h-14 items-center gap-2 px-3">
+    <div
+      class={cn(
+        "flex items-center gap-2 overflow-hidden",
+        titlebar
+          ? "explora-titlebar-content explora-titlebar-left h-8 shrink-0 border-b bg-muted/30"
+          : "h-14 px-3",
+      )}
+      data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
+    >
       <div
-        class="grid size-8 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground"
+        class={cn(
+          "grid shrink-0 place-items-center bg-primary text-primary-foreground",
+          titlebar ? "size-5 rounded-md" : "size-8 rounded-lg",
+        )}
+        data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
       >
-        <LaptopIcon class="size-4" />
+        <LaptopIcon class={titlebar ? "size-3" : "size-4"} />
       </div>
       {#if !compact}
-        <div class="min-w-0">
-          <p class="truncate text-sm font-semibold">Explora</p>
-          <p class="truncate text-xs text-muted-foreground">Local & remote</p>
-        </div>
+        <p
+          class={cn("truncate font-semibold", titlebar ? "text-xs" : "text-sm")}
+          data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
+        >
+          Explora
+        </p>
       {/if}
     </div>
 
@@ -282,11 +304,11 @@
 
 <aside
   class={cn(
-    "hidden h-full shrink-0 border-r bg-sidebar text-sidebar-foreground transition-[width] duration-200 md:block",
+    "relative hidden h-full shrink-0 border-r bg-sidebar text-sidebar-foreground transition-[width] duration-200 md:block",
     state.sidebarCollapsed ? "w-16" : "w-60",
   )}
 >
-  {@render navigation(state.sidebarCollapsed)}
+  {@render navigation(state.sidebarCollapsed, true)}
   <Button
     variant="ghost"
     size="icon-sm"
@@ -307,6 +329,6 @@
       <Sheet.Description>Choose a favorite or saved location.</Sheet.Description
       >
     </Sheet.Header>
-    <div class="min-h-0 flex-1">{@render navigation(false)}</div>
+    <div class="min-h-0 flex-1">{@render navigation(false, false)}</div>
   </Sheet.Content>
 </Sheet.Root>

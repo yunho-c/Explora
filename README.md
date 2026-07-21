@@ -9,6 +9,15 @@ metadata-only Quick Preview. Saved SSH targets and concrete aliases from
 application retains deterministic local and remote demo assets for UI development
 and tests.
 
+The packaged application integrates its tab strip into a guarded custom
+titlebar. macOS keeps native traffic lights, Windows 11 retains the native Snap
+Layout menu, and supported GNOME/KDE Wayland sessions receive GTK-themed window
+controls. Activation failures and unsupported Linux sessions automatically
+restore the native operating-system titlebar; browser-only development does not
+activate desktop window chrome. See
+[`docs/adr/0003-integrated-window-chrome.md`](docs/adr/0003-integrated-window-chrome.md)
+for the dependency, security, and fallback decision.
+
 ## Technology
 
 - Tauri 2 and stable Rust for the desktop application boundary
