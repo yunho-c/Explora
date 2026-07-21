@@ -4,13 +4,14 @@ import type {
   FileEntrySummary,
   LocationSummary,
   ManualSshTargetInput,
-  PreviewSummary,
+  PreviewContent,
   SshTargetSummary,
 } from "$lib/contracts/explorer";
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
+  PreparedPreview,
 } from "$lib/data/explorer-data-source";
 
 const roots: Readonly<Record<string, DirectoryRef>> = {
@@ -461,6 +462,9 @@ const excerpts: Partial<Record<ContentKind, string>> = {
     "Archive contents are not expanded in the initial preview experience.",
 };
 
+const demoImageUrl =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
 const abortError = () => {
   const error = new Error("The demo request was cancelled.");
   error.name = "AbortError";
@@ -692,38 +696,77 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   async getPreview(
     entry: FileEntrySummary,
     signal: AbortSignal,
-  ): Promise<PreviewSummary> {
+  ): Promise<PreparedPreview> {
     await wait(80, signal);
 
     const location = locations.find(
       ({ id }) => id === entry.reference.locationId,
     );
+    let content: PreviewContent;
+    if (location?.kind === "ssh") {
+      content = {
+        type: "metadata",
+        reason: "remote",
+        message: "Remote content preview is not available yet.",
+      };
+    } else if (entry.contentKind === "image") {
+      content = {
+        type: "image",
+        url: demoImageUrl,
+        mediaType: "image/png",
+        width: 960,
+        height: 640,
+        originalWidth: 4_032,
+        originalHeight: 3_024,
+      };
+    } else if (
+      entry.contentKind === "document" ||
+      entry.contentKind === "code"
+    ) {
+      content = {
+        type: "text",
+        text: excerpts[entry.contentKind] ?? "",
+        truncated: false,
+        encoding: "UTF-8",
+      };
+    } else {
+      content = {
+        type: "metadata",
+        reason: entry.kind === "directory" ? "directory" : "unsupported",
+        message:
+          excerpts[entry.contentKind] ??
+          "Content preview is not available for this file type yet.",
+      };
+    }
     return {
-      entryId: entry.reference.id,
-      kind: entry.contentKind,
-      title: entry.name,
-      subtitle:
-        entry.kind === "directory"
-          ? (entry.detail ?? "Folder")
-          : (entry.detail ?? "File"),
-      excerpt: excerpts[entry.contentKind],
-      details: [
-        {
-          label: "Location",
-          value: location?.displayPath ?? entry.reference.locationId,
-        },
-        {
-          label: "Modified",
-          value:
-            entry.modifiedAt === null
-              ? "Unknown"
-              : new Date(entry.modifiedAt).toLocaleString(),
-        },
-        {
-          label: "Size",
-          value: entry.size === null ? "—" : `${entry.size} bytes`,
-        },
-      ],
+      preview: {
+        entryId: entry.reference.id,
+        kind: entry.contentKind,
+        title: entry.name,
+        subtitle:
+          entry.kind === "directory"
+            ? (entry.detail ?? "Folder")
+            : (entry.detail ?? "File"),
+        content,
+        details: [
+          {
+            label: "Location",
+            value: location?.displayPath ?? entry.reference.locationId,
+          },
+          {
+            label: "Modified",
+            value:
+              entry.modifiedAt === null
+                ? "Unknown"
+                : new Date(entry.modifiedAt).toLocaleString(),
+          },
+          {
+            label: "Size",
+            value: entry.size === null ? "—" : `${entry.size} bytes`,
+          },
+        ],
+      },
+      dispose: () => {},
     };
   }
 }

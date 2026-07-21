@@ -4,7 +4,8 @@ Explora is a calm, modern desktop file explorer for local and SSH locations. The
 packaged Tauri application provides read-only local and SSH/SFTP navigation
 through Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
-metadata-only Quick Preview. Saved SSH targets and concrete aliases from
+bounded Quick Preview for local text, source, and common raster-image files.
+Saved SSH targets and concrete aliases from
 `~/.ssh/config` appear alongside local favorites. The browser-only Vite
 application retains deterministic local and remote demo assets for UI development
 and tests.
@@ -53,8 +54,16 @@ silently executed. Bounded keepalives detect dropped sessions, offline tabs reta
 their current folder and history, and an explicit reconnect resumes the same
 opaque directory reference when it is still valid. Refresh reloads the active
 folder without changing navigation history. File watching, mounted-volume
-discovery, hidden-file controls, mutations, and content previews remain later
-vertical slices.
+discovery, hidden-file controls, mutations, remote content previews, and
+additional preview formats remain later vertical slices.
+
+Local preview reads are authorized by opaque entry references and performed in
+bounded Rust workers. Text previews are capped and decoded without rendering
+markup; raster images are dimension-, allocation-, time-, and concurrency-limited,
+resized, and re-encoded before reaching the webview through one-shot binary
+resources. SVG, PDF, audio, video, and SSH content remain metadata-only. See
+[`docs/adr/0003-bounded-local-preview-pipeline.md`](docs/adr/0003-bounded-local-preview-pipeline.md)
+for the limits and resource-lifecycle decision.
 
 Rust integration tests start disposable loopback SSH/SFTP servers and cover host
 trust, supported authentication methods, secret-safe prompts and errors,
@@ -89,6 +98,9 @@ bun run build:web    # build only the static frontend
 ```
 
 Install the Playwright browser once with `bun run test:e2e:install`.
+The browser suite starts an isolated Vite server on port 6750 so it cannot reuse
+an unrelated development worktree; set `EXPLORA_E2E_PORT` to another valid port
+when needed.
 
 The Playwright suite validates the browser-rendered shell. It is not packaged
 Tauri end-to-end proof; native menus, window behavior, and IPC require separate

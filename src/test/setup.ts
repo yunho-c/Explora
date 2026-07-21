@@ -28,3 +28,16 @@ Object.defineProperty(window, "ResizeObserver", {
   writable: true,
   value: ResizeObserverStub,
 });
+
+Object.defineProperties(URL, {
+  createObjectURL: {
+    configurable: true,
+    writable: true,
+    value: () => "blob:test-preview",
+  },
+  revokeObjectURL: {
+    configurable: true,
+    writable: true,
+    value: () => undefined,
+  },
+});

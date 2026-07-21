@@ -40,6 +40,11 @@ export interface ConnectSshOptions {
   ) => void;
 }
 
+export interface PreparedPreview {
+  preview: PreviewSummary;
+  dispose: () => void;
+}
+
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
@@ -65,5 +70,5 @@ export interface ExplorerDataSource {
   getPreview(
     entry: FileEntrySummary,
     signal: AbortSignal,
-  ): Promise<PreviewSummary>;
+  ): Promise<PreparedPreview>;
 }

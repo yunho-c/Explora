@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import type { DirectoryRef } from "$lib/contracts/explorer";
+import type { DirectoryRef, FileEntrySummary } from "$lib/contracts/explorer";
 import type { SshConnectionEvent } from "$lib/contracts/explorer";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
 import type {
   ConnectSshOptions,
   ListDirectoryOptions,
+  PreparedPreview,
 } from "$lib/data/explorer-data-source";
 
 import { ExplorerState } from "./explorer-state.svelte";
@@ -62,6 +63,35 @@ class ObservableSshDataSource extends DemoExplorerDataSource {
 
   emitSshEvent(event: SshConnectionEvent): void {
     this.onSshEvent?.(event, async () => {});
+  }
+}
+
+class StalePreviewDataSource extends DemoExplorerDataSource {
+  readonly disposedEntryIds: string[] = [];
+
+  override async getPreview(
+    entry: FileEntrySummary,
+    signal: AbortSignal,
+  ): Promise<PreparedPreview> {
+    void signal;
+    if (entry.name === "explora-notes.md") {
+      await new Promise((resolve) => window.setTimeout(resolve, 100));
+    }
+    return {
+      preview: {
+        entryId: entry.reference.id,
+        kind: entry.contentKind,
+        title: entry.name,
+        subtitle: "File",
+        content: {
+          type: "metadata",
+          reason: "unsupported",
+          message: "Test preview",
+        },
+        details: [],
+      },
+      dispose: () => this.disposedEntryIds.push(entry.reference.id),
+    };
   }
 }
 
@@ -190,6 +220,44 @@ describe("ExplorerState", () => {
 
     state.closePreview();
     expect(state.previewOpen).toBe(false);
+  });
+
+  it("disposes stale and closed preview resources", async () => {
+    const dataSource = new StalePreviewDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const first = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const second = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+
+    state.selectEntry(first.reference.id);
+    const stalePreview = state.openPreview();
+    state.selectEntry(second.reference.id);
+    await state.openPreview();
+    await stalePreview;
+
+    expect(state.preview?.entryId).toBe(second.reference.id);
+    expect(dataSource.disposedEntryIds).toContain(first.reference.id);
+
+    state.closePreview();
+    expect(dataSource.disposedEntryIds).toContain(second.reference.id);
+  });
+
+  it("keeps SSH content previews metadata-only", async () => {
+    const state = await initializedState();
+    await state.selectLocation("staging-box");
+    const remoteFile = state.entries.find(({ name }) => name === "README.md")!;
+
+    state.selectEntry(remoteFile.reference.id);
+    await state.openPreview();
+
+    expect(state.preview?.content).toMatchObject({
+      type: "metadata",
+      reason: "remote",
+    });
   });
 
   it("connects SSH targets as locations and preserves their tab when disconnected", async () => {

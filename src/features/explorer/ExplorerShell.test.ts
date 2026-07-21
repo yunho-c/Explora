@@ -49,10 +49,41 @@ describe("ExplorerShell", () => {
     await fireEvent.keyDown(window, { key: " " });
 
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.queryByText("Preparing preview")).not.toBeInTheDocument();
     expect(
-      await screen.findByText(
-        "Use ↑ and ↓ to move between items · Esc to close",
-      ),
+      screen.queryByText("Reading a safe, bounded view of this file…"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Use ↑ and ↓ to move between items · Esc to close"),
+    ).not.toBeInTheDocument();
+    const textPreview = await screen.findByRole<HTMLTextAreaElement>(
+      "textbox",
+      {
+        name: "Text preview of explora-notes.md",
+      },
+    );
+    expect(textPreview.value).toContain("local and remote files");
+
+    const selectedEntryId = state.selectedEntryId;
+    textPreview.focus();
+    await fireEvent.keyDown(textPreview, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(state.selectedEntryId).not.toBe(selectedEntryId),
+    );
+  });
+
+  it("renders raster preview content with an accessible file name", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    render(ExplorerShell, { state });
+
+    await fireEvent.click(screen.getByText("summer-light.jpg"));
+    await fireEvent.keyDown(window, { key: " " });
+
+    expect(
+      await screen.findByRole("img", {
+        name: "Preview of summer-light.jpg",
+      }),
     ).toBeInTheDocument();
   });
 

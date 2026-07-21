@@ -111,6 +111,21 @@ impl LocalFilesystem {
         self.locations.clone()
     }
 
+    pub(crate) fn resolve_preview_path(
+        &self,
+        entry_id: &str,
+        location_id: &str,
+    ) -> Result<PathBuf, ExplorerError> {
+        if !self
+            .locations
+            .iter()
+            .any(|location| location.id == location_id)
+        {
+            return Err(ExplorerError::InvalidReference);
+        }
+        self.registry.resolve(entry_id)
+    }
+
     pub fn list_directory<F>(
         &self,
         directory_id: &str,

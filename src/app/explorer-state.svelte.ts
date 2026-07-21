@@ -65,6 +65,7 @@ export class ExplorerState {
 
   private directoryController: AbortController | null = null;
   private previewController: AbortController | null = null;
+  private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
   private tabSequence = 0;
 
@@ -638,22 +639,36 @@ export class ExplorerState {
     this.previewLoading = true;
     this.preview = null;
     this.previewController?.abort();
+    this.disposePreview();
     const controller = new AbortController();
     this.previewController = controller;
 
     try {
-      const preview = await this.dataSource.getPreview(
+      const prepared = await this.dataSource.getPreview(
         entry,
         controller.signal,
       );
-      if (this.previewController === controller) this.preview = preview;
+      if (this.previewController === controller) {
+        this.preview = prepared.preview;
+        this.previewDisposer = prepared.dispose;
+      } else {
+        prepared.dispose();
+      }
     } catch (error) {
-      if (!isAbortError(error)) {
+      if (!isAbortError(error) && this.previewController === controller) {
         this.preview = {
           entryId: entry.reference.id,
           kind: entry.contentKind,
           title: entry.name,
           subtitle: "Preview unavailable",
+          content: {
+            type: "metadata",
+            reason: "unsupported",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Explora could not prepare this preview.",
+          },
           details: [],
         };
       }
@@ -664,9 +679,16 @@ export class ExplorerState {
 
   closePreview(): void {
     this.previewController?.abort();
+    this.previewController = null;
+    this.disposePreview();
     this.previewOpen = false;
     this.previewLoading = false;
     this.preview = null;
+  }
+
+  private disposePreview(): void {
+    this.previewDisposer?.();
+    this.previewDisposer = null;
   }
 
   moveSelection(delta: number): void {

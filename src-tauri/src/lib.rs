@@ -1,6 +1,7 @@
 mod commands;
 mod filesystem;
 mod local_filesystem;
+mod preview;
 mod ssh;
 mod ssh_targets;
 #[cfg(test)]
@@ -92,6 +93,10 @@ pub fn run() {
             commands::disconnect_ssh_target,
             commands::list_directory,
             commands::cancel_listing,
+            commands::prepare_preview,
+            commands::cancel_preview,
+            commands::read_preview_resource,
+            commands::discard_preview_resource,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

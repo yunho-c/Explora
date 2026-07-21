@@ -143,11 +143,43 @@ export interface PreviewDetail {
   value: string;
 }
 
+export type PreviewUnavailableReason =
+  | "unsupported"
+  | "remote"
+  | "directory"
+  | "symlink"
+  | "tooLarge"
+  | "binary"
+  | "malformed"
+  | "timedOut";
+
+export type PreviewContent =
+  | {
+      type: "metadata";
+      reason: PreviewUnavailableReason;
+      message: string;
+    }
+  | {
+      type: "text";
+      text: string;
+      truncated: boolean;
+      encoding: string;
+    }
+  | {
+      type: "image";
+      url: string;
+      mediaType: "image/png";
+      width: number;
+      height: number;
+      originalWidth: number;
+      originalHeight: number;
+    };
+
 export interface PreviewSummary {
   entryId: string;
   kind: ContentKind;
   title: string;
   subtitle: string;
-  excerpt?: string;
+  content: PreviewContent;
   details: PreviewDetail[];
 }

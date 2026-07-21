@@ -12,6 +12,54 @@ pub const SFTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub enum PreviewUnavailableReason {
+    Unsupported,
+    Remote,
+    Directory,
+    Symlink,
+    TooLarge,
+    Binary,
+    Malformed,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum PreviewContentDto {
+    Metadata {
+        reason: PreviewUnavailableReason,
+        message: String,
+    },
+    Text {
+        text: String,
+        truncated: bool,
+        encoding: &'static str,
+    },
+    Image {
+        resource_id: String,
+        media_type: &'static str,
+        width: u32,
+        height: u32,
+        original_width: u32,
+        original_height: u32,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewResultDto {
+    pub entry_id: String,
+    pub size: Option<String>,
+    pub modified_at: Option<u64>,
+    pub content: PreviewContentDto,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub enum LocationRole {
     Home,
     Desktop,

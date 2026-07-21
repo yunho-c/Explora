@@ -9,8 +9,12 @@ use std::{
 use tauri::{ipc::Channel, State};
 
 use crate::{
-    filesystem::{DirectoryListingEvent, ExplorerError, ExplorerErrorDto, LocationSummaryDto},
+    filesystem::{
+        DirectoryListingEvent, ExplorerError, ExplorerErrorDto, LocationSummaryDto,
+        PreviewResultDto, PreviewUnavailableReason,
+    },
     local_filesystem::LocalFilesystem,
+    preview::{metadata_result, PreviewManager},
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
 };
@@ -19,6 +23,7 @@ pub struct AppState {
     local: Arc<LocalFilesystem>,
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
+    preview: Arc<PreviewManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -28,6 +33,7 @@ impl AppState {
             local: Arc::new(local),
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
+            preview: Arc::new(PreviewManager::default()),
             listings: Mutex::new(HashMap::new()),
         }
     }
@@ -240,6 +246,83 @@ pub fn cancel_listing(
         .map_err(ExplorerErrorDto::from)
 }
 
+#[tauri::command]
+pub async fn prepare_preview(
+    state: State<'_, AppState>,
+    request_id: String,
+    entry_id: String,
+    location_id: String,
+) -> Result<PreviewResultDto, ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
+
+    if location_id.starts_with("ssh:") {
+        return Ok(metadata_result(
+            entry_id,
+            None,
+            None,
+            PreviewUnavailableReason::Remote,
+            "Remote content preview is not available yet.",
+        ));
+    }
+
+    let path = state
+        .local
+        .resolve_preview_path(&entry_id, &location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    state
+        .preview
+        .prepare_local(request_id, entry_id, path)
+        .await
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_preview(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .preview
+        .cancel(&request_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn read_preview_resource(
+    state: State<'_, AppState>,
+    resource_id: String,
+) -> Result<tauri::ipc::Response, ExplorerErrorDto> {
+    validate_reference_id(&resource_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .preview
+        .take_resource(&resource_id)
+        .map(tauri::ipc::Response::new)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn discard_preview_resource(
+    state: State<'_, AppState>,
+    resource_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_reference_id(&resource_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .preview
+        .discard_resource(&resource_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+fn validate_reference_id(value: &str) -> Result<(), ExplorerError> {
+    if value.is_empty() || value.len() > 256 {
+        Err(ExplorerError::InvalidReference)
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,6 +332,13 @@ mod tests {
         assert!(validate_request_id("request-1").is_ok());
         assert!(validate_request_id("").is_err());
         assert!(validate_request_id(&"x".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn reference_ids_are_bounded() {
+        assert!(validate_reference_id("entry-1").is_ok());
+        assert!(validate_reference_id("").is_err());
+        assert!(validate_reference_id(&"x".repeat(257)).is_err());
     }
 
     #[test]

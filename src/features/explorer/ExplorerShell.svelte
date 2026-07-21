@@ -33,8 +33,10 @@
     const isTextInput =
       target instanceof Element &&
       target.matches("input, textarea, [contenteditable='true']");
+    const isPreviewText =
+      target instanceof Element && target.matches("[data-preview-text]");
 
-    if (isTextInput && event.key !== "Escape") return;
+    if (isTextInput && !isPreviewText && event.key !== "Escape") return;
 
     if (event.key === " " && state.selectedEntryId) {
       event.preventDefault();

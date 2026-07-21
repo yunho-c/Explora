@@ -1,7 +1,7 @@
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { DirectoryRef } from "$lib/contracts/explorer";
+import type { DirectoryRef, FileEntrySummary } from "$lib/contracts/explorer";
 
 import { TauriExplorerDataSource } from "./tauri-explorer-data-source";
 
@@ -33,6 +33,17 @@ const entryPayload = {
   displayPath: "/Users/test/notes.md",
   directory: null,
   detail: null,
+};
+
+const previewEntry: FileEntrySummary = {
+  reference: entryPayload.reference,
+  name: entryPayload.name,
+  kind: "file",
+  contentKind: "document",
+  size: entryPayload.size,
+  modifiedAt: entryPayload.modifiedAt,
+  displayPath: entryPayload.displayPath,
+  directory: null,
 };
 
 const sshTargetPayload = {
@@ -87,7 +98,10 @@ const sendChannelMessages = (
   }
 };
 
-afterEach(() => clearMocks());
+afterEach(() => {
+  clearMocks();
+  vi.restoreAllMocks();
+});
 
 describe("TauriExplorerDataSource", () => {
   it("validates locations and streams typed directory events", async () => {
@@ -199,6 +213,133 @@ describe("TauriExplorerDataSource", () => {
 
     await expect(listing).rejects.toMatchObject({ name: "AbortError" });
     expect(commands).toContain("cancel_listing");
+  });
+
+  it("validates and returns a bounded text preview", async () => {
+    mockIPC((command) => {
+      if (command === "prepare_preview") {
+        return {
+          entryId: previewEntry.reference.id,
+          size: "5",
+          modifiedAt: previewEntry.modifiedAt,
+          content: {
+            type: "text",
+            text: "hello",
+            truncated: true,
+            encoding: "UTF-8",
+          },
+        };
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const prepared = await source.getPreview(
+      previewEntry,
+      new AbortController().signal,
+    );
+
+    expect(prepared.preview.content).toEqual({
+      type: "text",
+      text: "hello",
+      truncated: true,
+      encoding: "UTF-8",
+    });
+    expect(prepared.preview.details).toContainEqual({
+      label: "Encoding",
+      value: "UTF-8",
+    });
+    expect(() => prepared.dispose()).not.toThrow();
+  });
+
+  it("loads raw image bytes and revokes the Blob URL on disposal", async () => {
+    const createObjectUrl = vi
+      .spyOn(URL, "createObjectURL")
+      .mockReturnValue("blob:preview-1");
+    const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL");
+    const commands: string[] = [];
+    mockIPC((command) => {
+      commands.push(command);
+      if (command === "prepare_preview") {
+        return {
+          entryId: previewEntry.reference.id,
+          size: "68",
+          modifiedAt: previewEntry.modifiedAt,
+          content: {
+            type: "image",
+            resourceId: "resource-1",
+            mediaType: "image/png",
+            width: 640,
+            height: 480,
+            originalWidth: 4_032,
+            originalHeight: 3_024,
+          },
+        };
+      }
+      if (command === "read_preview_resource") {
+        return new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer;
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const prepared = await source.getPreview(
+      { ...previewEntry, contentKind: "image", name: "photo.png" },
+      new AbortController().signal,
+    );
+
+    expect(prepared.preview.content).toMatchObject({
+      type: "image",
+      url: "blob:preview-1",
+      width: 640,
+      height: 480,
+    });
+    expect(commands).toContain("read_preview_resource");
+    expect(createObjectUrl).toHaveBeenCalledOnce();
+    prepared.dispose();
+    prepared.dispose();
+    expect(revokeObjectUrl).toHaveBeenCalledOnce();
+  });
+
+  it("rejects malformed preview payloads before rendering", async () => {
+    mockIPC((command) =>
+      command === "prepare_preview"
+        ? {
+            entryId: previewEntry.reference.id,
+            size: "5",
+            modifiedAt: null,
+            content: { type: "image", resourceId: "resource-1" },
+          }
+        : null,
+    );
+
+    const source = new TauriExplorerDataSource();
+    await expect(
+      source.getPreview(previewEntry, new AbortController().signal),
+    ).rejects.toThrow("mediaType must be a string");
+  });
+
+  it("forwards cancellation to an active Rust preview request", async () => {
+    let finishPreview = () => {};
+    const commands: string[] = [];
+    mockIPC((command) => {
+      commands.push(command);
+      if (command === "prepare_preview") {
+        return new Promise<void>((resolve) => {
+          finishPreview = resolve;
+        });
+      }
+      if (command === "cancel_preview") finishPreview();
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const controller = new AbortController();
+    const preview = source.getPreview(previewEntry, controller.signal);
+    controller.abort();
+
+    await expect(preview).rejects.toMatchObject({ name: "AbortError" });
+    expect(commands).toContain("cancel_preview");
   });
 
   it("validates saved SSH targets and their editable metadata", async () => {

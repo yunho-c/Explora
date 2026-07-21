@@ -9,8 +9,20 @@ test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await page.getByText("explora-notes.md").click();
   await page.keyboard.press("Space");
   await expect(page.getByRole("dialog")).toContainText("explora-notes.md");
+  await expect(
+    page.getByRole("textbox", {
+      name: "Text preview of explora-notes.md",
+    }),
+  ).toHaveValue(/local and remote files/);
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toBeHidden();
+
+  await page.getByText("summer-light.jpg").click();
+  await page.keyboard.press("Space");
+  await expect(
+    page.getByRole("img", { name: "Preview of summer-light.jpg" }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
 
   await page.getByRole("button", { name: "Grid view" }).click();
   await expect(page.getByRole("grid", { name: "Files" })).toBeVisible();

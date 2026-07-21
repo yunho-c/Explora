@@ -11,7 +11,9 @@ import type {
   LocationStatus,
   LocationSummary,
   ManualSshTargetInput,
+  PreviewContent,
   PreviewSummary,
+  PreviewUnavailableReason,
   SshConnectionEvent,
   SshPromptResponse,
   SshTargetSource,
@@ -22,6 +24,7 @@ import type {
   ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
+  PreparedPreview,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
 
@@ -76,6 +79,16 @@ const sshPromptKinds = new Set([
   "password",
   "keyboardInteractive",
 ] as const);
+const previewUnavailableReasons = new Set<PreviewUnavailableReason>([
+  "unsupported",
+  "remote",
+  "directory",
+  "symlink",
+  "tooLarge",
+  "binary",
+  "malformed",
+  "timedOut",
+]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -331,6 +344,192 @@ const parseEntry = (value: unknown): FileEntrySummary => {
       value.directory === null ? null : parseDirectoryRef(value.directory),
     detail: typeof value.detail === "string" ? value.detail : undefined,
   };
+};
+
+interface PreparedPreviewPayload {
+  entryId: string;
+  size: string | null;
+  modifiedAt: number | null;
+  content:
+    | {
+        type: "metadata";
+        reason: PreviewUnavailableReason;
+        message: string;
+      }
+    | {
+        type: "text";
+        text: string;
+        truncated: boolean;
+        encoding: string;
+      }
+    | {
+        type: "image";
+        resourceId: string;
+        mediaType: "image/png";
+        width: number;
+        height: number;
+        originalWidth: number;
+        originalHeight: number;
+      };
+}
+
+const parseNullableSize = (value: unknown, context: string): string | null => {
+  if (value === null) return null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    throw new Error(`Invalid preview response: ${context} is malformed.`);
+  }
+  return value;
+};
+
+const parseNullableTimestamp = (
+  value: unknown,
+  context: string,
+): number | null => {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid preview response: ${context} is malformed.`);
+  }
+  return value;
+};
+
+const requirePreviewDimension = (
+  record: Record<string, unknown>,
+  key: string,
+): number => {
+  const value = record[key];
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > 16_384
+  ) {
+    throw new Error(`Invalid preview response: ${key} is malformed.`);
+  }
+  return value;
+};
+
+const parsePreparedPreview = (
+  value: unknown,
+  expectedEntryId: string,
+): PreparedPreviewPayload => {
+  if (!isRecord(value) || !isRecord(value.content)) {
+    throw new Error("Invalid preview response: preview must be an object.");
+  }
+  const entryId = requireString(value, "entryId");
+  if (entryId !== expectedEntryId) {
+    throw new Error(
+      "Invalid preview response: entry reference does not match.",
+    );
+  }
+  const size = parseNullableSize(value.size, "size");
+  const modifiedAt = parseNullableTimestamp(value.modifiedAt, "modified time");
+  const type = requireString(value.content, "type");
+
+  if (type === "metadata") {
+    const reason = requireString(value.content, "reason");
+    if (!previewUnavailableReasons.has(reason as PreviewUnavailableReason)) {
+      throw new Error(`Invalid preview response: unknown reason ${reason}.`);
+    }
+    return {
+      entryId,
+      size,
+      modifiedAt,
+      content: {
+        type,
+        reason: reason as PreviewUnavailableReason,
+        message: requireString(value.content, "message"),
+      },
+    };
+  }
+
+  if (type === "text") {
+    if (typeof value.content.truncated !== "boolean") {
+      throw new Error("Invalid preview response: truncated flag is malformed.");
+    }
+    return {
+      entryId,
+      size,
+      modifiedAt,
+      content: {
+        type,
+        text: requireString(value.content, "text"),
+        truncated: value.content.truncated,
+        encoding: requireString(value.content, "encoding"),
+      },
+    };
+  }
+
+  if (type === "image") {
+    const mediaType = requireString(value.content, "mediaType");
+    if (mediaType !== "image/png") {
+      throw new Error(`Invalid preview response: unsupported media type.`);
+    }
+    return {
+      entryId,
+      size,
+      modifiedAt,
+      content: {
+        type,
+        resourceId: requireString(value.content, "resourceId"),
+        mediaType,
+        width: requirePreviewDimension(value.content, "width"),
+        height: requirePreviewDimension(value.content, "height"),
+        originalWidth: requirePreviewDimension(value.content, "originalWidth"),
+        originalHeight: requirePreviewDimension(
+          value.content,
+          "originalHeight",
+        ),
+      },
+    };
+  }
+
+  throw new Error(`Invalid preview response: unknown content type ${type}.`);
+};
+
+const previewDetails = (
+  entry: FileEntrySummary,
+  payload: PreparedPreviewPayload,
+): { details: PreviewSummary["details"]; subtitle: string } => {
+  const size = payload.size ?? entry.size;
+  const modifiedAt = payload.modifiedAt ?? entry.modifiedAt;
+  const details: PreviewSummary["details"] = [
+    { label: "Path", value: entry.displayPath },
+    { label: "Size", value: formatFileSize(size) },
+  ];
+  if (modifiedAt !== null) {
+    details.splice(1, 0, {
+      label: "Modified",
+      value: new Date(modifiedAt).toLocaleString(),
+    });
+  }
+
+  if (payload.content.type === "text") {
+    details.push({ label: "Encoding", value: payload.content.encoding });
+    return {
+      details,
+      subtitle: entry.detail ?? `${payload.content.encoding} text`,
+    };
+  }
+  if (payload.content.type === "image") {
+    details.push({
+      label: "Dimensions",
+      value: `${payload.content.originalWidth} × ${payload.content.originalHeight}`,
+    });
+    return { details, subtitle: entry.detail ?? "Image" };
+  }
+  return {
+    details,
+    subtitle:
+      entry.kind === "directory"
+        ? (entry.detail ?? "Folder")
+        : (entry.detail ?? "File"),
+  };
+};
+
+const parsePreviewBytes = (value: unknown): Uint8Array => {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (value instanceof Uint8Array) return value;
+  throw new Error("Invalid preview response: image bytes are malformed.");
 };
 
 const parseBreadcrumb = (value: unknown): BreadcrumbSegment => {
@@ -637,33 +836,91 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
   async getPreview(
     entry: FileEntrySummary,
     signal: AbortSignal,
-  ): Promise<PreviewSummary> {
+  ): Promise<PreparedPreview> {
     if (signal.aborted) throw abortError();
-
-    const kindLabel =
-      entry.kind === "symlink"
-        ? "Symbolic link"
-        : entry.kind === "directory"
-          ? "Folder"
-          : "File";
-    const details = [
-      { label: "Path", value: entry.displayPath },
-      { label: "Type", value: kindLabel },
-      { label: "Size", value: formatFileSize(entry.size) },
-    ];
-    if (entry.modifiedAt !== null) {
-      details.splice(2, 0, {
-        label: "Modified",
-        value: new Date(entry.modifiedAt).toLocaleString(),
+    const id = requestId();
+    let pendingResourceId: string | null = null;
+    let imageUrl: string | null = null;
+    const cancel = () => {
+      void invoke("cancel_preview", { requestId: id }).catch(() => {
+        // Cancellation is best-effort; stale preview results are still ignored.
       });
-    }
-
-    return {
-      entryId: entry.reference.id,
-      kind: entry.contentKind,
-      title: entry.name,
-      subtitle: entry.detail ?? kindLabel,
-      details,
+      if (pendingResourceId) {
+        void invoke("discard_preview_resource", {
+          resourceId: pendingResourceId,
+        }).catch(() => {
+          // The resource may already have been consumed by the binary read.
+        });
+      }
     };
+
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const rawPayload = await invoke<unknown>("prepare_preview", {
+        requestId: id,
+        entryId: entry.reference.id,
+        locationId: entry.reference.locationId,
+      });
+      if (signal.aborted) throw abortError();
+      const payload = parsePreparedPreview(rawPayload, entry.reference.id);
+      const { details, subtitle } = previewDetails(entry, payload);
+      let content: PreviewContent;
+
+      if (payload.content.type === "image") {
+        pendingResourceId = payload.content.resourceId;
+        const rawBytes = await invoke<unknown>("read_preview_resource", {
+          resourceId: pendingResourceId,
+        });
+        pendingResourceId = null;
+        if (signal.aborted) throw abortError();
+        const bytes = parsePreviewBytes(rawBytes);
+        const ownedBytes = Uint8Array.from(bytes);
+        const blob = new Blob([ownedBytes.buffer], {
+          type: payload.content.mediaType,
+        });
+        imageUrl = URL.createObjectURL(blob);
+        if (signal.aborted) throw abortError();
+        content = {
+          type: "image",
+          url: imageUrl,
+          mediaType: payload.content.mediaType,
+          width: payload.content.width,
+          height: payload.content.height,
+          originalWidth: payload.content.originalWidth,
+          originalHeight: payload.content.originalHeight,
+        };
+      } else {
+        content = payload.content;
+      }
+
+      const preview: PreviewSummary = {
+        entryId: entry.reference.id,
+        kind: entry.contentKind,
+        title: entry.name,
+        subtitle,
+        content,
+        details,
+      };
+      let disposed = false;
+      return {
+        preview,
+        dispose: () => {
+          if (disposed) return;
+          disposed = true;
+          if (imageUrl) URL.revokeObjectURL(imageUrl);
+        },
+      };
+    } catch (error) {
+      if (pendingResourceId) {
+        void invoke("discard_preview_resource", {
+          resourceId: pendingResourceId,
+        }).catch(() => {});
+      }
+      if (imageUrl) URL.revokeObjectURL(imageUrl);
+      if (signal.aborted) throw abortError();
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
   }
 }
