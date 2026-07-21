@@ -62,6 +62,7 @@ describe("ExplorerShell", () => {
     ] as const) {
       const button = screen.getByRole("button", { name });
       expect(button.querySelector(`.${iconClass}`)).toBeInTheDocument();
+      expect(button).toHaveClass("gap-2");
     }
   });
 

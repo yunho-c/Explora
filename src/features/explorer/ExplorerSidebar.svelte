@@ -88,7 +88,7 @@
               ? "secondary"
               : "ghost"}
             size={compact ? "icon" : "sm"}
-            class={compact ? "w-full" : "w-full justify-start"}
+            class={compact ? "w-full" : "w-full justify-start gap-2"}
             aria-current={state.activeLocation?.id === location.id
               ? "page"
               : undefined}
@@ -114,7 +114,7 @@
               ? "secondary"
               : "ghost"}
             size={compact ? "icon" : "sm"}
-            class={compact ? "w-full" : "w-full justify-start"}
+            class={compact ? "w-full" : "w-full justify-start gap-2"}
             aria-current={state.activeLocation?.id === location.id
               ? "page"
               : undefined}
@@ -156,7 +156,7 @@
               size={compact ? "icon" : "sm"}
               class={compact
                 ? "relative w-full"
-                : "min-w-0 flex-1 justify-start"}
+                : "min-w-0 flex-1 justify-start gap-2"}
               aria-current={target.connectedLocationId ===
               state.activeLocation?.id
                 ? "page"
