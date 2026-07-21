@@ -210,7 +210,21 @@ describe("ExplorerShell", () => {
       screen.getByRole("button", { name: "Add SSH target" }),
     ).toBeInTheDocument();
     expect(
-      sshTargets.getByRole("button", { name: "Manage staging-box" }),
+      sshTargets.queryByRole("button", { name: /Manage / }),
+    ).not.toBeInTheDocument();
+    expect(sshTargets.queryByText("Config")).not.toBeInTheDocument();
+
+    await fireEvent.contextMenu(
+      sshTargets.getByRole("button", { name: "staging-box connected" }),
+    );
+    expect(
+      await screen.findByRole("menuitem", { name: "Edit" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Disconnect" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("menuitem", { name: "Remove" }),
     ).toBeInTheDocument();
   });
 

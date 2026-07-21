@@ -102,9 +102,26 @@ test("configures visible SSH targets without disconnecting them", async ({
   await expect(
     page.getByRole("button", { name: "Configure SSH targets" }),
   ).toBeFocused();
+  await expect(sshTargets.getByRole("button", { name: /Manage / })).toHaveCount(
+    0,
+  );
+  await expect(sshTargets.getByText("Config", { exact: true })).toHaveCount(0);
+
+  await sshTargets
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .click({ button: "right" });
+  await expect(page.getByRole("menuitem", { name: "Edit" })).toBeVisible();
   await expect(
-    sshTargets.getByRole("button", { name: "Manage staging-box" }),
+    page.getByRole("menuitem", { name: "Disconnect" }),
   ).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await sshTargets
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .focus();
+  await page.keyboard.press("Shift+F10");
+  await expect(page.getByRole("menuitem", { name: "Edit" })).toBeVisible();
 });
 
 test("opens the responsive locations sheet", async ({ page }) => {

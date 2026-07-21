@@ -11,7 +11,6 @@
   import LaptopIcon from "@lucide/svelte/icons/laptop";
   import MonitorIcon from "@lucide/svelte/icons/monitor";
   import Music2Icon from "@lucide/svelte/icons/music-2";
-  import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
   import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
   import PanelLeftOpenIcon from "@lucide/svelte/icons/panel-left-open";
   import PencilIcon from "@lucide/svelte/icons/pencil";
@@ -24,11 +23,10 @@
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
   import type { WindowChromeMode } from "../../app/window-chrome.svelte";
-  import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
-  import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
+  import * as ContextMenu from "$lib/components/ui/context-menu";
   import * as Sheet from "$lib/components/ui/sheet";
-  import type { LocationRole } from "$lib/contracts/explorer";
+  import type { LocationRole, SshTargetSummary } from "$lib/contracts/explorer";
   import { isFavoriteRole } from "$lib/contracts/preferences";
   import { cn } from "$lib/utils";
 
@@ -96,6 +94,60 @@
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
+
+{#snippet sshTargetButton(
+  target: SshTargetSummary,
+  compact: boolean,
+  contextMenuTrigger: boolean,
+)}
+  <Button
+    variant={target.connectedLocationId === state.activeLocation?.id
+      ? "secondary"
+      : "ghost"}
+    size={compact ? "icon" : "sm"}
+    class={compact
+      ? "relative w-full"
+      : contextMenuTrigger
+        ? "w-full min-w-0 justify-start gap-2"
+        : "min-w-0 flex-1 justify-start gap-2"}
+    aria-current={target.connectedLocationId === state.activeLocation?.id
+      ? "page"
+      : undefined}
+    title={`${target.name} · ${target.endpoint} · ${target.status}`}
+    onclick={() => void state.selectSshTarget(target.id)}
+  >
+    <ServerIcon />
+    {#if !compact}
+      <span class="min-w-0 flex-1 truncate text-left">{target.name}</span>
+      <span
+        class={cn(
+          "size-2 rounded-full",
+          target.status === "connected"
+            ? "bg-emerald-500"
+            : target.status === "connecting"
+              ? "animate-pulse bg-amber-500"
+              : target.status === "error"
+                ? "bg-destructive"
+                : "bg-muted-foreground/40",
+        )}
+        aria-label={target.status}
+      ></span>
+    {:else}
+      <span
+        class={cn(
+          "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
+          target.status === "connected"
+            ? "bg-emerald-500"
+            : target.status === "connecting"
+              ? "animate-pulse bg-amber-500"
+              : target.status === "error"
+                ? "bg-destructive"
+                : "bg-muted-foreground/40",
+        )}
+      ></span>
+    {/if}
+  </Button>
+{/snippet}
 
 {#snippet navigation(compact: boolean, titlebar: boolean)}
   <div class="flex h-full min-h-0 flex-col">
@@ -312,59 +364,54 @@
             data-ssh-target-visible={visibleSshTarget}
           >
             {#if visibleSshTarget}
-              <Button
-                variant={target.connectedLocationId === state.activeLocation?.id
-                  ? "secondary"
-                  : "ghost"}
-                size={compact ? "icon" : "sm"}
-                class={compact
-                  ? "relative w-full"
-                  : "min-w-0 flex-1 justify-start gap-2"}
-                aria-current={target.connectedLocationId ===
-                state.activeLocation?.id
-                  ? "page"
-                  : undefined}
-                title={`${target.name} · ${target.endpoint} · ${target.status}`}
-                onclick={() => void state.selectSshTarget(target.id)}
-              >
-                <ServerIcon />
-                {#if !compact}
-                  <span class="min-w-0 flex-1 truncate text-left"
-                    >{target.name}</span
+              {#if !state.editingSshTargets && (target.editable || target.status === "connected")}
+                <ContextMenu.Root>
+                  <ContextMenu.Trigger
+                    class={compact ? "w-full" : "min-w-0 flex-1"}
                   >
-                  {#if target.source === "openSshConfig"}
-                    <Badge variant="outline" class="px-1 text-[10px]"
-                      >Config</Badge
-                    >
-                  {/if}
-                  <span
-                    class={cn(
-                      "size-2 rounded-full",
-                      target.status === "connected"
-                        ? "bg-emerald-500"
-                        : target.status === "connecting"
-                          ? "animate-pulse bg-amber-500"
-                          : target.status === "error"
-                            ? "bg-destructive"
-                            : "bg-muted-foreground/40",
-                    )}
-                    aria-label={target.status}
-                  ></span>
-                {:else}
-                  <span
-                    class={cn(
-                      "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
-                      target.status === "connected"
-                        ? "bg-emerald-500"
-                        : target.status === "connecting"
-                          ? "animate-pulse bg-amber-500"
-                          : target.status === "error"
-                            ? "bg-destructive"
-                            : "bg-muted-foreground/40",
-                    )}
-                  ></span>
-                {/if}
-              </Button>
+                    {@render sshTargetButton(target, compact, true)}
+                  </ContextMenu.Trigger>
+                  <ContextMenu.Content>
+                    {#if target.editable}
+                      <ContextMenu.Item
+                        onclick={() => state.openEditSshTarget(target.id)}
+                      >
+                        <PencilIcon />
+                        Edit
+                      </ContextMenu.Item>
+                    {/if}
+                    {#if target.status === "connected"}
+                      <ContextMenu.Item
+                        onclick={() =>
+                          void state.disconnectSshTarget(target.id)}
+                      >
+                        <UnplugIcon />
+                        Disconnect
+                      </ContextMenu.Item>
+                    {/if}
+                    {#if target.editable}
+                      <ContextMenu.Separator />
+                      <ContextMenu.Item
+                        variant="destructive"
+                        onclick={() => {
+                          if (
+                            window.confirm(
+                              `Remove SSH target “${target.name}”?`,
+                            )
+                          ) {
+                            void state.deleteSshTarget(target.id);
+                          }
+                        }}
+                      >
+                        <Trash2Icon />
+                        Remove
+                      </ContextMenu.Item>
+                    {/if}
+                  </ContextMenu.Content>
+                </ContextMenu.Root>
+              {:else}
+                {@render sshTargetButton(target, compact, false)}
+              {/if}
             {:else}
               <div
                 class="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-dashed border-border/60 bg-muted/20 px-2.5 text-sm text-muted-foreground"
@@ -372,11 +419,6 @@
               >
                 <ServerIcon class="size-4 shrink-0 opacity-60" />
                 <span class="min-w-0 flex-1 truncate">{target.name}</span>
-                {#if target.source === "openSshConfig"}
-                  <Badge variant="outline" class="px-1 text-[10px] opacity-70"
-                    >Config</Badge
-                  >
-                {/if}
               </div>
             {/if}
 
@@ -399,56 +441,6 @@
                 {#if visibleSshTarget}<CircleMinusIcon />{:else}<CirclePlusIcon
                   />{/if}
               </Button>
-            {:else if !compact}
-              <DropdownMenu.Root>
-                <DropdownMenu.Trigger>
-                  {#snippet child({ props })}
-                    <Button
-                      {...props}
-                      variant="ghost"
-                      size="icon-xs"
-                      class="opacity-0 group-hover:opacity-100 focus:opacity-100"
-                      aria-label={`Manage ${target.name}`}
-                    >
-                      <MoreHorizontalIcon />
-                    </Button>
-                  {/snippet}
-                </DropdownMenu.Trigger>
-                <DropdownMenu.Content align="start">
-                  {#if target.editable}
-                    <DropdownMenu.Item
-                      onclick={() => state.openEditSshTarget(target.id)}
-                    >
-                      <PencilIcon />
-                      Edit
-                    </DropdownMenu.Item>
-                  {/if}
-                  {#if target.status === "connected"}
-                    <DropdownMenu.Item
-                      onclick={() => void state.disconnectSshTarget(target.id)}
-                    >
-                      <UnplugIcon />
-                      Disconnect
-                    </DropdownMenu.Item>
-                  {/if}
-                  {#if target.editable}
-                    <DropdownMenu.Separator />
-                    <DropdownMenu.Item
-                      variant="destructive"
-                      onclick={() => {
-                        if (
-                          window.confirm(`Remove SSH target “${target.name}”?`)
-                        ) {
-                          void state.deleteSshTarget(target.id);
-                        }
-                      }}
-                    >
-                      <Trash2Icon />
-                      Remove
-                    </DropdownMenu.Item>
-                  {/if}
-                </DropdownMenu.Content>
-              </DropdownMenu.Root>
             {/if}
           </div>
         {/each}
