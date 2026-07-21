@@ -40,10 +40,6 @@
   const customChrome = $derived(
     chromeMode === "activating" || chromeMode === "custom",
   );
-  const elementRefs = {
-    favoritesEditButton: null as HTMLButtonElement | null,
-  };
-
   const iconsByRole = {
     home: HouseIcon,
     desktop: MonitorIcon,
@@ -68,13 +64,34 @@
 
   const finishEditingFavorites = (restoreFocus = false) => {
     state.editingFavorites = false;
-    if (restoreFocus) elementRefs.favoritesEditButton?.focus();
+    if (restoreFocus) focusVisibleEditor("[data-favorites-editor]");
+  };
+
+  const sshTargetIsVisible = (targetId: string) =>
+    !state.hiddenSshTargetIds.includes(targetId);
+
+  const finishEditingSshTargets = (restoreFocus = false) => {
+    state.editingSshTargets = false;
+    if (restoreFocus) focusVisibleEditor("[data-ssh-editor]");
+  };
+
+  const focusVisibleEditor = (selector: string) => {
+    queueMicrotask(() => {
+      const buttons = [
+        ...document.querySelectorAll<HTMLButtonElement>(selector),
+      ];
+      (
+        buttons.find((button) => button.offsetParent !== null) ?? buttons[0]
+      )?.focus();
+    });
   };
 
   const handleKeydown = (event: KeyboardEvent) => {
-    if (!state.editingFavorites || event.key !== "Escape") return;
+    if (event.key !== "Escape") return;
+    if (!state.editingFavorites && !state.editingSshTargets) return;
     event.preventDefault();
-    finishEditingFavorites(true);
+    if (state.editingFavorites) finishEditingFavorites(true);
+    else finishEditingSshTargets(true);
   };
 </script>
 
@@ -108,13 +125,13 @@
     >
       {#if !compact}
         <div
-          class="group/favorites flex items-center justify-between px-2 pt-3 pb-1"
+          class="group/favorites flex items-center justify-between pt-3 pb-1 pl-2"
         >
           <p class="text-xs font-medium text-muted-foreground">Favorites</p>
           <Button
-            bind:ref={elementRefs.favoritesEditButton}
             variant="ghost"
             size="icon-xs"
+            data-favorites-editor
             class={cn(
               "transition-opacity",
               state.editingFavorites
@@ -130,7 +147,10 @@
             aria-pressed={state.editingFavorites}
             onclick={() => {
               if (state.editingFavorites) finishEditingFavorites();
-              else state.editingFavorites = true;
+              else {
+                finishEditingSshTargets();
+                state.editingFavorites = true;
+              }
             }}
           >
             {#if state.editingFavorites}<CheckIcon />{:else}<Settings2Icon
@@ -224,81 +244,162 @@
 
       <div
         class={cn(
-          "flex items-center pt-5 pb-1",
-          compact ? "justify-center px-1" : "justify-between px-2",
+          "group/ssh flex items-center pt-5 pb-1",
+          compact ? "justify-center px-1" : "justify-between pl-2",
         )}
       >
-        {#if !compact}
+        {#if compact}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Add SSH target"
+            aria-label="Add SSH target"
+            onclick={() => state.openNewSshTarget()}
+          >
+            <PlusIcon />
+          </Button>
+        {:else}
           <p class="text-xs font-medium text-muted-foreground">SSH</p>
+          <div class="flex items-center">
+            {#if state.sshTargets.length > 0}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                data-ssh-editor
+                class={cn(
+                  "opacity-100 transition-opacity",
+                  !state.editingSshTargets &&
+                    "md:opacity-0 md:group-focus-within/ssh:opacity-100 md:group-hover/ssh:opacity-100",
+                )}
+                title={state.editingSshTargets
+                  ? "Finish editing SSH targets"
+                  : "Configure SSH targets"}
+                aria-label={state.editingSshTargets
+                  ? "Finish editing SSH targets"
+                  : "Configure SSH targets"}
+                aria-pressed={state.editingSshTargets}
+                onclick={() => {
+                  if (state.editingSshTargets) finishEditingSshTargets();
+                  else {
+                    finishEditingFavorites();
+                    state.editingSshTargets = true;
+                  }
+                }}
+              >
+                {#if state.editingSshTargets}<CheckIcon />{:else}<Settings2Icon
+                  />{/if}
+              </Button>
+            {/if}
+            {#if !state.editingSshTargets}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                title="Add SSH target"
+                aria-label="Add SSH target"
+                onclick={() => state.openNewSshTarget()}
+              >
+                <PlusIcon />
+              </Button>
+            {/if}
+          </div>
         {/if}
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          title="Add SSH target"
-          aria-label="Add SSH target"
-          onclick={() => state.openNewSshTarget()}
-        >
-          <PlusIcon />
-        </Button>
       </div>
       <nav aria-label="SSH targets" class="space-y-1">
-        {#each state.sshTargets as target (target.id)}
-          <div class="group flex min-w-0 items-center">
-            <Button
-              variant={target.connectedLocationId === state.activeLocation?.id
-                ? "secondary"
-                : "ghost"}
-              size={compact ? "icon" : "sm"}
-              class={compact
-                ? "relative w-full"
-                : "min-w-0 flex-1 justify-start gap-2"}
-              aria-current={target.connectedLocationId ===
-              state.activeLocation?.id
-                ? "page"
-                : undefined}
-              title={`${target.name} · ${target.endpoint} · ${target.status}`}
-              onclick={() => void state.selectSshTarget(target.id)}
-            >
-              <ServerIcon />
-              {#if !compact}
-                <span class="min-w-0 flex-1 truncate text-left"
-                  >{target.name}</span
-                >
+        {#each state.editingSshTargets && !compact ? state.sshTargets : state.visibleSshTargets as target (target.id)}
+          {@const visibleSshTarget = sshTargetIsVisible(target.id)}
+          <div
+            class="group flex min-w-0 items-center gap-1"
+            data-ssh-target-visible={visibleSshTarget}
+          >
+            {#if visibleSshTarget}
+              <Button
+                variant={target.connectedLocationId === state.activeLocation?.id
+                  ? "secondary"
+                  : "ghost"}
+                size={compact ? "icon" : "sm"}
+                class={compact
+                  ? "relative w-full"
+                  : "min-w-0 flex-1 justify-start gap-2"}
+                aria-current={target.connectedLocationId ===
+                state.activeLocation?.id
+                  ? "page"
+                  : undefined}
+                title={`${target.name} · ${target.endpoint} · ${target.status}`}
+                onclick={() => void state.selectSshTarget(target.id)}
+              >
+                <ServerIcon />
+                {#if !compact}
+                  <span class="min-w-0 flex-1 truncate text-left"
+                    >{target.name}</span
+                  >
+                  {#if target.source === "openSshConfig"}
+                    <Badge variant="outline" class="px-1 text-[10px]"
+                      >Config</Badge
+                    >
+                  {/if}
+                  <span
+                    class={cn(
+                      "size-2 rounded-full",
+                      target.status === "connected"
+                        ? "bg-emerald-500"
+                        : target.status === "connecting"
+                          ? "animate-pulse bg-amber-500"
+                          : target.status === "error"
+                            ? "bg-destructive"
+                            : "bg-muted-foreground/40",
+                    )}
+                    aria-label={target.status}
+                  ></span>
+                {:else}
+                  <span
+                    class={cn(
+                      "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
+                      target.status === "connected"
+                        ? "bg-emerald-500"
+                        : target.status === "connecting"
+                          ? "animate-pulse bg-amber-500"
+                          : target.status === "error"
+                            ? "bg-destructive"
+                            : "bg-muted-foreground/40",
+                    )}
+                  ></span>
+                {/if}
+              </Button>
+            {:else}
+              <div
+                class="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-dashed border-border/60 bg-muted/20 px-2.5 text-sm text-muted-foreground"
+                aria-label={`${target.name}, hidden from SSH`}
+              >
+                <ServerIcon class="size-4 shrink-0 opacity-60" />
+                <span class="min-w-0 flex-1 truncate">{target.name}</span>
                 {#if target.source === "openSshConfig"}
-                  <Badge variant="outline" class="px-1 text-[10px]"
+                  <Badge variant="outline" class="px-1 text-[10px] opacity-70"
                     >Config</Badge
                   >
                 {/if}
-                <span
-                  class={cn(
-                    "size-2 rounded-full",
-                    target.status === "connected"
-                      ? "bg-emerald-500"
-                      : target.status === "connecting"
-                        ? "animate-pulse bg-amber-500"
-                        : target.status === "error"
-                          ? "bg-destructive"
-                          : "bg-muted-foreground/40",
-                  )}
-                  aria-label={target.status}
-                ></span>
-              {:else}
-                <span
-                  class={cn(
-                    "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
-                    target.status === "connected"
-                      ? "bg-emerald-500"
-                      : target.status === "connecting"
-                        ? "animate-pulse bg-amber-500"
-                        : target.status === "error"
-                          ? "bg-destructive"
-                          : "bg-muted-foreground/40",
-                  )}
-                ></span>
-              {/if}
-            </Button>
+              </div>
+            {/if}
 
-            {#if !compact}
+            {#if state.editingSshTargets && !compact}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                class={visibleSshTarget
+                  ? "text-muted-foreground hover:text-destructive"
+                  : "text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"}
+                title={visibleSshTarget
+                  ? `Hide ${target.name} from SSH`
+                  : `Show ${target.name} in SSH`}
+                aria-label={visibleSshTarget
+                  ? `Hide ${target.name} from SSH`
+                  : `Show ${target.name} in SSH`}
+                onclick={() =>
+                  state.setSshTargetVisible(target.id, !visibleSshTarget)}
+              >
+                {#if visibleSshTarget}<CircleMinusIcon />{:else}<CirclePlusIcon
+                  />{/if}
+              </Button>
+            {:else if !compact}
               <DropdownMenu.Root>
                 <DropdownMenu.Trigger>
                   {#snippet child({ props })}
@@ -357,6 +458,11 @@
           Add a server or define a concrete Host in ~/.ssh/config.
         </p>
       {/if}
+      {#if !compact && !state.editingSshTargets && state.sshTargets.length > 0 && state.visibleSshTargets.length === 0}
+        <p class="px-2 py-2 text-xs text-muted-foreground">
+          All SSH targets are hidden. Configure SSH to show one.
+        </p>
+      {/if}
       {#if state.connectingTargetId}
         <div
           class={cn(
@@ -405,6 +511,7 @@
     aria-label={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
     onclick={() => {
       finishEditingFavorites();
+      finishEditingSshTargets();
       state.setSidebarCollapsed(!state.sidebarCollapsed);
     }}
   >

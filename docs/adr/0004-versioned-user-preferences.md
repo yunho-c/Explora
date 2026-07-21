@@ -20,15 +20,17 @@ registries exist.
 
 Rust owns a versioned `preferences.json` document in Tauri's application config
 directory. The global layout section stores sidebar collapsed state, view mode,
-sort descriptor, and the standard location roles shown under Favorites. IPC
-exposes a typed snapshot and typed partial layout updates. Rust validates closed
-enums, serializes concurrent writes under a mutex, performs file I/O away from
-the UI thread, and atomically replaces the document. The file is owner-only on
-Unix.
+sort descriptor, the standard location roles shown under Favorites, and a sparse
+list of SSH target IDs hidden from the sidebar. IPC exposes a typed snapshot and
+typed partial layout updates. Rust validates closed enums and bounded target IDs,
+serializes concurrent writes under a mutex, performs file I/O away from the UI
+thread, and atomically replaces the document. The file is owner-only on Unix.
 
 Version 2 adds the favorite-role list. Version 1 documents migrate in memory with
 all available standard favorites enabled, preserving their existing layout
 choices. Favorite roles are deduplicated and stored in canonical sidebar order.
+Version 3 adds hidden SSH target IDs; earlier documents migrate with every target
+visible. IDs are bounded, validated, deduplicated, and sorted before persistence.
 
 Missing preference files use defaults. Unreadable, malformed, or unsupported
 documents also recover to defaults and return a structured warning rather than
@@ -62,8 +64,10 @@ shortcut map is persisted before those semantics are implemented and tested.
 
 Current layout choices survive packaged-app restarts and remain consistent across
 locations. Users can hide or restore standard-folder shortcuts without removing
-the underlying location or affecting an open tab. Arbitrary directory favorites,
-per-location, or per-folder settings require a later product decision and stable
-backend-owned location identities rather than display paths. A future unified
-settings screen may migrate theme ownership, but must include an explicit
-compatibility path for existing `mode-watcher` values.
+the underlying location or affecting an open tab. Hiding an SSH target likewise
+does not edit, delete, or disconnect it; target lifecycle actions remain separate
+from sidebar visibility. Arbitrary directory favorites, per-location, or
+per-folder settings require a later product decision and stable backend-owned
+location identities rather than display paths. A future unified settings screen
+may migrate theme ownership, but must include an explicit compatibility path for
+existing `mode-watcher` values.

@@ -68,6 +68,45 @@ test("configures standard favorites from the section header", async ({
   ).toBeFocused();
 });
 
+test("configures visible SSH targets without disconnecting them", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const sshTargets = page.getByRole("navigation", { name: "SSH targets" });
+
+  await page.getByText("SSH", { exact: true }).hover();
+  await page.getByRole("button", { name: "Configure SSH targets" }).click();
+  await expect(
+    page.getByRole("button", { name: "Finish editing SSH targets" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Add SSH target" }),
+  ).toBeHidden();
+  await sshTargets
+    .getByRole("button", { name: "Hide staging-box from SSH" })
+    .click();
+  await expect(
+    sshTargets.getByRole("button", {
+      name: "staging-box connected",
+      exact: true,
+    }),
+  ).toBeHidden();
+  await expect(
+    sshTargets.getByLabel("staging-box, hidden from SSH"),
+  ).toBeVisible();
+
+  await sshTargets
+    .getByRole("button", { name: "Show staging-box in SSH" })
+    .click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "Configure SSH targets" }),
+  ).toBeFocused();
+  await expect(
+    sshTargets.getByRole("button", { name: "Manage staging-box" }),
+  ).toBeVisible();
+});
+
 test("opens the responsive locations sheet", async ({ page }) => {
   await page.setViewportSize({ width: 760, height: 720 });
   await page.goto("/");

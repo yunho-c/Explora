@@ -10,7 +10,9 @@ use tempfile::NamedTempFile;
 
 use crate::filesystem::ExplorerError;
 
-const PREFERENCES_FILE_VERSION: u32 = 2;
+const PREFERENCES_FILE_VERSION: u32 = 3;
+const MAX_HIDDEN_SSH_TARGETS: usize = 512;
+const MAX_SSH_TARGET_ID_LENGTH: usize = 512;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -73,6 +75,7 @@ pub struct LayoutPreferencesDto {
     pub view_mode: ViewMode,
     pub sort: SortDescriptorDto,
     pub favorite_roles: Vec<FavoriteRole>,
+    pub hidden_ssh_target_ids: Vec<String>,
 }
 
 impl Default for LayoutPreferencesDto {
@@ -82,6 +85,7 @@ impl Default for LayoutPreferencesDto {
             view_mode: ViewMode::default(),
             sort: SortDescriptorDto::default(),
             favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+            hidden_ssh_target_ids: Vec::new(),
         }
     }
 }
@@ -99,6 +103,7 @@ pub struct LayoutPreferencesPatchDto {
     pub view_mode: Option<ViewMode>,
     pub sort: Option<SortDescriptorDto>,
     pub favorite_roles: Option<Vec<FavoriteRole>>,
+    pub hidden_ssh_target_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -141,6 +146,22 @@ struct LayoutPreferencesV1 {
     sidebar_collapsed: bool,
     view_mode: ViewMode,
     sort: SortDescriptorDto,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPreferencesDocumentV2 {
+    version: u32,
+    layout: LayoutPreferencesV2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LayoutPreferencesV2 {
+    sidebar_collapsed: bool,
+    view_mode: ViewMode,
+    sort: SortDescriptorDto,
+    favorite_roles: Vec<FavoriteRole>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +224,10 @@ impl PreferencesStore {
         if let Some(favorite_roles) = patch.layout.favorite_roles {
             updated.layout.favorite_roles = canonical_favorite_roles(&favorite_roles);
         }
+        if let Some(hidden_ssh_target_ids) = patch.layout.hidden_ssh_target_ids {
+            updated.layout.hidden_ssh_target_ids =
+                canonical_hidden_ssh_target_ids(&hidden_ssh_target_ids)?;
+        }
 
         persist_preferences(&self.storage_path, &updated)?;
         state.preferences = updated.clone();
@@ -243,6 +268,24 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
                         view_mode: document.layout.view_mode,
                         sort: document.layout.sort,
                         favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+                        hidden_ssh_target_ids: Vec::new(),
+                    },
+                },
+                None,
+            ),
+            _ => malformed_recovery(),
+        },
+        2 => match serde_json::from_slice::<StoredPreferencesDocumentV2>(&bytes) {
+            Ok(document) if document.version == 2 => (
+                UserPreferencesDto {
+                    layout: LayoutPreferencesDto {
+                        sidebar_collapsed: document.layout.sidebar_collapsed,
+                        view_mode: document.layout.view_mode,
+                        sort: document.layout.sort,
+                        favorite_roles: canonical_favorite_roles(
+                            &document.layout.favorite_roles,
+                        ),
+                        hidden_ssh_target_ids: Vec::new(),
                     },
                 },
                 None,
@@ -251,17 +294,23 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
         },
         PREFERENCES_FILE_VERSION => {
             match serde_json::from_slice::<StoredPreferencesDocument>(&bytes) {
-                Ok(document) => (
-                    UserPreferencesDto {
-                        layout: LayoutPreferencesDto {
-                            favorite_roles: canonical_favorite_roles(
-                                &document.layout.favorite_roles,
-                            ),
-                            ..document.layout
+                Ok(document) => match canonical_hidden_ssh_target_ids(
+                    &document.layout.hidden_ssh_target_ids,
+                ) {
+                    Ok(hidden_ssh_target_ids) => (
+                        UserPreferencesDto {
+                            layout: LayoutPreferencesDto {
+                                favorite_roles: canonical_favorite_roles(
+                                    &document.layout.favorite_roles,
+                                ),
+                                hidden_ssh_target_ids,
+                                ..document.layout
+                            },
                         },
-                    },
-                    None,
-                ),
+                        None,
+                    ),
+                    Err(_) => malformed_recovery(),
+                },
                 Err(_) => malformed_recovery(),
             }
         }
@@ -284,6 +333,26 @@ fn canonical_favorite_roles(roles: &[FavoriteRole]) -> Vec<FavoriteRole> {
         .into_iter()
         .filter(|role| roles.contains(role))
         .collect()
+}
+
+fn canonical_hidden_ssh_target_ids(ids: &[String]) -> Result<Vec<String>, ExplorerError> {
+    if ids.len() > MAX_HIDDEN_SSH_TARGETS
+        || ids.iter().any(|id| {
+            id.is_empty()
+                || id.len() > MAX_SSH_TARGET_ID_LENGTH
+                || id.chars().any(char::is_control)
+                || !(id.starts_with("manual:") || id.starts_with("config:"))
+        })
+    {
+        return Err(ExplorerError::InvalidConfiguration(
+            "The hidden SSH target selection is invalid.".to_owned(),
+        ));
+    }
+
+    let mut canonical = ids.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
 }
 
 fn recovery(
@@ -351,6 +420,7 @@ mod tests {
                 view_mode,
                 sort,
                 favorite_roles: None,
+                hidden_ssh_target_ids: None,
             },
         }
     }
@@ -362,6 +432,24 @@ mod tests {
                 view_mode: None,
                 sort: None,
                 favorite_roles: Some(favorite_roles),
+                hidden_ssh_target_ids: None,
+            },
+        }
+    }
+
+    fn hidden_ssh_patch(hidden_ssh_target_ids: Vec<&str>) -> UserPreferencesPatchDto {
+        UserPreferencesPatchDto {
+            layout: LayoutPreferencesPatchDto {
+                sidebar_collapsed: None,
+                view_mode: None,
+                sort: None,
+                favorite_roles: None,
+                hidden_ssh_target_ids: Some(
+                    hidden_ssh_target_ids
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
             },
         }
     }
@@ -410,6 +498,7 @@ mod tests {
             reloaded.preferences.layout.favorite_roles,
             DEFAULT_FAVORITE_ROLES
         );
+        assert!(reloaded.preferences.layout.hidden_ssh_target_ids.is_empty());
     }
 
     #[test]
@@ -432,6 +521,28 @@ mod tests {
             snapshot.preferences.layout.favorite_roles,
             DEFAULT_FAVORITE_ROLES
         );
+        assert!(snapshot.preferences.layout.hidden_ssh_target_ids.is_empty());
+        assert_eq!(snapshot.warning, None);
+    }
+
+    #[test]
+    fn migrates_version_two_favorites_with_no_hidden_ssh_targets() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        fs::write(
+            &path,
+            br#"{"version":2,"layout":{"sidebarCollapsed":false,"viewMode":"list","sort":{"column":"name","direction":"ascending"},"favoriteRoles":["home","documents"]}}"#,
+        )
+        .expect("version two preferences");
+
+        let snapshot = PreferencesStore::new(path)
+            .snapshot()
+            .expect("migrated preferences");
+        assert_eq!(
+            snapshot.preferences.layout.favorite_roles,
+            vec![FavoriteRole::Home, FavoriteRole::Documents]
+        );
+        assert!(snapshot.preferences.layout.hidden_ssh_target_ids.is_empty());
         assert_eq!(snapshot.warning, None);
     }
 
@@ -456,6 +567,49 @@ mod tests {
             reloaded.preferences.layout.favorite_roles,
             vec![FavoriteRole::Home, FavoriteRole::Music]
         );
+    }
+
+    #[test]
+    fn hidden_ssh_targets_are_deduplicated_and_sorted() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        let store = PreferencesStore::new(path.clone());
+
+        store
+            .update(hidden_ssh_patch(vec![
+                "manual:target-b",
+                "config:staging",
+                "manual:target-b",
+            ]))
+            .expect("hidden SSH update");
+
+        let reloaded = PreferencesStore::new(path)
+            .snapshot()
+            .expect("reloaded hidden SSH targets");
+        assert_eq!(
+            reloaded.preferences.layout.hidden_ssh_target_ids,
+            vec!["config:staging", "manual:target-b"]
+        );
+    }
+
+    #[test]
+    fn hidden_ssh_targets_reject_untrusted_identifiers() {
+        let temp = TempDir::new().expect("temporary directory");
+        let store = PreferencesStore::new(temp.path().join("preferences.json"));
+
+        let result = store.update(hidden_ssh_patch(vec!["unknown:target"]));
+
+        assert!(matches!(
+            result,
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+        assert!(store
+            .snapshot()
+            .expect("unchanged preferences")
+            .preferences
+            .layout
+            .hidden_ssh_target_ids
+            .is_empty());
     }
 
     #[test]

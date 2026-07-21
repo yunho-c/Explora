@@ -24,6 +24,12 @@ const warningCodes = new Set<PreferencesWarningCode>([
   "malformed",
   "unsupportedVersion",
 ]);
+const validSshTargetId = (value: unknown): value is string =>
+  typeof value === "string" &&
+  value.length > 0 &&
+  value.length <= 512 &&
+  !/\p{Cc}/u.test(value) &&
+  (value.startsWith("manual:") || value.startsWith("config:"));
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -82,6 +88,16 @@ const parsePreferences = (value: unknown): UserPreferences => {
       "Invalid preference response: favorite roles are not canonical.",
     );
   }
+  if (
+    !Array.isArray(layout.hiddenSshTargetIds) ||
+    layout.hiddenSshTargetIds.length > 512 ||
+    layout.hiddenSshTargetIds.some((id) => !validSshTargetId(id)) ||
+    new Set(layout.hiddenSshTargetIds).size !== layout.hiddenSshTargetIds.length
+  ) {
+    throw new Error(
+      "Invalid preference response: hidden SSH target IDs are malformed.",
+    );
+  }
 
   return {
     layout: {
@@ -92,6 +108,7 @@ const parsePreferences = (value: unknown): UserPreferences => {
         direction: layout.sort.direction as SortDirection,
       },
       favoriteRoles: [...favoriteRoles],
+      hiddenSshTargetIds: [...layout.hiddenSshTargetIds] as string[],
     },
   };
 };

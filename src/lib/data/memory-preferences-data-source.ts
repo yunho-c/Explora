@@ -12,6 +12,7 @@ const clonePreferences = (preferences: UserPreferences): UserPreferences => ({
     viewMode: preferences.layout.viewMode,
     sort: { ...preferences.layout.sort },
     favoriteRoles: [...preferences.layout.favoriteRoles],
+    hiddenSshTargetIds: [...preferences.layout.hiddenSshTargetIds],
   },
 });
 
@@ -44,6 +45,9 @@ export class MemoryPreferencesDataSource implements PreferencesDataSource {
         favoriteRoles: patch.layout.favoriteRoles
           ? [...patch.layout.favoriteRoles]
           : [...this.#preferences.layout.favoriteRoles],
+        hiddenSshTargetIds: patch.layout.hiddenSshTargetIds
+          ? [...patch.layout.hiddenSshTargetIds]
+          : [...this.#preferences.layout.hiddenSshTargetIds],
       },
     };
     return clonePreferences(this.#preferences);

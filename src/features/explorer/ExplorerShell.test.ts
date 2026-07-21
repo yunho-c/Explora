@@ -52,6 +52,14 @@ describe("ExplorerShell", () => {
     expect(document.querySelector(".explora-sidebar-scroll")).toHaveClass(
       "overflow-y-auto",
     );
+    for (const header of ["Favorites", "SSH"]) {
+      expect(
+        screen.getByText(header, { exact: true }).parentElement,
+      ).toHaveClass("pl-2");
+      expect(
+        screen.getByText(header, { exact: true }).parentElement,
+      ).not.toHaveClass("pr-2");
+    }
 
     await fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
@@ -127,12 +135,83 @@ describe("ExplorerShell", () => {
       ).toBeInTheDocument(),
     );
     await fireEvent.keyDown(window, { key: "Escape" });
-    expect(
-      screen.getByRole("button", { name: "Configure favorites" }),
-    ).toHaveFocus();
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Configure favorites" }),
+      ).toHaveFocus(),
+    );
     expect(
       favorites.queryByRole("button", { name: "Remove Home from Favorites" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("configures visible SSH targets without deleting or disconnecting them", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+    renderShell(state);
+    const sshTargets = within(
+      screen.getByRole("navigation", { name: "SSH targets" }),
+    );
+    const configure = screen.getByRole("button", {
+      name: "Configure SSH targets",
+    });
+
+    expect(configure).toHaveClass("md:opacity-0");
+    await fireEvent.click(configure);
+    const finishEditing = screen.getByRole("button", {
+      name: "Finish editing SSH targets",
+    });
+    expect(finishEditing.querySelector(".lucide-check")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Add SSH target" }),
+    ).not.toBeInTheDocument();
+    await fireEvent.click(
+      sshTargets.getByRole("button", {
+        name: "Hide staging-box from SSH",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        sshTargets.queryByRole("button", {
+          name: "staging-box connected",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+    const ghostTarget = sshTargets.getByLabelText(
+      "staging-box, hidden from SSH",
+    );
+    expect(ghostTarget).toHaveClass("border-dashed");
+    expect(ghostTarget.querySelector("svg")).toHaveClass("size-4");
+    expect(
+      sshTargets.getByRole("button", { name: "Show staging-box in SSH" }),
+    ).toHaveClass("text-emerald-600");
+    await waitFor(async () =>
+      expect(
+        (await preferences.getPreferences()).preferences.layout
+          .hiddenSshTargetIds,
+      ).toEqual(["demo:staging-box"]),
+    );
+    expect(
+      state.sshTargets.find(({ id }) => id === "demo:staging-box")?.status,
+    ).toBe("connected");
+
+    await fireEvent.click(
+      sshTargets.getByRole("button", { name: "Show staging-box in SSH" }),
+    );
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Configure SSH targets" }),
+      ).toHaveFocus(),
+    );
+    expect(
+      screen.getByRole("button", { name: "Add SSH target" }),
+    ).toBeInTheDocument();
+    expect(
+      sshTargets.getByRole("button", { name: "Manage staging-box" }),
+    ).toBeInTheDocument();
   });
 
   it("opens Quick Preview with the Space key", async () => {

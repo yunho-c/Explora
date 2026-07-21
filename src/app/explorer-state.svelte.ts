@@ -82,7 +82,9 @@ export class ExplorerState {
   preview = $state<PreviewSummary | null>(null);
   sidebarCollapsed = $state(false);
   favoriteRoles = $state<FavoriteRole[]>([...DEFAULT_FAVORITE_ROLES]);
+  hiddenSshTargetIds = $state<string[]>([]);
   editingFavorites = $state(false);
+  editingSshTargets = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
   editingSshTargetId = $state<string | null>(null);
@@ -182,6 +184,12 @@ export class ExplorerState {
     );
   }
 
+  get visibleSshTargets(): SshTargetSummary[] {
+    return this.sshTargets.filter(
+      ({ id }) => !this.hiddenSshTargetIds.includes(id),
+    );
+  }
+
   async initialize(): Promise<void> {
     await this.initializePreferences();
     const controller = new AbortController();
@@ -238,6 +246,9 @@ export class ExplorerState {
       this.viewMode = snapshot.preferences.layout.viewMode;
       this.sort = { ...snapshot.preferences.layout.sort };
       this.favoriteRoles = [...snapshot.preferences.layout.favoriteRoles];
+      this.hiddenSshTargetIds = [
+        ...snapshot.preferences.layout.hiddenSshTargetIds,
+      ];
       this.preferencesWarningMessage = snapshot.warning?.message ?? null;
     } catch (error) {
       this.preferencesWarningMessage =
@@ -628,6 +639,16 @@ export class ExplorerState {
     );
     this.favoriteRoles = [...favoriteRoles];
     this.persistLayoutPreferences({ favoriteRoles: [...favoriteRoles] });
+  }
+
+  setSshTargetVisible(targetId: string, visible: boolean): void {
+    const hiddenSshTargetIds = visible
+      ? this.hiddenSshTargetIds.filter((id) => id !== targetId)
+      : this.hiddenSshTargetIds.includes(targetId)
+        ? [...this.hiddenSshTargetIds]
+        : [...this.hiddenSshTargetIds, targetId].sort();
+    this.hiddenSshTargetIds = hiddenSshTargetIds;
+    this.persistLayoutPreferences({ hiddenSshTargetIds });
   }
 
   selectEntry(entryId: string): void {

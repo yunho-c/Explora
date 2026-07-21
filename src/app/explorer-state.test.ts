@@ -60,6 +60,7 @@ class FailingPreferencesDataSource implements PreferencesDataSource {
             "music",
             "videos",
           ],
+          hiddenSshTargetIds: [],
         },
       },
       warning: null,
@@ -138,6 +139,7 @@ describe("ExplorerState", () => {
         viewMode: "grid",
         sort: { column: "size", direction: "descending" },
         favoriteRoles: ["home", "music"],
+        hiddenSshTargetIds: ["demo:render-node"],
       },
     });
     const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
@@ -150,6 +152,9 @@ describe("ExplorerState", () => {
     expect(state.visibleFavoriteLocations.map(({ role }) => role)).toEqual([
       "home",
       "music",
+    ]);
+    expect(state.visibleSshTargets.map(({ id }) => id)).toEqual([
+      "demo:staging-box",
     ]);
   });
 
@@ -169,6 +174,29 @@ describe("ExplorerState", () => {
     expect(
       state.visibleFavoriteLocations.map(({ role }) => role),
     ).not.toContain("home");
+  });
+
+  it("persists SSH target visibility without changing connection state", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+    const connectedTarget = state.sshTargets.find(
+      ({ id }) => id === "demo:staging-box",
+    );
+
+    state.setSshTargetVisible("demo:staging-box", false);
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout
+          .hiddenSshTargetIds,
+      ).toEqual(["demo:staging-box"]);
+    });
+
+    expect(state.visibleSshTargets.map(({ id }) => id)).not.toContain(
+      "demo:staging-box",
+    );
+    expect(connectedTarget?.status).toBe("connected");
+    expect(connectedTarget?.connectedLocationId).toBe("staging-box");
   });
 
   it("serializes rapid preference writes so the latest choice wins", async () => {
