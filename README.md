@@ -1,11 +1,13 @@
 # Explora
 
 Explora is a calm, modern desktop file explorer for local and SSH locations. The
-packaged Tauri application now provides read-only local filesystem navigation
-through a Rust-owned backend. It opens at Home, streams directory listings,
+packaged Tauri application provides read-only local and SSH/SFTP navigation
+through Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
-metadata-only Quick Preview. The browser-only Vite application retains a
-deterministic demo backend for UI development and tests.
+metadata-only Quick Preview. Saved SSH targets and concrete aliases from
+`~/.ssh/config` appear alongside local favorites. The browser-only Vite
+application retains deterministic local and remote demo assets for UI development
+and tests.
 
 ## Technology
 
@@ -30,19 +32,25 @@ src/
     ├── data/            replaceable data-source boundary and demo adapter
     └── hooks/           generated component hooks
 
-src-tauri/               Tauri configuration, typed IPC, and local filesystem backend
+src-tauri/               Tauri configuration, typed IPC, local filesystem, and SSH/SFTP
 tests/                   browser-level shell smoke tests
 docs/adr/                consequential architecture and security decisions
 ```
 
 Local paths remain in Rust and cross IPC as opaque, session-scoped references;
-display paths are never authoritative. See
+remote paths use the same opaque-reference rule, and display paths are never
+authoritative. See
 [`docs/adr/0001-opaque-local-path-references.md`](docs/adr/0001-opaque-local-path-references.md)
-for the authorization and security model.
+and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ssh-sftp-locations.md)
+for the authorization, trust, and credential-handling model.
 
-The current filesystem backend is deliberately read-only. File watching, mounted
-volume discovery, hidden-file controls, mutations, content previews, and SSH/SFTP
-remain later vertical slices.
+The current filesystem backends are deliberately read-only. SSH authentication
+supports agents, standard or configured identity files, encrypted-key
+passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
+`known_hosts` files, requires confirmation for unknown keys, and blocks changed
+keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
+silently executed. File watching, mounted-volume discovery, hidden-file controls,
+mutations, and content previews remain later vertical slices.
 
 ## Prerequisites
 

@@ -50,7 +50,27 @@ test("opens the responsive locations sheet", async ({ page }) => {
   );
   await page
     .getByRole("dialog")
-    .getByRole("button", { name: /staging-box/ })
+    .getByRole("button", { name: "staging-box connected" })
     .click();
   await expect(page.getByText("service.log")).toBeVisible();
+});
+
+test("adds an SSH target and connects a configured demo remote", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "Add SSH target" }).click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("textbox", { name: "Name", exact: true }).fill("Lab");
+  await dialog.getByRole("textbox", { name: "Host" }).fill("lab.example.com");
+  await dialog.getByRole("textbox", { name: "Username" }).fill("yunho");
+  await dialog.getByRole("button", { name: "Save target" }).click();
+  await expect(
+    page.getByRole("button", { name: "Lab disconnected" }),
+  ).toBeVisible();
+
+  await page.getByRole("button", { name: /render-node Config/ }).click();
+  await expect(page.getByRole("tab", { name: "render-node" })).toBeVisible();
+  await expect(page.getByText("This location is empty")).toBeVisible();
 });

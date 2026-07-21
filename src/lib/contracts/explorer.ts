@@ -10,6 +10,9 @@ export type LocationRole =
   | "volume"
   | "ssh";
 export type LocationStatus = "available" | "connected" | "offline";
+export type SshTargetSource = "manual" | "openSshConfig";
+export type SshTargetStatus =
+  "disconnected" | "connecting" | "connected" | "error";
 export type EntryKind = "directory" | "file" | "symlink" | "other";
 export type ContentKind =
   | "folder"
@@ -49,6 +52,59 @@ export interface LocationSummary {
   detail: string;
   root: DirectoryRef;
 }
+
+export interface SshTargetSummary {
+  id: string;
+  name: string;
+  source: SshTargetSource;
+  endpoint: string;
+  status: SshTargetStatus;
+  editable: boolean;
+  connectedLocationId: string | null;
+  configuration: ManualSshTargetInput | null;
+}
+
+export interface ManualSshTargetInput {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  initialPath: string | null;
+  identityFile: string | null;
+  identitiesOnly: boolean;
+}
+
+export interface SshPromptField {
+  label: string;
+  secret: boolean;
+}
+
+export type SshConnectionEvent =
+  | {
+      event: "state";
+      state: "connecting" | "authenticating" | "openingSftp" | "connected";
+    }
+  | {
+      event: "hostKeyPrompt";
+      promptId: string;
+      host: string;
+      port: number;
+      algorithm: string;
+      fingerprint: string;
+    }
+  | {
+      event: "authenticationPrompt";
+      promptId: string;
+      kind: "passphrase" | "password" | "keyboardInteractive";
+      title: string;
+      instructions: string;
+      fields: SshPromptField[];
+    };
+
+export type SshPromptResponse =
+  | { response: "accept" }
+  | { response: "reject" }
+  | { response: "answers"; answers: string[] };
 
 export interface FileEntrySummary {
   reference: EntryRef;

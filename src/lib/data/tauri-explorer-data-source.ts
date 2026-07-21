@@ -10,9 +10,16 @@ import type {
   LocationRole,
   LocationStatus,
   LocationSummary,
+  ManualSshTargetInput,
   PreviewSummary,
+  SshConnectionEvent,
+  SshPromptResponse,
+  SshTargetSource,
+  SshTargetStatus,
+  SshTargetSummary,
 } from "$lib/contracts/explorer";
 import type {
+  ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
 } from "$lib/data/explorer-data-source";
@@ -51,6 +58,24 @@ const locationStatuses = new Set<LocationStatus>([
   "connected",
   "offline",
 ]);
+const sshTargetSources = new Set<SshTargetSource>(["manual", "openSshConfig"]);
+const sshTargetStatuses = new Set<SshTargetStatus>([
+  "disconnected",
+  "connecting",
+  "connected",
+  "error",
+]);
+const sshConnectionStates = new Set([
+  "connecting",
+  "authenticating",
+  "openingSftp",
+  "connected",
+] as const);
+const sshPromptKinds = new Set([
+  "passphrase",
+  "password",
+  "keyboardInteractive",
+] as const);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -115,6 +140,128 @@ const parseLocation = (value: unknown): LocationSummary => {
     detail: requireString(value, "detail"),
     root: parseDirectoryRef(value.root),
   };
+};
+
+const parseSshTarget = (value: unknown): SshTargetSummary => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid SSH response: target must be an object.");
+  }
+  const source = requireString(value, "source");
+  const status = requireString(value, "status");
+  if (!sshTargetSources.has(source as SshTargetSource)) {
+    throw new Error(`Invalid SSH response: unknown target source ${source}.`);
+  }
+  if (!sshTargetStatuses.has(status as SshTargetStatus)) {
+    throw new Error(`Invalid SSH response: unknown target status ${status}.`);
+  }
+  if (typeof value.editable !== "boolean") {
+    throw new Error("Invalid SSH response: editable must be a boolean.");
+  }
+  if (
+    value.connectedLocationId !== null &&
+    typeof value.connectedLocationId !== "string"
+  ) {
+    throw new Error("Invalid SSH response: connected location is malformed.");
+  }
+  const configuration = value.configuration;
+  if (configuration !== null && !isRecord(configuration)) {
+    throw new Error("Invalid SSH response: target configuration is malformed.");
+  }
+  const parsedConfiguration = configuration
+    ? {
+        name: requireString(configuration, "name"),
+        host: requireString(configuration, "host"),
+        port: configuration.port,
+        username: requireString(configuration, "username"),
+        initialPath:
+          configuration.initialPath === null
+            ? null
+            : requireString(configuration, "initialPath"),
+        identityFile:
+          configuration.identityFile === null
+            ? null
+            : requireString(configuration, "identityFile"),
+        identitiesOnly: configuration.identitiesOnly,
+      }
+    : null;
+  if (
+    parsedConfiguration &&
+    (typeof parsedConfiguration.port !== "number" ||
+      !Number.isInteger(parsedConfiguration.port) ||
+      parsedConfiguration.port < 1 ||
+      parsedConfiguration.port > 65_535 ||
+      typeof parsedConfiguration.identitiesOnly !== "boolean")
+  ) {
+    throw new Error("Invalid SSH response: target configuration is malformed.");
+  }
+  return {
+    id: requireString(value, "id"),
+    name: requireString(value, "name"),
+    source: source as SshTargetSource,
+    endpoint: requireString(value, "endpoint"),
+    status: status as SshTargetStatus,
+    editable: value.editable,
+    connectedLocationId: value.connectedLocationId,
+    configuration: parsedConfiguration as ManualSshTargetInput | null,
+  };
+};
+
+const parseSshConnectionEvent = (value: unknown): SshConnectionEvent => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid SSH response: connection event is malformed.");
+  }
+  if (value.event === "state") {
+    const state = requireString(value, "state");
+    if (!sshConnectionStates.has(state as never)) {
+      throw new Error(
+        `Invalid SSH response: unknown connection state ${state}.`,
+      );
+    }
+    return {
+      event: "state",
+      state: state as Extract<SshConnectionEvent, { event: "state" }>["state"],
+    };
+  }
+  if (value.event === "hostKeyPrompt") {
+    if (
+      typeof value.port !== "number" ||
+      !Number.isInteger(value.port) ||
+      value.port < 1 ||
+      value.port > 65_535
+    ) {
+      throw new Error("Invalid SSH response: host-key port is malformed.");
+    }
+    return {
+      event: "hostKeyPrompt",
+      promptId: requireString(value, "promptId"),
+      host: requireString(value, "host"),
+      port: value.port,
+      algorithm: requireString(value, "algorithm"),
+      fingerprint: requireString(value, "fingerprint"),
+    };
+  }
+  if (value.event === "authenticationPrompt") {
+    const kind = requireString(value, "kind");
+    if (!sshPromptKinds.has(kind as never) || !Array.isArray(value.fields)) {
+      throw new Error(
+        "Invalid SSH response: authentication prompt is malformed.",
+      );
+    }
+    return {
+      event: "authenticationPrompt",
+      promptId: requireString(value, "promptId"),
+      kind: kind as "passphrase" | "password" | "keyboardInteractive",
+      title: requireString(value, "title"),
+      instructions: requireString(value, "instructions"),
+      fields: value.fields.map((field) => {
+        if (!isRecord(field) || typeof field.secret !== "boolean") {
+          throw new Error("Invalid SSH response: prompt field is malformed.");
+        }
+        return { label: requireString(field, "label"), secret: field.secret };
+      }),
+    };
+  }
+  throw new Error("Invalid SSH response: unknown connection event.");
 };
 
 const parseEntry = (value: unknown): FileEntrySummary => {
@@ -215,12 +362,145 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     signal: AbortSignal,
   ): Promise<readonly LocationSummary[]> {
     if (signal.aborted) throw abortError();
-    const payload = await invoke<unknown>("list_local_locations");
+    const payload = await invoke<unknown>("list_locations");
     if (signal.aborted) throw abortError();
     if (!Array.isArray(payload)) {
       throw new Error("Invalid filesystem response: locations must be a list.");
     }
     return payload.map(parseLocation);
+  }
+
+  async listSshTargets(
+    signal: AbortSignal,
+  ): Promise<readonly SshTargetSummary[]> {
+    if (signal.aborted) throw abortError();
+    try {
+      const payload = await invoke<unknown>("list_ssh_targets");
+      if (signal.aborted) throw abortError();
+      if (!Array.isArray(payload)) {
+        throw new Error("Invalid SSH response: targets must be a list.");
+      }
+      return payload.map(parseSshTarget);
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      throw commandError(error);
+    }
+  }
+
+  async createSshTarget(
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary> {
+    return this.saveSshTarget("create_ssh_target", null, input, signal);
+  }
+
+  async updateSshTarget(
+    targetId: string,
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary> {
+    return this.saveSshTarget("update_ssh_target", targetId, input, signal);
+  }
+
+  private async saveSshTarget(
+    command: "create_ssh_target" | "update_ssh_target",
+    targetId: string | null,
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary> {
+    if (signal.aborted) throw abortError();
+    try {
+      const payload = await invoke<unknown>(command, {
+        ...(targetId ? { targetId } : {}),
+        input,
+      });
+      if (signal.aborted) throw abortError();
+      return parseSshTarget(payload);
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      throw commandError(error);
+    }
+  }
+
+  async deleteSshTarget(targetId: string, signal: AbortSignal): Promise<void> {
+    await this.simpleSshCommand("delete_ssh_target", targetId, signal);
+  }
+
+  async disconnectSshTarget(
+    targetId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.simpleSshCommand("disconnect_ssh_target", targetId, signal);
+  }
+
+  private async simpleSshCommand(
+    command: "delete_ssh_target" | "disconnect_ssh_target",
+    targetId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) throw abortError();
+    try {
+      await invoke(command, { targetId });
+      if (signal.aborted) throw abortError();
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      throw commandError(error);
+    }
+  }
+
+  async connectSshTarget(
+    targetId: string,
+    { signal, onEvent }: ConnectSshOptions,
+  ): Promise<LocationSummary> {
+    if (signal.aborted) throw abortError();
+    const id = requestId();
+    let payloadError: Error | null = null;
+    const channel = new Channel<unknown>();
+    const cancel = () => {
+      void invoke("cancel_ssh_connection", { requestId: id }).catch(() => {
+        // Connection cancellation is best-effort; stale state is still ignored.
+      });
+    };
+    channel.onmessage = (payload) => {
+      if (signal.aborted || payloadError) return;
+      try {
+        const event = parseSshConnectionEvent(payload);
+        onEvent(event, async (response: SshPromptResponse) => {
+          if (signal.aborted) throw abortError();
+          try {
+            await invoke("respond_ssh_prompt", {
+              requestId: id,
+              promptId: event.event === "state" ? "" : event.promptId,
+              response,
+            });
+          } catch (error) {
+            throw commandError(error);
+          }
+        });
+      } catch (error) {
+        payloadError =
+          error instanceof Error ? error : new Error("Invalid SSH response.");
+        cancel();
+      }
+    };
+
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const payload = await invoke<unknown>("connect_ssh_target", {
+        requestId: id,
+        targetId,
+        onEvent: channel,
+      });
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
+      return parseLocation(payload);
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
   }
 
   async listDirectory(
@@ -233,7 +513,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     let payloadError: Error | null = null;
     const channel = new Channel<unknown>();
     const cancel = () => {
-      void invoke("cancel_local_listing", { requestId: id }).catch(() => {
+      void invoke("cancel_listing", { requestId: id }).catch(() => {
         // Cancellation is best-effort; the stale-result guard remains authoritative.
       });
     };
@@ -304,7 +584,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
 
     signal.addEventListener("abort", cancel, { once: true });
     try {
-      await invoke("list_local_directory", {
+      await invoke("list_directory", {
         requestId: id,
         directoryId: directory.id,
         locationId: directory.locationId,

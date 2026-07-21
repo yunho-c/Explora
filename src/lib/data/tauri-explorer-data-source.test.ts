@@ -35,6 +35,25 @@ const entryPayload = {
   detail: null,
 };
 
+const sshTargetPayload = {
+  id: "manual:target-1",
+  name: "Staging",
+  source: "manual",
+  endpoint: "deploy@staging.example.com",
+  status: "disconnected",
+  editable: true,
+  connectedLocationId: null,
+  configuration: {
+    name: "Staging",
+    host: "staging.example.com",
+    port: 22,
+    username: "deploy",
+    initialPath: "/srv/app",
+    identityFile: null,
+    identitiesOnly: false,
+  },
+};
+
 const sendChannelMessages = (
   channel: unknown,
   messages: readonly unknown[],
@@ -69,8 +88,8 @@ afterEach(() => clearMocks());
 describe("TauriExplorerDataSource", () => {
   it("validates locations and streams typed directory events", async () => {
     mockIPC((command, payload) => {
-      if (command === "list_local_locations") return [locationPayload];
-      if (command === "list_local_directory") {
+      if (command === "list_locations") return [locationPayload];
+      if (command === "list_directory") {
         if (
           !payload ||
           Array.isArray(payload) ||
@@ -123,7 +142,7 @@ describe("TauriExplorerDataSource", () => {
 
   it("rejects malformed IPC data before it reaches explorer state", async () => {
     mockIPC((command) => {
-      if (command === "list_local_locations") {
+      if (command === "list_locations") {
         return [{ ...locationPayload, kind: "untrusted" }];
       }
       return null;
@@ -137,7 +156,7 @@ describe("TauriExplorerDataSource", () => {
 
   it("rejects unknown semantic location roles", async () => {
     mockIPC((command) => {
-      if (command === "list_local_locations") {
+      if (command === "list_locations") {
         return [{ ...locationPayload, role: "untrusted" }];
       }
       return null;
@@ -154,12 +173,12 @@ describe("TauriExplorerDataSource", () => {
     const commands: string[] = [];
     mockIPC((command) => {
       commands.push(command);
-      if (command === "list_local_directory") {
+      if (command === "list_directory") {
         return new Promise<void>((resolve) => {
           finishListing = resolve;
         });
       }
-      if (command === "cancel_local_listing") finishListing();
+      if (command === "cancel_listing") finishListing();
       return null;
     });
 
@@ -175,6 +194,68 @@ describe("TauriExplorerDataSource", () => {
     controller.abort();
 
     await expect(listing).rejects.toMatchObject({ name: "AbortError" });
-    expect(commands).toContain("cancel_local_listing");
+    expect(commands).toContain("cancel_listing");
+  });
+
+  it("validates saved SSH targets and their editable metadata", async () => {
+    mockIPC((command) =>
+      command === "list_ssh_targets" ? [sshTargetPayload] : null,
+    );
+
+    const source = new TauriExplorerDataSource();
+    await expect(
+      source.listSshTargets(new AbortController().signal),
+    ).resolves.toEqual([sshTargetPayload]);
+  });
+
+  it("forwards host trust through a single-use SSH prompt response", async () => {
+    const commands: string[] = [];
+    let promptResponse: unknown;
+    mockIPC((command, payload) => {
+      commands.push(command);
+      if (command === "connect_ssh_target") {
+        if (
+          !payload ||
+          Array.isArray(payload) ||
+          payload instanceof ArrayBuffer ||
+          payload instanceof Uint8Array
+        ) {
+          throw new Error("Expected SSH command arguments.");
+        }
+        sendChannelMessages(payload.onEvent, [
+          {
+            event: "hostKeyPrompt",
+            promptId: "prompt-1",
+            host: "staging.example.com",
+            port: 22,
+            algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:test",
+          },
+        ]);
+        return { ...locationPayload, kind: "ssh", role: "ssh" };
+      }
+      if (command === "respond_ssh_prompt") {
+        promptResponse = payload;
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const location = await source.connectSshTarget("manual:target-1", {
+      signal: new AbortController().signal,
+      onEvent: (event, respond) => {
+        if (event.event === "hostKeyPrompt") {
+          void respond({ response: "accept" });
+        }
+      },
+    });
+    await Promise.resolve();
+
+    expect(location.kind).toBe("ssh");
+    expect(commands).toContain("respond_ssh_prompt");
+    expect(promptResponse).toMatchObject({
+      promptId: "prompt-1",
+      response: { response: "accept" },
+    });
   });
 });

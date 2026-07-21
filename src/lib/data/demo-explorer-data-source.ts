@@ -3,9 +3,12 @@ import type {
   DirectoryRef,
   FileEntrySummary,
   LocationSummary,
+  ManualSshTargetInput,
   PreviewSummary,
+  SshTargetSummary,
 } from "$lib/contracts/explorer";
 import type {
+  ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
 } from "$lib/data/explorer-data-source";
@@ -483,6 +486,39 @@ const wait = (duration: number, signal: AbortSignal) =>
   });
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
+  private sshTargets: SshTargetSummary[] = [
+    {
+      id: "demo:staging-box",
+      name: "staging-box",
+      source: "manual",
+      endpoint: "deploy@staging.example.com",
+      status: "connected",
+      editable: true,
+      connectedLocationId: "staging-box",
+      configuration: {
+        name: "staging-box",
+        host: "staging.example.com",
+        port: 22,
+        username: "deploy",
+        initialPath: "~/projects",
+        identityFile: null,
+        identitiesOnly: false,
+      },
+    },
+    {
+      id: "demo:render-node",
+      name: "render-node",
+      source: "openSshConfig",
+      endpoint: "yunho@render.example.com",
+      status: "disconnected",
+      editable: false,
+      connectedLocationId: null,
+      configuration: null,
+    },
+  ];
+  private dynamicLocations = new Map<string, LocationSummary>();
+  private dynamicRoots = new Map<string, DirectoryRef>();
+
   async listLocations(
     signal: AbortSignal,
   ): Promise<readonly LocationSummary[]> {
@@ -490,16 +526,136 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     return locations;
   }
 
+  async listSshTargets(
+    signal: AbortSignal,
+  ): Promise<readonly SshTargetSummary[]> {
+    await wait(30, signal);
+    return this.sshTargets.map((target) => ({ ...target }));
+  }
+
+  async createSshTarget(
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary> {
+    await wait(40, signal);
+    const target: SshTargetSummary = {
+      id: `demo:manual:${Date.now()}`,
+      name: input.name,
+      source: "manual",
+      endpoint: `${input.username}@${input.host}${input.port === 22 ? "" : `:${input.port}`}`,
+      status: "disconnected",
+      editable: true,
+      connectedLocationId: null,
+      configuration: { ...input },
+    };
+    this.sshTargets = [...this.sshTargets, target];
+    return { ...target };
+  }
+
+  async updateSshTarget(
+    targetId: string,
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary> {
+    await wait(40, signal);
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target || !target.editable)
+      throw new Error("Unknown demo SSH target.");
+    const updated: SshTargetSummary = {
+      ...target,
+      name: input.name,
+      endpoint: `${input.username}@${input.host}${input.port === 22 ? "" : `:${input.port}`}`,
+      status: "disconnected",
+      connectedLocationId: null,
+      configuration: { ...input },
+    };
+    this.sshTargets = this.sshTargets.map((candidate) =>
+      candidate.id === targetId ? updated : candidate,
+    );
+    return { ...updated };
+  }
+
+  async deleteSshTarget(targetId: string, signal: AbortSignal): Promise<void> {
+    await wait(30, signal);
+    this.sshTargets = this.sshTargets.filter(({ id }) => id !== targetId);
+  }
+
+  async connectSshTarget(
+    targetId: string,
+    { signal, onEvent }: ConnectSshOptions,
+  ): Promise<LocationSummary> {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target) throw new Error("Unknown demo SSH target.");
+    onEvent({ event: "state", state: "connecting" }, async () => {});
+    await wait(120, signal);
+    onEvent({ event: "state", state: "authenticating" }, async () => {});
+    await wait(100, signal);
+
+    let location = locations.find(({ name }) => name === target.name);
+    if (!location) {
+      const locationId = `ssh:${target.id}`;
+      const root: DirectoryRef = {
+        id: locationId,
+        locationId,
+        name: target.name,
+        displayPath: `${target.name}:~`,
+      };
+      location = {
+        id: locationId,
+        name: target.name,
+        kind: "ssh",
+        role: "ssh",
+        status: "connected",
+        displayPath: root.displayPath,
+        detail: target.endpoint,
+        root,
+      };
+      this.dynamicRoots.set(locationId, root);
+      this.dynamicLocations.set(locationId, location);
+    } else {
+      location = { ...location, status: "connected", detail: target.endpoint };
+    }
+    this.sshTargets = this.sshTargets.map((candidate) =>
+      candidate.id === targetId
+        ? {
+            ...candidate,
+            status: "connected",
+            connectedLocationId: location!.id,
+          }
+        : candidate,
+    );
+    onEvent({ event: "state", state: "connected" }, async () => {});
+    return location;
+  }
+
+  async disconnectSshTarget(
+    targetId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await wait(30, signal);
+    this.sshTargets = this.sshTargets.map((target) =>
+      target.id === targetId
+        ? { ...target, status: "disconnected", connectedLocationId: null }
+        : target,
+    );
+  }
+
   async listDirectory(
     directory: DirectoryRef,
     { signal, onStart, onBatch, onComplete }: ListDirectoryOptions,
   ): Promise<void> {
-    const root = roots[directory.locationId];
+    const root =
+      roots[directory.locationId] ??
+      this.dynamicRoots.get(directory.locationId);
     const rootEntries = entriesByLocation[directory.id];
     const isKnownChild = Object.values(entriesByLocation)
       .flat()
       .some((entry) => entry.directory?.id === directory.id);
-    const entries = rootEntries ?? (isKnownChild ? [] : undefined);
+    const entries =
+      rootEntries ??
+      (this.dynamicRoots.has(directory.locationId) || isKnownChild
+        ? []
+        : undefined);
 
     if (!entries || !root) {
       throw new Error(`Unknown demo directory: ${directory.id}`);

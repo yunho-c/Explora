@@ -162,4 +162,26 @@ describe("ExplorerState", () => {
     state.closePreview();
     expect(state.previewOpen).toBe(false);
   });
+
+  it("connects SSH targets as locations and preserves their tab when disconnected", async () => {
+    const state = await initializedState();
+
+    expect(state.sshTargets.map(({ name }) => name)).toEqual([
+      "staging-box",
+      "render-node",
+    ]);
+    await state.selectSshTarget("demo:render-node");
+
+    expect(state.activeLocation?.name).toBe("render-node");
+    expect(
+      state.sshTargets.find(({ id }) => id === "demo:render-node")?.status,
+    ).toBe("connected");
+    const remoteTabId = state.activeTabId;
+
+    await state.disconnectSshTarget("demo:render-node");
+
+    expect(state.activeTabId).toBe(remoteTabId);
+    expect(state.activeLocation?.status).toBe("offline");
+    expect(state.activeDirectory?.name).toBe("render-node");
+  });
 });

@@ -3,7 +3,11 @@ import type {
   DirectoryRef,
   FileEntrySummary,
   LocationSummary,
+  ManualSshTargetInput,
   PreviewSummary,
+  SshConnectionEvent,
+  SshPromptResponse,
+  SshTargetSummary,
 } from "$lib/contracts/explorer";
 
 export interface DirectoryStart {
@@ -28,8 +32,32 @@ export interface ListDirectoryOptions {
   onComplete: (complete: DirectoryComplete) => void;
 }
 
+export interface ConnectSshOptions {
+  signal: AbortSignal;
+  onEvent: (
+    event: SshConnectionEvent,
+    respond: (response: SshPromptResponse) => Promise<void>,
+  ) => void;
+}
+
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
+  listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
+  createSshTarget(
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary>;
+  updateSshTarget(
+    targetId: string,
+    input: ManualSshTargetInput,
+    signal: AbortSignal,
+  ): Promise<SshTargetSummary>;
+  deleteSshTarget(targetId: string, signal: AbortSignal): Promise<void>;
+  connectSshTarget(
+    targetId: string,
+    options: ConnectSshOptions,
+  ): Promise<LocationSummary>;
+  disconnectSshTarget(targetId: string, signal: AbortSignal): Promise<void>;
   listDirectory(
     directory: DirectoryRef,
     options: ListDirectoryOptions,

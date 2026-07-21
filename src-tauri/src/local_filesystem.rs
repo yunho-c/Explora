@@ -10,11 +10,12 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use serde::Serialize;
-use thiserror::Error;
 use uuid::Uuid;
 
-const LISTING_BATCH_SIZE: usize = 256;
+use crate::filesystem::{
+    BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
+    FileEntrySummaryDto, LocationRole, LocationSummaryDto, LISTING_BATCH_SIZE,
+};
 
 #[derive(Debug, Clone)]
 pub struct LocalRoot {
@@ -22,156 +23,6 @@ pub struct LocalRoot {
     pub name: &'static str,
     pub role: LocationRole,
     pub path: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum LocationRole {
-    Home,
-    Desktop,
-    Documents,
-    Downloads,
-    Pictures,
-    Music,
-    Videos,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct EntryRefDto {
-    pub id: String,
-    pub location_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectoryRefDto {
-    pub id: String,
-    pub location_id: String,
-    pub name: String,
-    pub display_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct BreadcrumbSegmentDto {
-    pub label: String,
-    pub directory: DirectoryRefDto,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct LocationSummaryDto {
-    pub id: String,
-    pub name: String,
-    pub kind: &'static str,
-    pub role: LocationRole,
-    pub status: &'static str,
-    pub display_path: String,
-    pub detail: &'static str,
-    pub root: DirectoryRefDto,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileEntrySummaryDto {
-    pub reference: EntryRefDto,
-    pub name: String,
-    pub kind: &'static str,
-    pub content_kind: &'static str,
-    pub size: Option<String>,
-    pub modified_at: Option<u64>,
-    pub display_path: String,
-    pub directory: Option<DirectoryRefDto>,
-    pub detail: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(
-    tag = "event",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum DirectoryListingEvent {
-    Started {
-        directory: DirectoryRefDto,
-        parent: Option<DirectoryRefDto>,
-        breadcrumbs: Vec<BreadcrumbSegmentDto>,
-    },
-    Entries {
-        entries: Vec<FileEntrySummaryDto>,
-        replace: bool,
-    },
-    Complete {
-        skipped_entries: usize,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum ExplorerErrorCode {
-    InvalidReference,
-    NotFound,
-    PermissionDenied,
-    NotDirectory,
-    Cancelled,
-    Unexpected,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ExplorerErrorDto {
-    pub code: ExplorerErrorCode,
-    pub message: String,
-}
-
-#[derive(Debug, Error)]
-pub enum ExplorerError {
-    #[error("This filesystem reference is no longer valid.")]
-    InvalidReference,
-    #[error("The directory listing was cancelled.")]
-    Cancelled,
-    #[error("Explora's filesystem state is unavailable.")]
-    StateUnavailable,
-    #[error("{message}")]
-    Io {
-        message: String,
-        kind: std::io::ErrorKind,
-    },
-    #[error("The directory listing channel closed unexpectedly.")]
-    ChannelClosed,
-}
-
-impl ExplorerError {
-    fn io(action: &str, path: &Path, error: std::io::Error) -> Self {
-        Self::Io {
-            message: format!("Explora could not {action} {}: {error}", path.display()),
-            kind: error.kind(),
-        }
-    }
-}
-
-impl From<ExplorerError> for ExplorerErrorDto {
-    fn from(error: ExplorerError) -> Self {
-        let code = match &error {
-            ExplorerError::InvalidReference => ExplorerErrorCode::InvalidReference,
-            ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
-            ExplorerError::Io { kind, .. } => match kind {
-                std::io::ErrorKind::NotFound => ExplorerErrorCode::NotFound,
-                std::io::ErrorKind::PermissionDenied => ExplorerErrorCode::PermissionDenied,
-                std::io::ErrorKind::NotADirectory => ExplorerErrorCode::NotDirectory,
-                _ => ExplorerErrorCode::Unexpected,
-            },
-            ExplorerError::StateUnavailable | ExplorerError::ChannelClosed => {
-                ExplorerErrorCode::Unexpected
-            }
-        };
-
-        Self {
-            code,
-            message: error.to_string(),
-        }
-    }
 }
 
 #[derive(Default)]
@@ -238,7 +89,7 @@ impl LocalFilesystem {
                 role: root.role,
                 status: "available",
                 display_path: directory.display_path.clone(),
-                detail: "Local",
+                detail: "Local".to_owned(),
                 root: directory,
             });
         }
@@ -483,6 +334,8 @@ mod tests {
     use std::{fs::File, io::Write};
 
     use tempfile::TempDir;
+
+    use crate::filesystem::{ExplorerErrorCode, ExplorerErrorDto};
 
     use super::*;
 

@@ -4,7 +4,11 @@ import type {
   ExplorerTab,
   FileEntrySummary,
   LocationSummary,
+  ManualSshTargetInput,
   PreviewSummary,
+  SshConnectionEvent,
+  SshPromptResponse,
+  SshTargetSummary,
   SortColumn,
   SortDescriptor,
   ViewMode,
@@ -20,8 +24,17 @@ const nameCollator = new Intl.Collator(undefined, {
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
 
+type SshPromptEvent = Exclude<SshConnectionEvent, { event: "state" }>;
+
+export interface PendingSshPrompt {
+  targetId: string;
+  event: SshPromptEvent;
+  respond: (response: SshPromptResponse) => Promise<void>;
+}
+
 export class ExplorerState {
   locations = $state<LocationSummary[]>([]);
+  sshTargets = $state<SshTargetSummary[]>([]);
   tabs = $state<ExplorerTab[]>([]);
   activeTabId = $state("");
   entries = $state<FileEntrySummary[]>([]);
@@ -39,9 +52,17 @@ export class ExplorerState {
   preview = $state<PreviewSummary | null>(null);
   sidebarCollapsed = $state(false);
   mobileSidebarOpen = $state(false);
+  sshTargetDialogOpen = $state(false);
+  editingSshTargetId = $state<string | null>(null);
+  sshTargetSaving = $state(false);
+  sshErrorMessage = $state<string | null>(null);
+  pendingSshPrompt = $state<PendingSshPrompt | null>(null);
+  connectingTargetId = $state<string | null>(null);
+  sshConnectionMessage = $state<string | null>(null);
 
   private directoryController: AbortController | null = null;
   private previewController: AbortController | null = null;
+  private sshConnectionController: AbortController | null = null;
   private tabSequence = 0;
 
   constructor(private readonly dataSource: ExplorerDataSource) {}
@@ -63,6 +84,11 @@ export class ExplorerState {
     return this.entries.find(
       ({ reference }) => reference.id === this.selectedEntryId,
     );
+  }
+
+  get editingSshTarget(): SshTargetSummary | undefined {
+    const id = this.editingSshTargetId;
+    return this.sshTargets.find((target) => target.id === id);
   }
 
   get canGoBack(): boolean {
@@ -111,9 +137,18 @@ export class ExplorerState {
     const controller = new AbortController();
 
     try {
-      this.locations = [
-        ...(await this.dataSource.listLocations(controller.signal)),
-      ];
+      const [locations, sshTargets] = await Promise.all([
+        this.dataSource.listLocations(controller.signal),
+        this.dataSource.listSshTargets(controller.signal).catch((error) => {
+          this.sshErrorMessage =
+            error instanceof Error
+              ? error.message
+              : "Explora could not load SSH targets.";
+          return [];
+        }),
+      ]);
+      this.locations = [...locations];
+      this.sshTargets = [...sshTargets];
       const initialLocation = this.locations[0];
 
       if (!initialLocation) {
@@ -136,6 +171,221 @@ export class ExplorerState {
             : "Explora could not load its locations.";
       }
     }
+  }
+
+  openNewSshTarget(): void {
+    this.editingSshTargetId = null;
+    this.sshTargetDialogOpen = true;
+  }
+
+  openEditSshTarget(targetId: string): void {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target?.editable || !target.configuration) return;
+    this.editingSshTargetId = targetId;
+    this.sshTargetDialogOpen = true;
+  }
+
+  closeSshTargetDialog(): void {
+    if (this.sshTargetSaving) return;
+    this.sshTargetDialogOpen = false;
+    this.editingSshTargetId = null;
+  }
+
+  async saveSshTarget(input: ManualSshTargetInput): Promise<boolean> {
+    const controller = new AbortController();
+    this.sshTargetSaving = true;
+    this.sshErrorMessage = null;
+    try {
+      const saved = this.editingSshTargetId
+        ? await this.dataSource.updateSshTarget(
+            this.editingSshTargetId,
+            input,
+            controller.signal,
+          )
+        : await this.dataSource.createSshTarget(input, controller.signal);
+      if (this.editingSshTargetId) {
+        const previous = this.sshTargets.find(
+          ({ id }) => id === this.editingSshTargetId,
+        );
+        await this.removeConnectedLocation(previous?.connectedLocationId);
+        this.sshTargets = this.sshTargets.map((target) =>
+          target.id === saved.id ? saved : target,
+        );
+      } else {
+        this.sshTargets = [...this.sshTargets, saved];
+      }
+      this.sshTargetDialogOpen = false;
+      this.editingSshTargetId = null;
+      return true;
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.sshErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "The SSH target was not saved.";
+      }
+      return false;
+    } finally {
+      this.sshTargetSaving = false;
+    }
+  }
+
+  async selectSshTarget(targetId: string): Promise<void> {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target) return;
+    const location = target.connectedLocationId
+      ? this.locations.find(({ id }) => id === target.connectedLocationId)
+      : undefined;
+    if (location) {
+      await this.selectLocation(location.id);
+      return;
+    }
+    await this.connectSshTarget(targetId);
+  }
+
+  async connectSshTarget(targetId: string): Promise<void> {
+    if (this.connectingTargetId) return;
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target) return;
+
+    const controller = new AbortController();
+    this.sshConnectionController = controller;
+    this.connectingTargetId = targetId;
+    this.sshConnectionMessage = `Connecting to ${target.name}…`;
+    this.sshErrorMessage = null;
+    this.setSshTargetStatus(targetId, "connecting", null);
+    try {
+      const location = await this.dataSource.connectSshTarget(targetId, {
+        signal: controller.signal,
+        onEvent: (event, respond) => {
+          if (this.sshConnectionController !== controller) return;
+          if (event.event === "state") {
+            this.sshConnectionMessage =
+              event.state === "authenticating"
+                ? `Authenticating with ${target.name}…`
+                : event.state === "openingSftp"
+                  ? `Opening ${target.name} in Explora…`
+                  : event.state === "connected"
+                    ? `Connected to ${target.name}.`
+                    : `Connecting to ${target.name}…`;
+          } else {
+            this.pendingSshPrompt = { targetId, event, respond };
+          }
+        },
+      });
+      if (this.sshConnectionController !== controller) return;
+      this.locations = [
+        ...this.locations.filter(({ id }) => id !== location.id),
+        location,
+      ];
+      this.setSshTargetStatus(targetId, "connected", location.id);
+      this.pendingSshPrompt = null;
+      await this.selectLocation(location.id);
+    } catch (error) {
+      if (!isAbortError(error) && this.sshConnectionController === controller) {
+        this.setSshTargetStatus(targetId, "error", null);
+        this.sshErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not connect to the SSH target.";
+      } else if (this.sshConnectionController === controller) {
+        this.setSshTargetStatus(targetId, "disconnected", null);
+      }
+    } finally {
+      if (this.sshConnectionController === controller) {
+        this.sshConnectionController = null;
+        this.connectingTargetId = null;
+        this.sshConnectionMessage = null;
+        this.pendingSshPrompt = null;
+      }
+    }
+  }
+
+  async answerSshPrompt(response: SshPromptResponse): Promise<void> {
+    const pending = this.pendingSshPrompt;
+    if (!pending) return;
+    this.pendingSshPrompt = null;
+    try {
+      await pending.respond(response);
+    } catch (error) {
+      this.sshErrorMessage =
+        error instanceof Error
+          ? error.message
+          : "The SSH response was not accepted.";
+      this.sshConnectionController?.abort();
+    }
+  }
+
+  cancelSshConnection(): void {
+    this.pendingSshPrompt = null;
+    this.sshConnectionController?.abort();
+  }
+
+  async disconnectSshTarget(targetId: string): Promise<void> {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target) return;
+    try {
+      await this.dataSource.disconnectSshTarget(
+        targetId,
+        new AbortController().signal,
+      );
+      await this.removeConnectedLocation(target.connectedLocationId);
+      this.setSshTargetStatus(targetId, "disconnected", null);
+    } catch (error) {
+      this.sshErrorMessage =
+        error instanceof Error
+          ? error.message
+          : "The SSH target did not disconnect.";
+    }
+  }
+
+  async deleteSshTarget(targetId: string): Promise<void> {
+    const target = this.sshTargets.find(({ id }) => id === targetId);
+    if (!target?.editable) return;
+    try {
+      await this.dataSource.deleteSshTarget(
+        targetId,
+        new AbortController().signal,
+      );
+      await this.removeConnectedLocation(target.connectedLocationId);
+      this.sshTargets = this.sshTargets.filter(({ id }) => id !== targetId);
+    } catch (error) {
+      this.sshErrorMessage =
+        error instanceof Error
+          ? error.message
+          : "The SSH target was not removed.";
+    }
+  }
+
+  private setSshTargetStatus(
+    targetId: string,
+    status: SshTargetSummary["status"],
+    connectedLocationId: string | null,
+  ): void {
+    this.sshTargets = this.sshTargets.map((target) =>
+      target.id === targetId
+        ? { ...target, status, connectedLocationId }
+        : target,
+    );
+  }
+
+  private async removeConnectedLocation(
+    locationId: string | null | undefined,
+  ): Promise<void> {
+    if (!locationId) return;
+    if (this.tabs.some((tab) => tab.locationId === locationId)) {
+      this.locations = this.locations.map((location) =>
+        location.id === locationId
+          ? {
+              ...location,
+              status: "offline",
+              detail: "SSH · Disconnected",
+            }
+          : location,
+      );
+      return;
+    }
+    this.locations = this.locations.filter(({ id }) => id !== locationId);
   }
 
   async selectLocation(locationId: string): Promise<void> {

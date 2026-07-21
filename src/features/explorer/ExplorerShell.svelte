@@ -11,6 +11,8 @@
   import FileGrid from "./FileGrid.svelte";
   import FileList from "./FileList.svelte";
   import QuickPreview from "./QuickPreview.svelte";
+  import SshPromptDialog from "./SshPromptDialog.svelte";
+  import SshTargetDialog from "./SshTargetDialog.svelte";
 
   let { state }: { state: ExplorerState } = $props();
 
@@ -119,4 +121,6 @@
   </main>
 
   <QuickPreview {state} />
+  <SshTargetDialog {state} />
+  <SshPromptDialog {state} />
 </div>

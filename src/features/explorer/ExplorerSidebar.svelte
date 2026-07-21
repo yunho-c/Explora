@@ -8,13 +8,20 @@
   import LaptopIcon from "@lucide/svelte/icons/laptop";
   import MonitorIcon from "@lucide/svelte/icons/monitor";
   import Music2Icon from "@lucide/svelte/icons/music-2";
+  import MoreHorizontalIcon from "@lucide/svelte/icons/more-horizontal";
   import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
   import PanelLeftOpenIcon from "@lucide/svelte/icons/panel-left-open";
+  import PencilIcon from "@lucide/svelte/icons/pencil";
+  import PlusIcon from "@lucide/svelte/icons/plus";
   import ServerIcon from "@lucide/svelte/icons/server";
+  import Trash2Icon from "@lucide/svelte/icons/trash-2";
+  import UnplugIcon from "@lucide/svelte/icons/unplug";
+  import XIcon from "@lucide/svelte/icons/x";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import { Button } from "$lib/components/ui/button";
+  import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
   import * as Sheet from "$lib/components/ui/sheet";
   import type { LocationRole } from "$lib/contracts/explorer";
   import { cn } from "$lib/utils";
@@ -105,56 +112,170 @@
         {/each}
       </nav>
 
-      {#if !compact && state.locations.some(({ kind }) => kind === "ssh")}
-        <div class="flex items-center justify-between px-2 pt-5 pb-1">
+      <div
+        class={cn(
+          "flex items-center pt-5 pb-1",
+          compact ? "justify-center px-1" : "justify-between px-2",
+        )}
+      >
+        {#if !compact}
           <p class="text-xs font-medium text-muted-foreground">SSH</p>
-          <Badge variant="outline">Demo</Badge>
-        </div>
-      {/if}
-      <nav aria-label="SSH locations" class="space-y-1">
-        {#each state.locations.filter(({ kind }) => kind === "ssh") as location (location.id)}
-          {@const Icon = iconFor(location.role)}
-          <Button
-            variant={state.activeLocation?.id === location.id
-              ? "secondary"
-              : "ghost"}
-            size={compact ? "icon" : "sm"}
-            class={compact ? "relative w-full" : "w-full justify-start"}
-            aria-current={state.activeLocation?.id === location.id
-              ? "page"
-              : undefined}
-            title={compact
-              ? `${location.name} · ${location.status}`
-              : undefined}
-            onclick={() => void state.selectLocation(location.id)}
-          >
-            <Icon />
+        {/if}
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          title="Add SSH target"
+          aria-label="Add SSH target"
+          onclick={() => state.openNewSshTarget()}
+        >
+          <PlusIcon />
+        </Button>
+      </div>
+      <nav aria-label="SSH targets" class="space-y-1">
+        {#each state.sshTargets as target (target.id)}
+          <div class="group flex min-w-0 items-center">
+            <Button
+              variant={target.connectedLocationId === state.activeLocation?.id
+                ? "secondary"
+                : "ghost"}
+              size={compact ? "icon" : "sm"}
+              class={compact
+                ? "relative w-full"
+                : "min-w-0 flex-1 justify-start"}
+              aria-current={target.connectedLocationId ===
+              state.activeLocation?.id
+                ? "page"
+                : undefined}
+              title={`${target.name} · ${target.endpoint} · ${target.status}`}
+              onclick={() => void state.selectSshTarget(target.id)}
+            >
+              <ServerIcon />
+              {#if !compact}
+                <span class="min-w-0 flex-1 truncate text-left"
+                  >{target.name}</span
+                >
+                {#if target.source === "openSshConfig"}
+                  <Badge variant="outline" class="px-1 text-[10px]"
+                    >Config</Badge
+                  >
+                {/if}
+                <span
+                  class={cn(
+                    "size-2 rounded-full",
+                    target.status === "connected"
+                      ? "bg-emerald-500"
+                      : target.status === "connecting"
+                        ? "animate-pulse bg-amber-500"
+                        : target.status === "error"
+                          ? "bg-destructive"
+                          : "bg-muted-foreground/40",
+                  )}
+                  aria-label={target.status}
+                ></span>
+              {:else}
+                <span
+                  class={cn(
+                    "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
+                    target.status === "connected"
+                      ? "bg-emerald-500"
+                      : target.status === "connecting"
+                        ? "animate-pulse bg-amber-500"
+                        : target.status === "error"
+                          ? "bg-destructive"
+                          : "bg-muted-foreground/40",
+                  )}
+                ></span>
+              {/if}
+            </Button>
+
             {#if !compact}
-              <span class="min-w-0 flex-1 truncate text-left"
-                >{location.name}</span
-              >
-              <span
-                class={cn(
-                  "size-2 rounded-full",
-                  location.status === "connected"
-                    ? "bg-emerald-500"
-                    : "bg-muted-foreground/40",
-                )}
-                aria-label={location.status}
-              ></span>
-            {:else}
-              <span
-                class={cn(
-                  "absolute right-1.5 bottom-1.5 size-2 rounded-full ring-2 ring-sidebar",
-                  location.status === "connected"
-                    ? "bg-emerald-500"
-                    : "bg-muted-foreground/40",
-                )}
-              ></span>
+              <DropdownMenu.Root>
+                <DropdownMenu.Trigger>
+                  {#snippet child({ props })}
+                    <Button
+                      {...props}
+                      variant="ghost"
+                      size="icon-xs"
+                      class="opacity-0 group-hover:opacity-100 focus:opacity-100"
+                      aria-label={`Manage ${target.name}`}
+                    >
+                      <MoreHorizontalIcon />
+                    </Button>
+                  {/snippet}
+                </DropdownMenu.Trigger>
+                <DropdownMenu.Content align="start">
+                  {#if target.editable}
+                    <DropdownMenu.Item
+                      onclick={() => state.openEditSshTarget(target.id)}
+                    >
+                      <PencilIcon />
+                      Edit
+                    </DropdownMenu.Item>
+                  {/if}
+                  {#if target.status === "connected"}
+                    <DropdownMenu.Item
+                      onclick={() => void state.disconnectSshTarget(target.id)}
+                    >
+                      <UnplugIcon />
+                      Disconnect
+                    </DropdownMenu.Item>
+                  {/if}
+                  {#if target.editable}
+                    <DropdownMenu.Separator />
+                    <DropdownMenu.Item
+                      variant="destructive"
+                      onclick={() => {
+                        if (
+                          window.confirm(`Remove SSH target “${target.name}”?`)
+                        ) {
+                          void state.deleteSshTarget(target.id);
+                        }
+                      }}
+                    >
+                      <Trash2Icon />
+                      Remove
+                    </DropdownMenu.Item>
+                  {/if}
+                </DropdownMenu.Content>
+              </DropdownMenu.Root>
             {/if}
-          </Button>
+          </div>
         {/each}
       </nav>
+      {#if !compact && state.sshTargets.length === 0}
+        <p class="px-2 py-2 text-xs text-muted-foreground">
+          Add a server or define a concrete Host in ~/.ssh/config.
+        </p>
+      {/if}
+      {#if state.connectingTargetId}
+        <div
+          class={cn(
+            "mt-2 flex items-center gap-2 text-xs text-muted-foreground",
+            compact ? "justify-center px-1" : "px-2",
+          )}
+          role="status"
+        >
+          {#if !compact}
+            <span class="min-w-0 flex-1 truncate">
+              {state.sshConnectionMessage ?? "Connecting…"}
+            </span>
+          {/if}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Cancel SSH connection"
+            aria-label="Cancel SSH connection"
+            onclick={() => state.cancelSshConnection()}
+          >
+            <XIcon />
+          </Button>
+        </div>
+      {/if}
+      {#if !compact && state.sshErrorMessage}
+        <p class="px-2 py-2 text-xs text-destructive" role="status">
+          {state.sshErrorMessage}
+        </p>
+      {/if}
     </div>
   </div>
 {/snippet}
