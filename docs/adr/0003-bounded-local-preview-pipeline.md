@@ -67,8 +67,8 @@ or disclose a local path.
 ## Consequences
 
 Very large or complex files may show metadata even when another desktop viewer
-could open them. Animated images display a static first frame. PDF, SVG,
-audio/video, syntax highlighting, persistent caching, and remote content reads
-remain separate slices. The future SFTP implementation can feed bounded bytes
-into the same preparation pipeline and return the same IPC DTOs without changing
-the Quick Preview UI.
+could open them. Animated images display a static first frame. ADR 0005 adds PDF
+as a separate, direct-rendered slice. SVG, audio/video, syntax highlighting,
+persistent caching, and remote content reads remain separate slices. The future
+SFTP implementation can feed bounded bytes into the same preparation pipeline and
+return the same IPC DTOs without changing the Quick Preview UI.

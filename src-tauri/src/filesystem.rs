@@ -55,6 +55,10 @@ pub enum PreviewContentDto {
         original_width: u32,
         original_height: u32,
     },
+    Pdf {
+        resource_id: String,
+        media_type: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

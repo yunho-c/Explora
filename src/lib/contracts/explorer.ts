@@ -177,6 +177,11 @@ export type PreviewContent =
       height: number;
       originalWidth: number;
       originalHeight: number;
+    }
+  | {
+      type: "pdf";
+      data: ArrayBuffer;
+      mediaType: "application/pdf";
     };
 
 export interface PreviewSummary {

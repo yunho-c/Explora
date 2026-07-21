@@ -381,6 +381,11 @@ interface PreparedPreviewPayload {
         height: number;
         originalWidth: number;
         originalHeight: number;
+      }
+    | {
+        type: "pdf";
+        resourceId: string;
+        mediaType: "application/pdf";
       };
 }
 
@@ -499,6 +504,23 @@ const parsePreparedPreview = (
     };
   }
 
+  if (type === "pdf") {
+    const mediaType = requireString(value.content, "mediaType");
+    if (mediaType !== "application/pdf") {
+      throw new Error("Invalid preview response: unsupported PDF media type.");
+    }
+    return {
+      entryId,
+      size,
+      modifiedAt,
+      content: {
+        type,
+        resourceId: requireString(value.content, "resourceId"),
+        mediaType,
+      },
+    };
+  }
+
   throw new Error(`Invalid preview response: unknown content type ${type}.`);
 };
 
@@ -535,7 +557,7 @@ const previewDetails = (
 const parsePreviewBuffer = (value: unknown): ArrayBuffer => {
   if (value instanceof ArrayBuffer) return value;
   if (value instanceof Uint8Array) return value.slice().buffer;
-  throw new Error("Invalid preview response: image bytes are malformed.");
+  throw new Error("Invalid preview response: preview bytes are malformed.");
 };
 
 const parseBreadcrumb = (value: unknown): BreadcrumbSegment => {
@@ -870,8 +892,10 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       });
       if (signal.aborted) throw abortError();
       const payload = parsePreparedPreview(rawPayload, entry.reference.id);
-      if (payload.content.type === "image") {
+      if (payload.content.type === "image" || payload.content.type === "pdf") {
         pendingResourceId = payload.content.resourceId;
+      }
+      if (payload.content.type === "image") {
         if (payload.content.imageMode !== imageMode) {
           throw new Error(
             "Invalid preview response: image mode does not match the request.",
@@ -881,28 +905,36 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       const details = previewDetails(entry, payload);
       let content: PreviewContent;
 
-      if (payload.content.type === "image") {
+      if (payload.content.type === "image" || payload.content.type === "pdf") {
         const rawBytes = await invoke<unknown>("read_preview_resource", {
           resourceId: pendingResourceId,
         });
         pendingResourceId = null;
         if (signal.aborted) throw abortError();
         const bytes = parsePreviewBuffer(rawBytes);
-        const blob = new Blob([bytes], {
-          type: payload.content.mediaType,
-        });
-        imageUrl = URL.createObjectURL(blob);
-        if (signal.aborted) throw abortError();
-        content = {
-          type: "image",
-          url: imageUrl,
-          mediaType: payload.content.mediaType,
-          imageMode: payload.content.imageMode,
-          width: payload.content.width,
-          height: payload.content.height,
-          originalWidth: payload.content.originalWidth,
-          originalHeight: payload.content.originalHeight,
-        };
+        if (payload.content.type === "pdf") {
+          content = {
+            type: "pdf",
+            data: bytes,
+            mediaType: payload.content.mediaType,
+          };
+        } else {
+          const blob = new Blob([bytes], {
+            type: payload.content.mediaType,
+          });
+          imageUrl = URL.createObjectURL(blob);
+          if (signal.aborted) throw abortError();
+          content = {
+            type: "image",
+            url: imageUrl,
+            mediaType: payload.content.mediaType,
+            imageMode: payload.content.imageMode,
+            width: payload.content.width,
+            height: payload.content.height,
+            originalWidth: payload.content.originalWidth,
+            originalHeight: payload.content.originalHeight,
+          };
+        }
       } else {
         content = payload.content;
       }

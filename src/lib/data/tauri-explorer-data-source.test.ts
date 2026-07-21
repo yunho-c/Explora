@@ -319,6 +319,55 @@ describe("TauriExplorerDataSource", () => {
     expect(revokeObjectUrl).toHaveBeenCalledOnce();
   });
 
+  it("loads bounded PDF bytes without creating a Blob URL", async () => {
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL");
+    const commands: string[] = [];
+    mockIPC((command) => {
+      commands.push(command);
+      if (command === "prepare_preview") {
+        return {
+          entryId: previewEntry.reference.id,
+          size: "18",
+          modifiedAt: previewEntry.modifiedAt,
+          content: {
+            type: "pdf",
+            resourceId: "pdf-resource-1",
+            mediaType: "application/pdf",
+          },
+        };
+      }
+      if (command === "read_preview_resource") {
+        return new Uint8Array([
+          0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x0a,
+        ]).buffer;
+      }
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const prepared = await source.getPreview(
+      { ...previewEntry, name: "brief.pdf" },
+      {
+        signal: new AbortController().signal,
+        imageMode: "direct",
+      },
+    );
+
+    expect(prepared.preview.content).toMatchObject({
+      type: "pdf",
+      mediaType: "application/pdf",
+    });
+    if (prepared.preview.content.type !== "pdf") {
+      throw new Error("Expected PDF preview content.");
+    }
+    expect(
+      Array.from(new Uint8Array(prepared.preview.content.data).slice(0, 5)),
+    ).toEqual([0x25, 0x50, 0x44, 0x46, 0x2d]);
+    expect(commands).toContain("read_preview_resource");
+    expect(createObjectUrl).not.toHaveBeenCalled();
+    expect(() => prepared.dispose()).not.toThrow();
+  });
+
   it("rejects malformed preview payloads before rendering", async () => {
     mockIPC((command) =>
       command === "prepare_preview"

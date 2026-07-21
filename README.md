@@ -4,7 +4,7 @@ Explora is a calm, modern desktop file explorer for local and SSH locations. The
 packaged Tauri application provides read-only local and SSH/SFTP navigation
 through Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
-bounded Quick Preview for local text, source, and common raster-image files.
+bounded Quick Preview for local text, source, common raster-image, and PDF files.
 Saved SSH targets and concrete aliases from
 `~/.ssh/config` appear alongside local favorites. The browser-only Vite
 application retains deterministic local and remote demo assets for UI development
@@ -63,11 +63,15 @@ markup. Static JPEG, PNG, WebP, and BMP images default to dimension- and
 size-validated original bytes rendered by the system WebView through one-shot
 binary resources. A per-session shield control explicitly enables sanitized,
 resized PNG thumbnails; formats that may animate or lack consistent WebView
-support require that mode. SVG, PDF, audio, video, and SSH content remain
-metadata-only. See
+support require that mode. Local PDFs pass through the same one-shot resource
+boundary to a custom, canvas-only PDF.js viewer with continuous pages, bounded
+rendering, responsive thumbnails, and no interactive document layer. SVG,
+audio, video, and SSH content remain metadata-only. See
 [`docs/adr/0003-bounded-local-preview-pipeline.md`](docs/adr/0003-bounded-local-preview-pipeline.md)
 and
 [`docs/adr/0004-direct-webview-image-preview.md`](docs/adr/0004-direct-webview-image-preview.md)
+and
+[`docs/adr/0005-bounded-pdf-preview.md`](docs/adr/0005-bounded-pdf-preview.md)
 for the limits, resource lifecycle, and security tradeoff.
 
 Rust integration tests start disposable loopback SSH/SFTP servers and cover host

@@ -40,6 +40,54 @@ test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await expect(page.getByRole("grid", { name: "Files" })).toBeVisible();
 });
 
+test("previews a multipage PDF with custom canvas controls", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByText("handoff.pdf").click();
+  await page.keyboard.press("Space");
+
+  const dialog = page.getByRole("dialog");
+  const document = page.getByRole("application", {
+    name: "PDF preview of handoff.pdf",
+  });
+  await expect(document).toBeVisible();
+  await expect(dialog.locator('[data-slot="dialog-header"]')).toHaveClass(
+    /sr-only/,
+  );
+  await expect(dialog.getByText("1 / 3")).toBeVisible();
+  await expect(
+    dialog.getByRole("complementary", { name: "PDF pages" }),
+  ).toBeVisible();
+  await expect
+    .poll(() =>
+      dialog
+        .locator("canvas")
+        .evaluateAll((canvases) =>
+          canvases.some(
+            (canvas) =>
+              (canvas as HTMLCanvasElement).width > 0 &&
+              (canvas as HTMLCanvasElement).height > 0,
+          ),
+        ),
+    )
+    .toBe(true);
+
+  await dialog.getByRole("button", { name: "Zoom in" }).click();
+  await expect(dialog.getByText("125%")).toBeVisible();
+  await dialog.getByRole("button", { name: "Hide page thumbnails" }).click();
+  await expect(
+    dialog.getByRole("complementary", { name: "PDF pages" }),
+  ).toBeHidden();
+
+  await document.focus();
+  await page.keyboard.press("ArrowDown");
+  await expect(document).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+});
+
 test("filters entries and follows a dark system preference", async ({
   page,
 }) => {

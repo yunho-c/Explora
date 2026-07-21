@@ -37,6 +37,26 @@
       );
     const isPreviewText =
       target instanceof Element && target.matches("[data-preview-text]");
+    const isPreviewDocument =
+      target instanceof Element &&
+      target.closest("[data-preview-document]") !== null;
+
+    if (
+      state.previewOpen &&
+      isPreviewDocument &&
+      (event.key === "ArrowDown" || event.key === "ArrowUp")
+    ) {
+      return;
+    }
+
+    if (
+      state.previewOpen &&
+      (event.key === "ArrowDown" || event.key === "ArrowUp")
+    ) {
+      event.preventDefault();
+      state.moveSelection(event.key === "ArrowDown" ? 1 : -1);
+      return;
+    }
 
     if (isInteractiveControl && !isPreviewText && event.key !== "Escape")
       return;

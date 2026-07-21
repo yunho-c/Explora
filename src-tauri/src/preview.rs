@@ -29,8 +29,10 @@ pub const MAX_IMAGE_DIMENSION: u32 = 16_384;
 pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 pub const MAX_IMAGE_ALLOCATION_BYTES: u64 = 192 * 1024 * 1024;
 pub const MAX_PREVIEW_IMAGE_DIMENSION: u32 = 1_920;
-pub const MAX_PREVIEW_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_DIRECT_IMAGE_FILE_BYTES: u64 = MAX_PREVIEW_RESOURCE_BYTES as u64;
+pub const MAX_IMAGE_PREVIEW_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_PDF_FILE_BYTES: u64 = 32 * 1024 * 1024;
+pub const MAX_PREVIEW_RESOURCE_BYTES: usize = MAX_PDF_FILE_BYTES as usize;
+pub const MAX_DIRECT_IMAGE_FILE_BYTES: u64 = MAX_IMAGE_PREVIEW_RESOURCE_BYTES as u64;
 pub const MAX_PREVIEW_RESOURCE_COUNT: usize = 4;
 pub const MAX_PREVIEW_RESOURCE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const PREVIEW_RESOURCE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -92,7 +94,7 @@ impl PreviewResourceStore {
     fn insert_at(&mut self, bytes: Vec<u8>, now: Instant) -> Result<String, ExplorerError> {
         if bytes.len() > MAX_PREVIEW_RESOURCE_BYTES {
             return Err(ExplorerError::Unsupported(
-                "The prepared image is too large to preview safely.".to_owned(),
+                "The prepared file is too large to preview.".to_owned(),
             ));
         }
 
@@ -284,6 +286,22 @@ impl PreviewManager {
                     },
                 })
             }
+            PreparedContent::Pdf { bytes } => {
+                let resource_id = self
+                    .resources
+                    .lock()
+                    .map_err(|_| ExplorerError::StateUnavailable)?
+                    .insert(bytes)?;
+                Ok(PreviewResultDto {
+                    entry_id,
+                    size: prepared.size,
+                    modified_at: prepared.modified_at,
+                    content: PreviewContentDto::Pdf {
+                        resource_id,
+                        media_type: "application/pdf",
+                    },
+                })
+            }
         }
     }
 
@@ -362,6 +380,9 @@ enum PreparedContent {
         original_width: u32,
         original_height: u32,
     },
+    Pdf {
+        bytes: Vec<u8>,
+    },
 }
 
 fn prepare_local_file(
@@ -430,6 +451,9 @@ fn prepare_local_file(
             "SVG preview requires a separately isolated renderer.",
         ));
     }
+    if extension.as_deref() == Some("pdf") {
+        return prepare_pdf(path, metadata.len(), size, modified_at, cancellation);
+    }
     if extension.as_deref().is_some_and(is_known_binary_extension) {
         return Ok(metadata_only(
             PreviewUnavailableReason::Unsupported,
@@ -464,6 +488,57 @@ fn prepare_local_file(
             truncated,
             encoding,
         },
+    })
+}
+
+fn prepare_pdf(
+    path: &Path,
+    file_size: u64,
+    size: Option<String>,
+    modified_at: Option<u64>,
+    cancellation: &PreviewCancellation,
+) -> Result<PreparedPreview, ExplorerError> {
+    let unavailable = |reason, message| PreparedPreview {
+        size: size.clone(),
+        modified_at,
+        content: PreparedContent::Metadata { reason, message },
+    };
+
+    if file_size > MAX_PDF_FILE_BYTES {
+        return Ok(unavailable(
+            PreviewUnavailableReason::TooLarge,
+            "PDF is too large to preview.",
+        ));
+    }
+
+    ensure_not_cancelled(cancellation)?;
+    let file = File::open(path).map_err(|error| ExplorerError::io("open", path, error))?;
+    let capacity = usize::try_from(file_size)
+        .unwrap_or(MAX_PREVIEW_RESOURCE_BYTES)
+        .min(MAX_PREVIEW_RESOURCE_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_PDF_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ExplorerError::io("read", path, error))?;
+    ensure_not_cancelled(cancellation)?;
+
+    if bytes.len() > MAX_PREVIEW_RESOURCE_BYTES {
+        return Ok(unavailable(
+            PreviewUnavailableReason::TooLarge,
+            "PDF is too large to preview.",
+        ));
+    }
+    if !bytes.starts_with(b"%PDF-") {
+        return Ok(unavailable(
+            PreviewUnavailableReason::Malformed,
+            "This PDF couldn't be displayed.",
+        ));
+    }
+
+    Ok(PreparedPreview {
+        size,
+        modified_at,
+        content: PreparedContent::Pdf { bytes },
     })
 }
 
@@ -508,13 +583,13 @@ fn prepare_direct_image(
     ensure_not_cancelled(cancellation)?;
     let file = File::open(path).map_err(|error| ExplorerError::io("open", path, error))?;
     let capacity = usize::try_from(file_size)
-        .unwrap_or(MAX_PREVIEW_RESOURCE_BYTES)
-        .min(MAX_PREVIEW_RESOURCE_BYTES);
+        .unwrap_or(MAX_IMAGE_PREVIEW_RESOURCE_BYTES)
+        .min(MAX_IMAGE_PREVIEW_RESOURCE_BYTES);
     let mut bytes = Vec::with_capacity(capacity);
     file.take(MAX_DIRECT_IMAGE_FILE_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| ExplorerError::io("read", path, error))?;
-    if bytes.len() > MAX_PREVIEW_RESOURCE_BYTES {
+    if bytes.len() > MAX_IMAGE_PREVIEW_RESOURCE_BYTES {
         return Ok(unavailable(
             PreviewUnavailableReason::TooLarge,
             "This image is too large for direct preview. Enable sanitized image preview to resize it first.",
@@ -672,7 +747,7 @@ fn prepare_sanitized_image(
         return Ok(malformed());
     }
     let bytes = encoded.into_inner();
-    if bytes.len() > MAX_PREVIEW_RESOURCE_BYTES {
+    if bytes.len() > MAX_IMAGE_PREVIEW_RESOURCE_BYTES {
         return Ok(too_large());
     }
     ensure_not_cancelled(cancellation)?;
@@ -877,8 +952,7 @@ fn is_image_extension(extension: &str) -> bool {
 fn is_known_binary_extension(extension: &str) -> bool {
     matches!(
         extension,
-        "pdf"
-            | "rtf"
+        "rtf"
             | "doc"
             | "docx"
             | "odt"
@@ -1028,7 +1102,7 @@ mod tests {
         assert_eq!(media_type, "image/png");
         assert_eq!(image_mode, ImagePreviewMode::Sanitized);
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
-        assert!(bytes.len() <= MAX_PREVIEW_RESOURCE_BYTES);
+        assert!(bytes.len() <= MAX_IMAGE_PREVIEW_RESOURCE_BYTES);
     }
 
     #[test]
@@ -1059,6 +1133,47 @@ mod tests {
         assert_eq!(image_mode, ImagePreviewMode::Direct);
         assert_eq!((width, height), (640, 480));
         assert_eq!((original_width, original_height), (640, 480));
+    }
+
+    #[test]
+    fn pdf_preview_returns_bounded_original_bytes() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("brief.pdf");
+        let source = b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n%%EOF\n";
+        fs::write(&path, source).expect("write PDF");
+
+        let preview = prepare_direct(&path);
+        let PreparedContent::Pdf { bytes } = preview.content else {
+            panic!("expected PDF preview");
+        };
+        assert_eq!(bytes, source);
+    }
+
+    #[test]
+    fn pdf_preview_rejects_malformed_and_oversized_files() {
+        let temp = TempDir::new().expect("temporary directory");
+        let malformed = temp.path().join("broken.pdf");
+        fs::write(&malformed, b"not a PDF").expect("write malformed PDF");
+        assert!(matches!(
+            prepare_direct(&malformed).content,
+            PreparedContent::Metadata {
+                reason: PreviewUnavailableReason::Malformed,
+                ..
+            }
+        ));
+
+        let oversized = temp.path().join("oversized.pdf");
+        File::create(&oversized)
+            .expect("create sparse PDF")
+            .set_len(MAX_PDF_FILE_BYTES + 1)
+            .expect("size sparse PDF");
+        assert!(matches!(
+            prepare_direct(&oversized).content,
+            PreparedContent::Metadata {
+                reason: PreviewUnavailableReason::TooLarge,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1264,6 +1379,43 @@ mod tests {
             .take_resource(&resource_id)
             .expect("consume resource");
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+        assert!(matches!(
+            manager.take_resource(&resource_id),
+            Err(ExplorerError::InvalidReference)
+        ));
+    }
+
+    #[tokio::test]
+    async fn manager_returns_one_shot_pdf_resources() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("brief.pdf");
+        let source = b"%PDF-1.7\n%%EOF\n";
+        fs::write(&path, source).expect("write PDF");
+        let manager = PreviewManager::default();
+
+        let preview = manager
+            .prepare_local(
+                "request-pdf".to_owned(),
+                "entry-pdf".to_owned(),
+                path,
+                ImagePreviewMode::Direct,
+            )
+            .await
+            .expect("prepare PDF");
+        let PreviewContentDto::Pdf {
+            resource_id,
+            media_type,
+        } = preview.content
+        else {
+            panic!("expected PDF resource");
+        };
+        assert_eq!(media_type, "application/pdf");
+        assert_eq!(
+            manager
+                .take_resource(&resource_id)
+                .expect("consume resource"),
+            source
+        );
         assert!(matches!(
             manager.take_resource(&resource_id),
             Err(ExplorerError::InvalidReference)

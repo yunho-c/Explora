@@ -7,6 +7,8 @@ import type {
   PreviewContent,
   SshTargetSummary,
 } from "$lib/contracts/explorer";
+
+import { createDemoPdf } from "./demo-pdf";
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
@@ -720,6 +722,12 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         height: 640,
         originalWidth: 4_032,
         originalHeight: 3_024,
+      };
+    } else if (entry.name.toLocaleLowerCase().endsWith(".pdf")) {
+      content = {
+        type: "pdf",
+        data: createDemoPdf(),
+        mediaType: "application/pdf",
       };
     } else if (
       entry.contentKind === "document" ||

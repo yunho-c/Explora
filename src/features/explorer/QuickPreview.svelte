@@ -9,6 +9,7 @@
   import { Toggle } from "$lib/components/ui/toggle";
 
   import FileGlyph from "./FileGlyph.svelte";
+  import PdfPreview from "./PdfPreview.svelte";
 
   let { state }: { state: ExplorerState } = $props();
 
@@ -103,18 +104,31 @@
       </div>
     {:else if state.preview}
       {@const preview = state.preview}
-      <header class="border-b px-6 py-4 pr-24">
-        <Dialog.Header class="gap-0">
-          <Dialog.Title class="truncate" title={preview.title}>
-            {preview.title}
-          </Dialog.Title>
-          <Dialog.Description class="sr-only">
+      {#if preview.content.type === "pdf"}
+        <Dialog.Header class="sr-only">
+          <Dialog.Title>{preview.title}</Dialog.Title>
+          <Dialog.Description>
             {preview.accessibilityDescription}
           </Dialog.Description>
         </Dialog.Header>
-      </header>
+      {:else}
+        <header class="border-b px-6 py-4 pr-24">
+          <Dialog.Header class="gap-0">
+            <Dialog.Title class="truncate" title={preview.title}>
+              {preview.title}
+            </Dialog.Title>
+            <Dialog.Description class="sr-only">
+              {preview.accessibilityDescription}
+            </Dialog.Description>
+          </Dialog.Header>
+        </header>
+      {/if}
 
-      <div class="min-h-0 flex-1 bg-muted/30 p-4 sm:p-6">
+      <div
+        class="min-h-0 flex-1 bg-muted/30 {preview.content.type === 'pdf'
+          ? ''
+          : 'p-4 sm:p-6'}"
+      >
         {#if preview.content.type === "image"}
           <div
             class="flex size-full items-center justify-center overflow-hidden"
@@ -152,6 +166,10 @@
               class="min-h-0 flex-1 resize-none overflow-auto border-0 bg-transparent p-4 font-mono text-[13px] leading-5 whitespace-pre text-foreground outline-none selection:bg-primary/20"
             ></textarea>
           </div>
+        {:else if preview.content.type === "pdf"}
+          {#key preview.entryId}
+            <PdfPreview data={preview.content.data} title={preview.title} />
+          {/key}
         {:else}
           <div
             class="flex size-full flex-col items-center justify-center gap-4 rounded-lg border border-dashed bg-background/70 p-8 text-center"
@@ -168,18 +186,22 @@
         {/if}
       </div>
 
-      <footer class="shrink-0 border-t bg-background px-6 py-3">
-        <dl class="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2 lg:grid-cols-3">
-          {#each preview.details as detail (detail.label)}
-            <div class="flex min-w-0 items-baseline justify-between gap-3">
-              <dt class="shrink-0 text-muted-foreground">{detail.label}</dt>
-              <dd class="truncate text-right" title={detail.value}>
-                {detail.value}
-              </dd>
-            </div>
-          {/each}
-        </dl>
-      </footer>
+      {#if preview.content.type !== "pdf"}
+        <footer class="shrink-0 border-t bg-background px-6 py-3">
+          <dl
+            class="grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2 lg:grid-cols-3"
+          >
+            {#each preview.details as detail (detail.label)}
+              <div class="flex min-w-0 items-baseline justify-between gap-3">
+                <dt class="shrink-0 text-muted-foreground">{detail.label}</dt>
+                <dd class="truncate text-right" title={detail.value}>
+                  {detail.value}
+                </dd>
+              </div>
+            {/each}
+          </dl>
+        </footer>
+      {/if}
     {/if}
   </Dialog.Content>
 </Dialog.Root>
