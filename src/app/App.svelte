@@ -26,12 +26,23 @@
   const windowChrome = new WindowChromeController();
   let shownRecoveryMessage: string | null = null;
   let shownPreferencesWarning: string | null = null;
+  let shownVolumeWarning: string | null = null;
 
   $effect(() => {
     const message = windowChrome.recoveryMessage;
     if (message && message !== shownRecoveryMessage) {
       shownRecoveryMessage = message;
       toast.warning("Window controls recovered with limited behavior", {
+        description: message,
+      });
+    }
+  });
+
+  $effect(() => {
+    const message = state.volumeWarningMessage;
+    if (message && message !== shownVolumeWarning) {
+      shownVolumeWarning = message;
+      toast.warning("Mounted volumes may be out of date", {
         description: message,
       });
     }
@@ -60,6 +71,7 @@
 
     return () => {
       disposed = true;
+      state.dispose();
       stopWindowChrome();
     };
   });

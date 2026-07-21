@@ -4,6 +4,7 @@ mod local_filesystem;
 mod preferences;
 mod ssh;
 mod ssh_targets;
+mod volumes;
 
 use commands::AppState;
 use filesystem::LocationRole;
@@ -13,6 +14,7 @@ use serde::Serialize;
 use ssh_targets::SshTargetStore;
 use tauri::{Manager, WebviewWindow};
 use tauri_plugin_decoration::WebviewWindowExt;
+use volumes::VolumeManager;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,19 +137,22 @@ pub fn run() {
                 }
             }
 
-            let filesystem = LocalFilesystem::new(roots)?;
+            let filesystem = std::sync::Arc::new(LocalFilesystem::new(roots)?);
+            let volumes = VolumeManager::start(filesystem.clone())?;
             let preferences =
                 PreferencesStore::new(paths.app_config_dir()?.join("preferences.json"));
             let ssh_targets = SshTargetStore::new(
                 paths.app_config_dir()?.join("ssh-targets.json"),
                 paths.home_dir()?,
             )?;
-            app.manage(AppState::new(filesystem, preferences, ssh_targets));
+            app.manage(AppState::new(filesystem, preferences, ssh_targets, volumes));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             activate_custom_titlebar,
             show_native_titlebar_fallback,
+            commands::watch_volumes,
+            commands::cancel_volume_watch,
             commands::get_user_preferences,
             commands::update_user_preferences,
             commands::list_locations,

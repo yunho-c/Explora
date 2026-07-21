@@ -54,6 +54,22 @@ const sshTargetPayload = {
   },
 };
 
+const volumePayload = {
+  ...locationPayload,
+  id: "volume:test",
+  name: "Test Volume",
+  kind: "volume",
+  role: "volume",
+  displayPath: "/Volumes/Test Volume",
+  detail: "750 GB available of 1 TB",
+  root: {
+    id: "volume-root-token",
+    locationId: "volume:test",
+    name: "Test Volume",
+    displayPath: "/Volumes/Test Volume",
+  },
+};
+
 const sendChannelMessages = (
   channel: unknown,
   messages: readonly unknown[],
@@ -166,6 +182,39 @@ describe("TauriExplorerDataSource", () => {
     await expect(
       source.listLocations(new AbortController().signal),
     ).rejects.toThrow("unknown location role");
+  });
+
+  it("streams validated volume snapshots and cancels the Rust watch", async () => {
+    const commands: string[] = [];
+    mockIPC((command, payload) => {
+      commands.push(command);
+      if (command === "watch_volumes") {
+        if (
+          !payload ||
+          Array.isArray(payload) ||
+          payload instanceof ArrayBuffer ||
+          payload instanceof Uint8Array
+        ) {
+          throw new Error("Expected volume watch arguments.");
+        }
+        sendChannelMessages(payload.onEvent, [
+          { revision: 2, volumes: [volumePayload], warning: null },
+        ]);
+      }
+      return null;
+    });
+    const source = new TauriExplorerDataSource();
+    const controller = new AbortController();
+    const onSnapshot = vi.fn(() => controller.abort());
+
+    await source.watchVolumes({ signal: controller.signal, onSnapshot });
+
+    expect(onSnapshot).toHaveBeenCalledWith({
+      revision: 2,
+      volumes: [volumePayload],
+      warning: null,
+    });
+    expect(commands).toContain("cancel_volume_watch");
   });
 
   it("forwards AbortSignal cancellation to the active Rust listing", async () => {

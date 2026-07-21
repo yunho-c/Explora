@@ -268,13 +268,13 @@
         {/each}
       </nav>
 
-      {#if !compact}
+      {#if !compact && state.locations.some(({ kind, status }) => kind === "volume" && status === "available")}
         <p class="px-2 pt-5 pb-1 text-xs font-medium text-muted-foreground">
           Locations
         </p>
       {/if}
       <nav aria-label="Mounted locations" class="space-y-1">
-        {#each state.locations.filter(({ kind }) => kind === "volume") as location (location.id)}
+        {#each state.locations.filter(({ kind, status }) => kind === "volume" && status === "available") as location (location.id)}
           {@const Icon = iconFor(location.role)}
           <Button
             variant={state.activeLocation?.id === location.id

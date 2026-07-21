@@ -12,6 +12,7 @@ import type {
   SortColumn,
   SortDescriptor,
   ViewMode,
+  VolumeSnapshot,
 } from "$lib/contracts/explorer";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
@@ -77,6 +78,7 @@ export class ExplorerState {
   errorMessage = $state<string | null>(null);
   warningMessage = $state<string | null>(null);
   preferencesWarningMessage = $state<string | null>(null);
+  volumeWarningMessage = $state<string | null>(null);
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
@@ -97,6 +99,8 @@ export class ExplorerState {
   private directoryController: AbortController | null = null;
   private previewController: AbortController | null = null;
   private sshConnectionController: AbortController | null = null;
+  private volumeWatchController: AbortController | null = null;
+  private volumeRevision = -1;
   private tabSequence = 0;
   private preferencesInitialization: Promise<void> | null = null;
   private preferenceWriteQueue: Promise<void> = Promise.resolve();
@@ -207,6 +211,7 @@ export class ExplorerState {
       ]);
       this.locations = [...locations];
       this.sshTargets = [...sshTargets];
+      this.startVolumeWatch();
       const initialLocation = this.locations[0];
 
       if (!initialLocation) {
@@ -227,6 +232,102 @@ export class ExplorerState {
           error instanceof Error
             ? error.message
             : "Explora could not load its locations.";
+      }
+    }
+  }
+
+  dispose(): void {
+    this.directoryController?.abort();
+    this.previewController?.abort();
+    this.sshConnectionController?.abort();
+    this.volumeWatchController?.abort();
+  }
+
+  private startVolumeWatch(): void {
+    this.volumeWatchController?.abort();
+    const controller = new AbortController();
+    this.volumeWatchController = controller;
+    void this.dataSource
+      .watchVolumes({
+        signal: controller.signal,
+        onSnapshot: (snapshot) => void this.applyVolumeSnapshot(snapshot),
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || this.volumeWatchController !== controller)
+          return;
+        this.volumeWarningMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not watch mounted volumes.";
+      });
+  }
+
+  private async applyVolumeSnapshot(snapshot: VolumeSnapshot): Promise<void> {
+    if (snapshot.revision <= this.volumeRevision) return;
+    this.volumeRevision = snapshot.revision;
+    this.volumeWarningMessage = snapshot.warning;
+
+    const previousVolumes = this.locations.filter(
+      ({ kind }) => kind === "volume",
+    );
+    const offlineVolumes = previousVolumes
+      .filter(
+        ({ id }) =>
+          !snapshot.volumes.some((volume) => volume.id === id) &&
+          this.tabs.some(({ locationId }) => locationId === id),
+      )
+      .map((location) => ({
+        ...location,
+        status: "offline" as const,
+        detail: "Volume unavailable",
+      }));
+    this.locations = [
+      ...this.locations.filter(({ kind }) => kind !== "volume"),
+      ...snapshot.volumes,
+      ...offlineVolumes,
+    ];
+
+    const activeTab = this.activeTab;
+    const removedActiveVolume = activeTab
+      ? offlineVolumes.find(({ id }) => id === activeTab.locationId)
+      : undefined;
+    if (removedActiveVolume) {
+      this.directoryController?.abort();
+      this.previewController?.abort();
+      this.loading = false;
+      this.warningMessage = `“${removedActiveVolume.name}” is no longer available. Reconnect the volume to continue.`;
+    }
+
+    const restoredIds = snapshot.volumes
+      .filter(
+        ({ id }) =>
+          previousVolumes.find((location) => location.id === id)?.status ===
+          "offline",
+      )
+      .map(({ id }) => id);
+    if (restoredIds.length === 0) return;
+
+    for (const tab of this.tabs) {
+      if (!restoredIds.includes(tab.locationId)) continue;
+      const volume = snapshot.volumes.find(({ id }) => id === tab.locationId);
+      if (!volume) continue;
+      tab.directory = volume.root;
+      tab.history = [volume.root];
+      tab.historyIndex = 0;
+      tab.title = volume.name;
+    }
+    if (activeTab && restoredIds.includes(activeTab.locationId)) {
+      const volume = snapshot.volumes.find(
+        ({ id }) => id === activeTab.locationId,
+      );
+      if (volume) {
+        this.warningMessage = null;
+        await this.loadDirectory(volume.root, (directory) => {
+          activeTab.directory = directory;
+          activeTab.history = [directory];
+          activeTab.historyIndex = 0;
+          activeTab.title = directory.name;
+        });
       }
     }
   }
@@ -755,6 +856,11 @@ export class ExplorerState {
     target: DirectoryRef,
     commit: (directory: DirectoryRef) => void,
   ): Promise<boolean> {
+    const location = this.locations.find(({ id }) => id === target.locationId);
+    if (location?.kind === "volume" && location.status === "offline") {
+      this.warningMessage = `“${location.name}” is no longer available. Reconnect the volume to continue.`;
+      return false;
+    }
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;

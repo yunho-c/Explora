@@ -40,6 +40,19 @@ test("opens a folder and returns to its parent", async ({ page }) => {
   await expect(page.getByText("explora-notes.md")).toBeVisible();
 });
 
+test("opens a discovered volume from Locations", async ({ page }) => {
+  await page.goto("/");
+
+  await expect(page.getByText("Locations", { exact: true })).toBeVisible();
+  const locations = page.getByRole("navigation", {
+    name: "Mounted locations",
+  });
+  await locations.getByRole("button", { name: "Workspace" }).click();
+  await expect(
+    locations.getByRole("button", { name: "Workspace" }),
+  ).toHaveAttribute("aria-current", "page");
+});
+
 test("configures standard favorites from the section header", async ({
   page,
 }) => {
@@ -154,7 +167,9 @@ test("adds an SSH target and connects a configured demo remote", async ({
     page.getByRole("button", { name: "Lab disconnected" }),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: /render-node Config/ }).click();
+  await page
+    .getByRole("button", { name: "render-node disconnected", exact: true })
+    .click();
   await expect(page.getByRole("tab", { name: "render-node" })).toBeVisible();
   await expect(page.getByText("This location is empty")).toBeVisible();
 });

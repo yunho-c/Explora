@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        Mutex, RwLock,
     },
     time::UNIX_EPOCH,
 };
@@ -28,7 +28,8 @@ pub struct LocalRoot {
 #[derive(Default)]
 struct PathRegistryInner {
     paths_by_id: HashMap<String, PathBuf>,
-    ids_by_path: HashMap<PathBuf, String>,
+    locations_by_id: HashMap<String, String>,
+    ids_by_path: HashMap<(String, PathBuf), String>,
 }
 
 #[derive(Default)]
@@ -37,36 +38,74 @@ struct PathRegistry {
 }
 
 impl PathRegistry {
-    fn register(&self, path: PathBuf) -> Result<String, ExplorerError> {
+    fn register(&self, location_id: &str, path: PathBuf) -> Result<String, ExplorerError> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| ExplorerError::StateUnavailable)?;
 
-        if let Some(id) = inner.ids_by_path.get(&path) {
+        let key = (location_id.to_owned(), path.clone());
+        if let Some(id) = inner.ids_by_path.get(&key) {
             return Ok(id.clone());
         }
 
         let id = Uuid::new_v4().to_string();
         inner.paths_by_id.insert(id.clone(), path.clone());
-        inner.ids_by_path.insert(path, id.clone());
+        inner
+            .locations_by_id
+            .insert(id.clone(), location_id.to_owned());
+        inner.ids_by_path.insert(key, id.clone());
         Ok(id)
     }
 
-    fn resolve(&self, id: &str) -> Result<PathBuf, ExplorerError> {
-        self.inner
+    fn resolve(&self, location_id: &str, id: &str) -> Result<PathBuf, ExplorerError> {
+        let inner = self
+            .inner
             .lock()
-            .map_err(|_| ExplorerError::StateUnavailable)?
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        if inner.locations_by_id.get(id).map(String::as_str) != Some(location_id) {
+            return Err(ExplorerError::InvalidReference);
+        }
+        inner
             .paths_by_id
             .get(id)
             .cloned()
             .ok_or(ExplorerError::InvalidReference)
     }
+
+    fn remove_location(&self, location_id: &str) -> Result<(), ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let removed_ids = inner
+            .locations_by_id
+            .iter()
+            .filter_map(|(id, registered_location)| {
+                (registered_location == location_id).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in removed_ids {
+            if let Some(path) = inner.paths_by_id.remove(&id) {
+                inner.ids_by_path.remove(&(location_id.to_owned(), path));
+            }
+            inner.locations_by_id.remove(&id);
+        }
+        Ok(())
+    }
 }
 
 pub struct LocalFilesystem {
     registry: PathRegistry,
-    locations: Vec<LocationSummaryDto>,
+    locations: RwLock<Vec<LocationSummaryDto>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeRoot {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub detail: String,
 }
 
 impl LocalFilesystem {
@@ -103,12 +142,67 @@ impl LocalFilesystem {
 
         Ok(Self {
             registry,
-            locations,
+            locations: RwLock::new(locations),
         })
     }
 
-    pub fn locations(&self) -> Vec<LocationSummaryDto> {
-        self.locations.clone()
+    pub fn locations(&self) -> Result<Vec<LocationSummaryDto>, ExplorerError> {
+        self.locations
+            .read()
+            .map(|locations| locations.clone())
+            .map_err(|_| ExplorerError::StateUnavailable)
+    }
+
+    pub fn replace_volumes(
+        &self,
+        volumes: Vec<VolumeRoot>,
+    ) -> Result<Vec<LocationSummaryDto>, ExplorerError> {
+        let mut locations = self
+            .locations
+            .write()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let previous = locations
+            .iter()
+            .filter(|location| location.kind == "volume")
+            .map(|location| (location.id.clone(), location.clone()))
+            .collect::<HashMap<_, _>>();
+        locations.retain(|location| location.kind != "volume");
+
+        let mut summaries = Vec::with_capacity(volumes.len());
+        for volume in volumes {
+            if !volume.path.is_dir() {
+                continue;
+            }
+            let display_path = volume.path.display().to_string();
+            let directory = if let Some(existing) = previous
+                .get(&volume.id)
+                .filter(|existing| existing.root.display_path == display_path)
+            {
+                let mut root = existing.root.clone();
+                root.name = volume.name.clone();
+                root
+            } else {
+                self.registry.remove_location(&volume.id)?;
+                directory_ref(&self.registry, &volume.path, &volume.id, Some(&volume.name))?
+            };
+            summaries.push(LocationSummaryDto {
+                id: volume.id,
+                name: volume.name,
+                kind: "volume",
+                role: LocationRole::Volume,
+                status: "available",
+                display_path: directory.display_path.clone(),
+                detail: volume.detail,
+                root: directory,
+            });
+        }
+        for id in previous.keys() {
+            if !summaries.iter().any(|location| &location.id == id) {
+                self.registry.remove_location(id)?;
+            }
+        }
+        locations.extend(summaries.iter().cloned());
+        Ok(summaries)
     }
 
     pub fn list_directory<F>(
@@ -122,23 +216,36 @@ impl LocalFilesystem {
         F: FnMut(DirectoryListingEvent) -> Result<(), ExplorerError>,
     {
         ensure_not_cancelled(cancelled)?;
-        if !self
+        let location = self
             .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
             .iter()
-            .any(|location| location.id == location_id)
-        {
+            .find(|location| location.id == location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self.registry.resolve(location_id, &location.root.id)?;
+        let path = self.registry.resolve(location_id, directory_id)?;
+        if !path.starts_with(&root_path) {
             return Err(ExplorerError::InvalidReference);
         }
-        let path = self.registry.resolve(directory_id)?;
         let read_dir = fs::read_dir(&path)
             .map_err(|error| ExplorerError::io("open", path.as_path(), error))?;
 
         let directory = directory_ref(&self.registry, &path, location_id, None)?;
-        let parent = path
-            .parent()
+        let parent = (path != root_path)
+            .then(|| path.parent())
+            .flatten()
+            .filter(|parent| parent.starts_with(&root_path))
             .map(|parent| directory_ref(&self.registry, parent, location_id, None))
             .transpose()?;
-        let breadcrumbs = breadcrumbs(&self.registry, &path, location_id)?;
+        let breadcrumbs = breadcrumbs(
+            &self.registry,
+            &path,
+            &root_path,
+            location_id,
+            &location.name,
+        )?;
 
         emit(DirectoryListingEvent::Started {
             directory,
@@ -208,7 +315,7 @@ impl LocalFilesystem {
                 .map(|target| target.is_dir())
                 .unwrap_or(false);
         let is_navigable = file_type.is_dir() || symlink_target_is_directory;
-        let id = self.registry.register(path.clone())?;
+        let id = self.registry.register(location_id, path.clone())?;
         let directory = is_navigable.then(|| DirectoryRefDto {
             id: id.clone(),
             location_id: location_id.to_owned(),
@@ -265,7 +372,7 @@ fn directory_ref(
     preferred_name: Option<&str>,
 ) -> Result<DirectoryRefDto, ExplorerError> {
     Ok(DirectoryRefDto {
-        id: registry.register(path.to_path_buf())?,
+        id: registry.register(location_id, path.to_path_buf())?,
         location_id: location_id.to_owned(),
         name: preferred_name
             .map(str::to_owned)
@@ -277,14 +384,22 @@ fn directory_ref(
 fn breadcrumbs(
     registry: &PathRegistry,
     path: &Path,
+    root: &Path,
     location_id: &str,
+    root_name: &str,
 ) -> Result<Vec<BreadcrumbSegmentDto>, ExplorerError> {
     path.ancestors()
+        .take_while(|ancestor| ancestor.starts_with(root))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .map(|ancestor| {
-            let directory = directory_ref(registry, ancestor, location_id, None)?;
+            let directory = directory_ref(
+                registry,
+                ancestor,
+                location_id,
+                (ancestor == root).then_some(root_name),
+            )?;
             Ok(BreadcrumbSegmentDto {
                 label: directory.name.clone(),
                 directory,
@@ -352,7 +467,7 @@ mod tests {
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
-        let root = filesystem.locations()[0].root.clone();
+        let root = filesystem.locations().expect("locations")[0].root.clone();
         (temp, filesystem, root)
     }
 
@@ -402,7 +517,7 @@ mod tests {
         assert_eq!(file.content_kind, "document");
         assert!(!file.reference.id.contains("notes.md"));
         assert_eq!(started.0.id, root.id);
-        assert!(started.1.is_some());
+        assert!(started.1.is_none());
         assert_eq!(
             started.2.last().map(|item| &item.directory.id),
             Some(&root.id)
@@ -422,7 +537,7 @@ mod tests {
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
-        let root = filesystem.locations()[0].root.clone();
+        let root = filesystem.locations().expect("locations")[0].root.clone();
         let cancelled = AtomicBool::new(false);
         let mut batch_sizes = Vec::new();
 
@@ -456,6 +571,81 @@ mod tests {
         let (_temp, filesystem, root) = fixture();
         let result =
             filesystem.list_directory(&root.id, "forged-location", &AtomicBool::new(false), |_| {
+                Ok(())
+            });
+
+        assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+    }
+
+    #[test]
+    fn rejects_tokens_claimed_under_another_location() {
+        let temp = TempDir::new().expect("temporary directory");
+        let home = temp.path().join("home");
+        let desktop = temp.path().join("desktop");
+        fs::create_dir(&home).expect("home fixture");
+        fs::create_dir(&desktop).expect("desktop fixture");
+        let filesystem = LocalFilesystem::new(vec![
+            LocalRoot {
+                id: "home",
+                name: "Home",
+                role: LocationRole::Home,
+                path: home,
+            },
+            LocalRoot {
+                id: "desktop",
+                name: "Desktop",
+                role: LocationRole::Desktop,
+                path: desktop,
+            },
+        ])
+        .expect("local filesystem");
+        let locations = filesystem.locations().expect("locations");
+        let home_root = &locations[0].root;
+
+        let result = filesystem.list_directory(
+            &home_root.id,
+            "desktop",
+            &AtomicBool::new(false),
+            |_| Ok(()),
+        );
+
+        assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+    }
+
+    #[test]
+    fn invalidates_volume_tokens_when_the_volume_disappears() {
+        let (temp, filesystem, _) = fixture();
+        let mount = temp.path().join("mounted-volume");
+        fs::create_dir(&mount).expect("volume fixture");
+        let volume = filesystem
+            .replace_volumes(vec![VolumeRoot {
+                id: "volume:test".to_owned(),
+                name: "Test Volume".to_owned(),
+                path: mount,
+                detail: "1 GB available".to_owned(),
+            }])
+            .expect("volume snapshot")
+            .remove(0);
+
+        filesystem
+            .replace_volumes(vec![VolumeRoot {
+                id: volume.id.clone(),
+                name: "Renamed Volume".to_owned(),
+                path: temp.path().join("mounted-volume"),
+                detail: "900 MB available".to_owned(),
+            }])
+            .expect("volume metadata refresh");
+        filesystem
+            .list_directory(&volume.root.id, &volume.id, &AtomicBool::new(false), |_| {
+                Ok(())
+            })
+            .expect("unchanged mount keeps its authorized tokens");
+
+        filesystem
+            .replace_volumes(Vec::new())
+            .expect("volume removal");
+        let result =
+            filesystem.list_directory(&volume.root.id, &volume.id, &AtomicBool::new(false), |_| {
                 Ok(())
             });
 
@@ -520,10 +710,11 @@ mod tests {
         ])
         .expect("local filesystem");
 
-        assert_eq!(filesystem.locations().len(), 1);
-        assert_eq!(filesystem.locations()[0].id, "home");
-        assert_eq!(filesystem.locations()[0].role, LocationRole::Home);
-        let wire = serde_json::to_value(&filesystem.locations()[0]).expect("serializable location");
+        let locations = filesystem.locations().expect("locations");
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].id, "home");
+        assert_eq!(locations[0].role, LocationRole::Home);
+        let wire = serde_json::to_value(&locations[0]).expect("serializable location");
         assert_eq!(wire["role"], "home");
     }
 
@@ -542,7 +733,7 @@ mod tests {
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
-        let root = filesystem.locations()[0].root.clone();
+        let root = filesystem.locations().expect("locations")[0].root.clone();
         let mut navigable = None;
 
         filesystem
@@ -585,7 +776,7 @@ mod tests {
             path: temp.path().to_path_buf(),
         }])
         .expect("local filesystem");
-        let root = filesystem.locations()[0].root.clone();
+        let root = filesystem.locations().expect("locations")[0].root.clone();
         let mut link = None;
 
         filesystem

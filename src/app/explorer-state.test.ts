@@ -1,13 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { DirectoryRef } from "$lib/contracts/explorer";
+import type {
+  DirectoryRef,
+  LocationSummary,
+  VolumeSnapshot,
+} from "$lib/contracts/explorer";
 import type {
   PreferencesSnapshot,
   UserPreferences,
   UserPreferencesPatch,
 } from "$lib/contracts/preferences";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
-import type { ListDirectoryOptions } from "$lib/data/explorer-data-source";
+import type {
+  ListDirectoryOptions,
+  WatchVolumesOptions,
+} from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
 
@@ -89,6 +96,24 @@ class HangingPreferencesDataSource extends MemoryPreferencesDataSource {
   }
 }
 
+class ControllableVolumeDataSource extends DemoExplorerDataSource {
+  private onVolumeSnapshot: ((snapshot: VolumeSnapshot) => void) | null = null;
+
+  override async watchVolumes({
+    signal,
+    onSnapshot,
+  }: WatchVolumesOptions): Promise<void> {
+    this.onVolumeSnapshot = onSnapshot;
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  emitVolumes(revision: number, volumes: readonly LocationSummary[]): void {
+    this.onVolumeSnapshot?.({ revision, volumes, warning: null });
+  }
+}
+
 describe("ExplorerState", () => {
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
@@ -112,6 +137,30 @@ describe("ExplorerState", () => {
     expect(state.activeDirectory?.name).toBe("Home");
     expect(state.breadcrumbs.map(({ label }) => label)).toEqual(["Home"]);
     expect(state.loading).toBe(false);
+  });
+
+  it("preserves an active volume tab across removal and restores it at the root", async () => {
+    const dataSource = new ControllableVolumeDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const workspace = state.locations.find(({ id }) => id === "workspace");
+    expect(workspace).toBeDefined();
+    await state.selectLocation("workspace");
+
+    dataSource.emitVolumes(1, []);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("offline"),
+    );
+    expect(state.activeTab?.locationId).toBe("workspace");
+    expect(state.warningMessage).toContain("no longer available");
+
+    dataSource.emitVolumes(2, [workspace as LocationSummary]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("available"),
+    );
+    expect(state.activeDirectory?.id).toBe(workspace?.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
   });
 
   it("filters, sorts, and switches views without mutating source entries", async () => {

@@ -85,6 +85,17 @@ describe("ExplorerShell", () => {
     }
   });
 
+  it("does not render an empty Locations section", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    state.locations = state.locations.filter(({ kind }) => kind !== "volume");
+    renderShell(state);
+
+    expect(
+      screen.queryByText("Locations", { exact: true }),
+    ).not.toBeInTheDocument();
+  });
+
   it("configures visible standard favorites from the section header", async () => {
     const preferences = new MemoryPreferencesDataSource();
     const state = new ExplorerState(new DemoExplorerDataSource(), preferences);

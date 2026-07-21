@@ -16,6 +16,7 @@ use crate::{
     },
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
+    volumes::{VolumeManager, VolumeSnapshotEventDto},
 };
 
 pub struct AppState {
@@ -23,20 +24,23 @@ pub struct AppState {
     preferences: Arc<PreferencesStore>,
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
+    volumes: Arc<VolumeManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
     pub fn new(
-        local: LocalFilesystem,
+        local: Arc<LocalFilesystem>,
         preferences: PreferencesStore,
         ssh_targets: SshTargetStore,
+        volumes: Arc<VolumeManager>,
     ) -> Self {
         Self {
-            local: Arc::new(local),
+            local,
             preferences: Arc::new(preferences),
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
+            volumes,
             listings: Mutex::new(HashMap::new()),
         }
     }
@@ -104,10 +108,36 @@ pub async fn update_user_preferences(
 }
 
 #[tauri::command]
-pub fn list_locations(state: State<'_, AppState>) -> Vec<LocationSummaryDto> {
-    let mut locations = state.local.locations();
+pub fn list_locations(
+    state: State<'_, AppState>,
+) -> Result<Vec<LocationSummaryDto>, ExplorerErrorDto> {
+    let mut locations = state.local.locations().map_err(ExplorerErrorDto::from)?;
     locations.extend(state.ssh.locations());
-    locations
+    Ok(locations)
+}
+
+#[tauri::command]
+pub fn watch_volumes(
+    state: State<'_, AppState>,
+    request_id: String,
+    on_event: Channel<VolumeSnapshotEventDto>,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .volumes
+        .subscribe(request_id, on_event)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_volume_watch(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    state
+        .volumes
+        .unsubscribe(&request_id)
+        .map_err(ExplorerErrorDto::from)
 }
 
 #[tauri::command]
