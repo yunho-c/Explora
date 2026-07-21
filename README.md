@@ -59,11 +59,16 @@ additional preview formats remain later vertical slices.
 
 Local preview reads are authorized by opaque entry references and performed in
 bounded Rust workers. Text previews are capped and decoded without rendering
-markup; raster images are dimension-, allocation-, time-, and concurrency-limited,
-resized, and re-encoded before reaching the webview through one-shot binary
-resources. SVG, PDF, audio, video, and SSH content remain metadata-only. See
+markup. Static JPEG, PNG, WebP, and BMP images default to dimension- and
+size-validated original bytes rendered by the system WebView through one-shot
+binary resources. A per-session shield control explicitly enables sanitized,
+resized PNG thumbnails; formats that may animate or lack consistent WebView
+support require that mode. SVG, PDF, audio, video, and SSH content remain
+metadata-only. See
 [`docs/adr/0003-bounded-local-preview-pipeline.md`](docs/adr/0003-bounded-local-preview-pipeline.md)
-for the limits and resource-lifecycle decision.
+and
+[`docs/adr/0004-direct-webview-image-preview.md`](docs/adr/0004-direct-webview-image-preview.md)
+for the limits, resource lifecycle, and security tradeoff.
 
 Rust integration tests start disposable loopback SSH/SFTP servers and cover host
 trust, supported authentication methods, secret-safe prompts and errors,

@@ -1,12 +1,53 @@
 <script lang="ts">
+  import ShieldCheckIcon from "@lucide/svelte/icons/shield-check";
+  import type { Action } from "svelte/action";
+
   import type { ExplorerState } from "../../app/explorer-state.svelte";
   import { Badge } from "$lib/components/ui/badge";
   import * as Dialog from "$lib/components/ui/dialog";
   import { Skeleton } from "$lib/components/ui/skeleton";
+  import { Toggle } from "$lib/components/ui/toggle";
 
   import FileGlyph from "./FileGlyph.svelte";
 
   let { state }: { state: ExplorerState } = $props();
+
+  const guardImageRender: Action<
+    HTMLImageElement,
+    { entryId: string; direct: boolean }
+  > = (node, initialOptions) => {
+    let options = initialOptions;
+    let timeout: number | undefined;
+
+    const clearTimeout = () => {
+      if (timeout !== undefined) window.clearTimeout(timeout);
+      timeout = undefined;
+    };
+    const fail = () => {
+      clearTimeout();
+      state.handlePreviewImageFailure(options.entryId);
+    };
+    const scheduleTimeout = () => {
+      clearTimeout();
+      if (options.direct) timeout = window.setTimeout(fail, 5_000);
+    };
+
+    node.addEventListener("load", clearTimeout);
+    node.addEventListener("error", fail);
+    scheduleTimeout();
+
+    return {
+      update(nextOptions) {
+        options = nextOptions;
+        scheduleTimeout();
+      },
+      destroy() {
+        clearTimeout();
+        node.removeEventListener("load", clearTimeout);
+        node.removeEventListener("error", fail);
+      },
+    };
+  };
 </script>
 
 <Dialog.Root
@@ -18,6 +59,25 @@
   <Dialog.Content
     class="flex h-[min(48rem,calc(100vh-3rem))] max-h-[calc(100vh-3rem)] w-[min(64rem,calc(100vw-3rem))] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl"
   >
+    {#if state.selectedEntry?.contentKind === "image" && state.activeLocation?.kind !== "ssh"}
+      <Toggle
+        variant="default"
+        size="sm"
+        pressed={state.imagePreviewMode === "sanitized"}
+        onPressedChange={(pressed) =>
+          void state.setImagePreviewMode(pressed ? "sanitized" : "direct")}
+        aria-label={state.imagePreviewMode === "sanitized"
+          ? "Use direct image preview"
+          : "Use sanitized image preview"}
+        title={state.imagePreviewMode === "sanitized"
+          ? "Use direct image preview"
+          : "Use sanitized image preview"}
+        class="absolute top-4 right-14 z-10 size-8 p-0"
+      >
+        <ShieldCheckIcon />
+      </Toggle>
+    {/if}
+
     {#if state.previewLoading}
       <Dialog.Header class="sr-only">
         <Dialog.Title>{state.selectedEntry?.name ?? "Preview"}</Dialog.Title>
@@ -27,7 +87,7 @@
             "Preview"}
         </Dialog.Description>
       </Dialog.Header>
-      <div class="border-b px-6 py-4 pr-14" aria-busy="true">
+      <div class="border-b px-6 py-4 pr-24" aria-busy="true">
         <Skeleton class="h-5 w-2/5 max-w-72" />
         <Skeleton class="mt-2 h-3 w-1/4 max-w-44" />
       </div>
@@ -43,7 +103,7 @@
       </div>
     {:else if state.preview}
       {@const preview = state.preview}
-      <header class="border-b px-6 py-4 pr-14">
+      <header class="border-b px-6 py-4 pr-24">
         <Dialog.Header class="gap-0">
           <Dialog.Title class="truncate" title={preview.title}>
             {preview.title}
@@ -64,6 +124,10 @@
               alt={`Preview of ${preview.title}`}
               width={preview.content.width}
               height={preview.content.height}
+              use:guardImageRender={{
+                entryId: preview.entryId,
+                direct: preview.content.imageMode === "direct",
+              }}
               class="max-h-full max-w-full rounded-md object-contain shadow-sm ring-1 ring-foreground/10"
             />
           </div>

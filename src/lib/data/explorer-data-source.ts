@@ -2,6 +2,7 @@ import type {
   BreadcrumbSegment,
   DirectoryRef,
   FileEntrySummary,
+  ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
   PreviewSummary,
@@ -45,6 +46,11 @@ export interface PreparedPreview {
   dispose: () => void;
 }
 
+export interface PreparePreviewOptions {
+  signal: AbortSignal;
+  imageMode: ImagePreviewMode;
+}
+
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
@@ -69,6 +75,6 @@ export interface ExplorerDataSource {
   ): Promise<void>;
   getPreview(
     entry: FileEntrySummary,
-    signal: AbortSignal,
+    options: PreparePreviewOptions,
   ): Promise<PreparedPreview>;
 }

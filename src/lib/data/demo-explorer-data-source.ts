@@ -11,6 +11,7 @@ import type {
   ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
+  PreparePreviewOptions,
   PreparedPreview,
 } from "$lib/data/explorer-data-source";
 
@@ -695,7 +696,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
 
   async getPreview(
     entry: FileEntrySummary,
-    signal: AbortSignal,
+    { signal, imageMode }: PreparePreviewOptions,
   ): Promise<PreparedPreview> {
     await wait(80, signal);
 
@@ -714,6 +715,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         type: "image",
         url: demoImageUrl,
         mediaType: "image/png",
+        imageMode,
         width: 960,
         height: 640,
         originalWidth: 4_032,

@@ -26,6 +26,9 @@ export type ContentKind =
 export type ViewMode = "list" | "grid";
 export type SortColumn = "name" | "modifiedAt" | "size";
 export type SortDirection = "ascending" | "descending";
+export type ImagePreviewMode = "direct" | "sanitized";
+export type PreviewImageMediaType =
+  "image/bmp" | "image/jpeg" | "image/png" | "image/webp";
 
 export interface EntryRef {
   id: string;
@@ -168,7 +171,8 @@ export type PreviewContent =
   | {
       type: "image";
       url: string;
-      mediaType: "image/png";
+      mediaType: PreviewImageMediaType;
+      imageMode: ImagePreviewMode;
       width: number;
       height: number;
       originalWidth: number;

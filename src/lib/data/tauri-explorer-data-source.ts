@@ -6,12 +6,14 @@ import type {
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
+  ImagePreviewMode,
   LocationKind,
   LocationRole,
   LocationStatus,
   LocationSummary,
   ManualSshTargetInput,
   PreviewContent,
+  PreviewImageMediaType,
   PreviewSummary,
   PreviewUnavailableReason,
   SshConnectionEvent,
@@ -24,6 +26,7 @@ import type {
   ConnectSshOptions,
   ExplorerDataSource,
   ListDirectoryOptions,
+  PreparePreviewOptions,
   PreparedPreview,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
@@ -89,6 +92,13 @@ const previewUnavailableReasons = new Set<PreviewUnavailableReason>([
   "malformed",
   "timedOut",
 ]);
+const previewImageMediaTypes = new Set<PreviewImageMediaType>([
+  "image/bmp",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+]);
+const imagePreviewModes = new Set<ImagePreviewMode>(["direct", "sanitized"]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -365,7 +375,8 @@ interface PreparedPreviewPayload {
     | {
         type: "image";
         resourceId: string;
-        mediaType: "image/png";
+        mediaType: PreviewImageMediaType;
+        imageMode: ImagePreviewMode;
         width: number;
         height: number;
         originalWidth: number;
@@ -461,8 +472,12 @@ const parsePreparedPreview = (
 
   if (type === "image") {
     const mediaType = requireString(value.content, "mediaType");
-    if (mediaType !== "image/png") {
+    const imageMode = requireString(value.content, "imageMode");
+    if (!previewImageMediaTypes.has(mediaType as PreviewImageMediaType)) {
       throw new Error(`Invalid preview response: unsupported media type.`);
+    }
+    if (!imagePreviewModes.has(imageMode as ImagePreviewMode)) {
+      throw new Error(`Invalid preview response: unknown image mode.`);
     }
     return {
       entryId,
@@ -471,7 +486,8 @@ const parsePreparedPreview = (
       content: {
         type,
         resourceId: requireString(value.content, "resourceId"),
-        mediaType,
+        mediaType: mediaType as PreviewImageMediaType,
+        imageMode: imageMode as ImagePreviewMode,
         width: requirePreviewDimension(value.content, "width"),
         height: requirePreviewDimension(value.content, "height"),
         originalWidth: requirePreviewDimension(value.content, "originalWidth"),
@@ -516,9 +532,9 @@ const previewDetails = (
   return details;
 };
 
-const parsePreviewBytes = (value: unknown): Uint8Array => {
-  if (value instanceof ArrayBuffer) return new Uint8Array(value);
-  if (value instanceof Uint8Array) return value;
+const parsePreviewBuffer = (value: unknown): ArrayBuffer => {
+  if (value instanceof ArrayBuffer) return value;
+  if (value instanceof Uint8Array) return value.slice().buffer;
   throw new Error("Invalid preview response: image bytes are malformed.");
 };
 
@@ -825,7 +841,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
 
   async getPreview(
     entry: FileEntrySummary,
-    signal: AbortSignal,
+    { signal, imageMode }: PreparePreviewOptions,
   ): Promise<PreparedPreview> {
     if (signal.aborted) throw abortError();
     const id = requestId();
@@ -850,22 +866,29 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         requestId: id,
         entryId: entry.reference.id,
         locationId: entry.reference.locationId,
+        imageMode,
       });
       if (signal.aborted) throw abortError();
       const payload = parsePreparedPreview(rawPayload, entry.reference.id);
+      if (payload.content.type === "image") {
+        pendingResourceId = payload.content.resourceId;
+        if (payload.content.imageMode !== imageMode) {
+          throw new Error(
+            "Invalid preview response: image mode does not match the request.",
+          );
+        }
+      }
       const details = previewDetails(entry, payload);
       let content: PreviewContent;
 
       if (payload.content.type === "image") {
-        pendingResourceId = payload.content.resourceId;
         const rawBytes = await invoke<unknown>("read_preview_resource", {
           resourceId: pendingResourceId,
         });
         pendingResourceId = null;
         if (signal.aborted) throw abortError();
-        const bytes = parsePreviewBytes(rawBytes);
-        const ownedBytes = Uint8Array.from(bytes);
-        const blob = new Blob([ownedBytes.buffer], {
+        const bytes = parsePreviewBuffer(rawBytes);
+        const blob = new Blob([bytes], {
           type: payload.content.mediaType,
         });
         imageUrl = URL.createObjectURL(blob);
@@ -874,6 +897,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
           type: "image",
           url: imageUrl,
           mediaType: payload.content.mediaType,
+          imageMode: payload.content.imageMode,
           width: payload.content.width,
           height: payload.content.height,
           originalWidth: payload.content.originalWidth,

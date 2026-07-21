@@ -10,6 +10,13 @@ pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const SSH_KEEPALIVE_MAX: usize = 3;
 pub const SFTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ImagePreviewMode {
+    Direct,
+    Sanitized,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum PreviewUnavailableReason {
@@ -42,6 +49,7 @@ pub enum PreviewContentDto {
     Image {
         resource_id: String,
         media_type: &'static str,
+        image_mode: ImagePreviewMode,
         width: u32,
         height: u32,
         original_width: u32,

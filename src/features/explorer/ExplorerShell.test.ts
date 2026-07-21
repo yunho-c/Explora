@@ -97,6 +97,16 @@ describe("ExplorerShell", () => {
         name: "Preview of summer-light.jpg",
       }),
     ).toBeInTheDocument();
+    const sanitizeToggle = screen.getByRole("button", {
+      name: "Use sanitized image preview",
+    });
+    expect(sanitizeToggle).toHaveAttribute("aria-pressed", "false");
+
+    await fireEvent.click(sanitizeToggle);
+    await waitFor(() => expect(state.imagePreviewMode).toBe("sanitized"));
+    expect(
+      await screen.findByRole("button", { name: "Use direct image preview" }),
+    ).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByText("Image")).not.toBeInTheDocument();
   });
 

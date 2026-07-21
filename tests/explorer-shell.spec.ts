@@ -22,6 +22,18 @@ test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await expect(
     page.getByRole("img", { name: "Preview of summer-light.jpg" }),
   ).toBeVisible();
+  const sanitizeToggle = page.getByRole("button", {
+    name: "Use sanitized image preview",
+  });
+  await expect(sanitizeToggle).toHaveAttribute("aria-pressed", "false");
+  await sanitizeToggle.focus();
+  await page.keyboard.press("Space");
+  await expect(
+    page.getByRole("button", { name: "Use direct image preview" }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByRole("img", { name: "Preview of summer-light.jpg" }),
+  ).toBeVisible();
   await page.keyboard.press("Escape");
 
   await page.getByRole("button", { name: "Grid view" }).click();

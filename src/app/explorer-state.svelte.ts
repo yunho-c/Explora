@@ -3,6 +3,7 @@ import type {
   DirectoryRef,
   ExplorerTab,
   FileEntrySummary,
+  ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
   PreviewSummary,
@@ -53,6 +54,7 @@ export class ExplorerState {
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
+  imagePreviewMode = $state<ImagePreviewMode>("direct");
   sidebarCollapsed = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
@@ -644,10 +646,10 @@ export class ExplorerState {
     this.previewController = controller;
 
     try {
-      const prepared = await this.dataSource.getPreview(
-        entry,
-        controller.signal,
-      );
+      const prepared = await this.dataSource.getPreview(entry, {
+        signal: controller.signal,
+        imageMode: this.imagePreviewMode,
+      });
       if (this.previewController === controller) {
         this.preview = prepared.preview;
         this.previewDisposer = prepared.dispose;
@@ -684,6 +686,30 @@ export class ExplorerState {
     this.previewOpen = false;
     this.previewLoading = false;
     this.preview = null;
+  }
+
+  async setImagePreviewMode(mode: ImagePreviewMode): Promise<void> {
+    if (this.imagePreviewMode === mode) return;
+    this.imagePreviewMode = mode;
+    if (this.previewOpen && this.selectedEntry?.contentKind === "image") {
+      await this.openPreview(this.selectedEntryId);
+    }
+  }
+
+  handlePreviewImageFailure(entryId: string): void {
+    const preview = this.preview;
+    if (preview?.entryId !== entryId || preview.content.type !== "image") {
+      return;
+    }
+    this.disposePreview();
+    this.preview = {
+      ...preview,
+      content: {
+        type: "metadata",
+        reason: "malformed",
+        message: "This image could not be rendered by the system WebView.",
+      },
+    };
   }
 
   private disposePreview(): void {

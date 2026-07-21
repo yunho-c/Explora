@@ -30,13 +30,16 @@
     }
 
     const target = event.target;
-    const isTextInput =
+    const isInteractiveControl =
       target instanceof Element &&
-      target.matches("input, textarea, [contenteditable='true']");
+      target.matches(
+        "a[href], button, input, select, textarea, [contenteditable='true'], [role='button'], [role='checkbox'], [role='menuitem'], [role='switch']",
+      );
     const isPreviewText =
       target instanceof Element && target.matches("[data-preview-text]");
 
-    if (isTextInput && !isPreviewText && event.key !== "Escape") return;
+    if (isInteractiveControl && !isPreviewText && event.key !== "Escape")
+      return;
 
     if (event.key === " " && state.selectedEntryId) {
       event.preventDefault();

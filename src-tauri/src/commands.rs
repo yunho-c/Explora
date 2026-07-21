@@ -10,8 +10,8 @@ use tauri::{ipc::Channel, State};
 
 use crate::{
     filesystem::{
-        DirectoryListingEvent, ExplorerError, ExplorerErrorDto, LocationSummaryDto,
-        PreviewResultDto, PreviewUnavailableReason,
+        DirectoryListingEvent, ExplorerError, ExplorerErrorDto, ImagePreviewMode,
+        LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
     },
     local_filesystem::LocalFilesystem,
     preview::{metadata_result, PreviewManager},
@@ -252,6 +252,7 @@ pub async fn prepare_preview(
     request_id: String,
     entry_id: String,
     location_id: String,
+    image_mode: ImagePreviewMode,
 ) -> Result<PreviewResultDto, ExplorerErrorDto> {
     validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
     validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
@@ -273,7 +274,7 @@ pub async fn prepare_preview(
         .map_err(ExplorerErrorDto::from)?;
     state
         .preview
-        .prepare_local(request_id, entry_id, path)
+        .prepare_local(request_id, entry_id, path, image_mode)
         .await
         .map_err(ExplorerErrorDto::from)
 }

@@ -6,6 +6,7 @@ import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
 import type {
   ConnectSshOptions,
   ListDirectoryOptions,
+  PreparePreviewOptions,
   PreparedPreview,
 } from "$lib/data/explorer-data-source";
 
@@ -68,12 +69,14 @@ class ObservableSshDataSource extends DemoExplorerDataSource {
 
 class StalePreviewDataSource extends DemoExplorerDataSource {
   readonly disposedEntryIds: string[] = [];
+  readonly imageModes: PreparePreviewOptions["imageMode"][] = [];
 
   override async getPreview(
     entry: FileEntrySummary,
-    signal: AbortSignal,
+    { signal, imageMode }: PreparePreviewOptions,
   ): Promise<PreparedPreview> {
     void signal;
+    this.imageModes.push(imageMode);
     if (entry.name === "explora-notes.md") {
       await new Promise((resolve) => window.setTimeout(resolve, 100));
     }
@@ -244,6 +247,23 @@ describe("ExplorerState", () => {
 
     state.closePreview();
     expect(dataSource.disposedEntryIds).toContain(second.reference.id);
+  });
+
+  it("uses direct image rendering by default and reloads after explicit sanitizing", async () => {
+    const dataSource = new StalePreviewDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+
+    state.selectEntry(image.reference.id);
+    await state.openPreview();
+    expect(dataSource.imageModes.at(-1)).toBe("direct");
+
+    await state.setImagePreviewMode("sanitized");
+    expect(state.imagePreviewMode).toBe("sanitized");
+    expect(dataSource.imageModes.at(-1)).toBe("sanitized");
   });
 
   it("keeps SSH content previews metadata-only", async () => {

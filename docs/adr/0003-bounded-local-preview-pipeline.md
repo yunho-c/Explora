@@ -1,9 +1,14 @@
 # ADR 0003: Bound and isolate local content previews
 
-- Status: Accepted
+- Status: Superseded in part by ADR 0004
 - Date: 2026-07-20
 
 ## Context
+
+ADR 0004 changes the default raster-image policy to bounded original-byte
+rendering in the system WebView and retains this sanitized pipeline as an
+explicitly enabled mode. The text pipeline and resource-lifecycle decisions in
+this ADR remain current.
 
 Quick Preview must show useful file content without giving the webview general
 filesystem access or asking it to decode arbitrarily large, malformed source

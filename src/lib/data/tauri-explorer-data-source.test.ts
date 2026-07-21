@@ -234,10 +234,10 @@ describe("TauriExplorerDataSource", () => {
     });
 
     const source = new TauriExplorerDataSource();
-    const prepared = await source.getPreview(
-      previewEntry,
-      new AbortController().signal,
-    );
+    const prepared = await source.getPreview(previewEntry, {
+      signal: new AbortController().signal,
+      imageMode: "direct",
+    });
 
     expect(prepared.preview.content).toEqual({
       type: "text",
@@ -264,9 +264,14 @@ describe("TauriExplorerDataSource", () => {
       .mockReturnValue("blob:preview-1");
     const revokeObjectUrl = vi.spyOn(URL, "revokeObjectURL");
     const commands: string[] = [];
-    mockIPC((command) => {
+    let requestedImageMode: unknown;
+    mockIPC((command, payload) => {
       commands.push(command);
       if (command === "prepare_preview") {
+        requestedImageMode =
+          payload && !Array.isArray(payload)
+            ? Reflect.get(payload, "imageMode")
+            : undefined;
         return {
           entryId: previewEntry.reference.id,
           size: "68",
@@ -275,6 +280,7 @@ describe("TauriExplorerDataSource", () => {
             type: "image",
             resourceId: "resource-1",
             mediaType: "image/png",
+            imageMode: "direct",
             width: 640,
             height: 480,
             originalWidth: 4_032,
@@ -291,16 +297,22 @@ describe("TauriExplorerDataSource", () => {
     const source = new TauriExplorerDataSource();
     const prepared = await source.getPreview(
       { ...previewEntry, contentKind: "image", name: "photo.png" },
-      new AbortController().signal,
+      {
+        signal: new AbortController().signal,
+        imageMode: "direct",
+      },
     );
 
     expect(prepared.preview.content).toMatchObject({
       type: "image",
       url: "blob:preview-1",
+      mediaType: "image/png",
+      imageMode: "direct",
       width: 640,
       height: 480,
     });
     expect(commands).toContain("read_preview_resource");
+    expect(requestedImageMode).toBe("direct");
     expect(createObjectUrl).toHaveBeenCalledOnce();
     prepared.dispose();
     prepared.dispose();
@@ -321,8 +333,44 @@ describe("TauriExplorerDataSource", () => {
 
     const source = new TauriExplorerDataSource();
     await expect(
-      source.getPreview(previewEntry, new AbortController().signal),
+      source.getPreview(previewEntry, {
+        signal: new AbortController().signal,
+        imageMode: "direct",
+      }),
     ).rejects.toThrow("mediaType must be a string");
+  });
+
+  it("rejects an image prepared under a different rendering policy", async () => {
+    const commands: string[] = [];
+    mockIPC((command) => {
+      commands.push(command);
+      return command === "prepare_preview"
+        ? {
+            entryId: previewEntry.reference.id,
+            size: "68",
+            modifiedAt: previewEntry.modifiedAt,
+            content: {
+              type: "image",
+              resourceId: "resource-1",
+              mediaType: "image/png",
+              imageMode: "sanitized",
+              width: 640,
+              height: 480,
+              originalWidth: 640,
+              originalHeight: 480,
+            },
+          }
+        : null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    await expect(
+      source.getPreview(previewEntry, {
+        signal: new AbortController().signal,
+        imageMode: "direct",
+      }),
+    ).rejects.toThrow("image mode does not match the request");
+    expect(commands).toContain("discard_preview_resource");
   });
 
   it("forwards cancellation to an active Rust preview request", async () => {
@@ -341,7 +389,10 @@ describe("TauriExplorerDataSource", () => {
 
     const source = new TauriExplorerDataSource();
     const controller = new AbortController();
-    const preview = source.getPreview(previewEntry, controller.signal);
+    const preview = source.getPreview(previewEntry, {
+      signal: controller.signal,
+      imageMode: "direct",
+    });
     controller.abort();
 
     await expect(preview).rejects.toMatchObject({ name: "AbortError" });

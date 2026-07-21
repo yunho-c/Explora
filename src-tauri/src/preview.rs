@@ -20,7 +20,7 @@ use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::filesystem::{
-    ExplorerError, PreviewContentDto, PreviewResultDto, PreviewUnavailableReason,
+    ExplorerError, ImagePreviewMode, PreviewContentDto, PreviewResultDto, PreviewUnavailableReason,
 };
 
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
@@ -30,6 +30,7 @@ pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 pub const MAX_IMAGE_ALLOCATION_BYTES: u64 = 192 * 1024 * 1024;
 pub const MAX_PREVIEW_IMAGE_DIMENSION: u32 = 1_920;
 pub const MAX_PREVIEW_RESOURCE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_DIRECT_IMAGE_FILE_BYTES: u64 = MAX_PREVIEW_RESOURCE_BYTES as u64;
 pub const MAX_PREVIEW_RESOURCE_COUNT: usize = 4;
 pub const MAX_PREVIEW_RESOURCE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const PREVIEW_RESOURCE_TTL: Duration = Duration::from_secs(5 * 60);
@@ -177,9 +178,12 @@ impl PreviewManager {
         request_id: String,
         entry_id: String,
         path: PathBuf,
+        image_mode: ImagePreviewMode,
     ) -> Result<PreviewResultDto, ExplorerError> {
         let cancellation = self.begin_request(&request_id)?;
-        let result = self.prepare_local_inner(entry_id, path, cancellation).await;
+        let result = self
+            .prepare_local_inner(entry_id, path, cancellation, image_mode)
+            .await;
         self.finish_request(&request_id);
         result
     }
@@ -189,6 +193,7 @@ impl PreviewManager {
         entry_id: String,
         path: PathBuf,
         cancellation: Arc<PreviewCancellation>,
+        image_mode: ImagePreviewMode,
     ) -> Result<PreviewResultDto, ExplorerError> {
         let permit = tokio::select! {
             permit = self.workers.clone().acquire_owned() => {
@@ -200,7 +205,7 @@ impl PreviewManager {
         let task_cancellation = cancellation.clone();
         let task = tauri::async_runtime::spawn_blocking(move || {
             let _permit = permit;
-            prepare_local_file(&path, &task_cancellation)
+            prepare_local_file(&path, &task_cancellation, image_mode)
         });
 
         let prepared = tokio::select! {
@@ -252,6 +257,8 @@ impl PreviewManager {
             }),
             PreparedContent::Image {
                 bytes,
+                media_type,
+                image_mode,
                 width,
                 height,
                 original_width,
@@ -268,7 +275,8 @@ impl PreviewManager {
                     modified_at: prepared.modified_at,
                     content: PreviewContentDto::Image {
                         resource_id,
-                        media_type: "image/png",
+                        media_type,
+                        image_mode,
                         width,
                         height,
                         original_width,
@@ -347,6 +355,8 @@ enum PreparedContent {
     },
     Image {
         bytes: Vec<u8>,
+        media_type: &'static str,
+        image_mode: ImagePreviewMode,
         width: u32,
         height: u32,
         original_width: u32,
@@ -357,6 +367,7 @@ enum PreparedContent {
 fn prepare_local_file(
     path: &Path,
     cancellation: &PreviewCancellation,
+    image_mode: ImagePreviewMode,
 ) -> Result<PreparedPreview, ExplorerError> {
     ensure_not_cancelled(cancellation)?;
     let metadata =
@@ -404,7 +415,14 @@ fn prepare_local_file(
                 "This image is too large to preview safely.",
             ));
         }
-        return prepare_image(path, size, modified_at, cancellation);
+        return prepare_image(
+            path,
+            metadata.len(),
+            size,
+            modified_at,
+            cancellation,
+            image_mode,
+        );
     }
     if extension.as_deref() == Some("svg") {
         return Ok(metadata_only(
@@ -450,6 +468,136 @@ fn prepare_local_file(
 }
 
 fn prepare_image(
+    path: &Path,
+    file_size: u64,
+    size: Option<String>,
+    modified_at: Option<u64>,
+    cancellation: &PreviewCancellation,
+    image_mode: ImagePreviewMode,
+) -> Result<PreparedPreview, ExplorerError> {
+    match image_mode {
+        ImagePreviewMode::Direct => {
+            prepare_direct_image(path, file_size, size, modified_at, cancellation)
+        }
+        ImagePreviewMode::Sanitized => {
+            prepare_sanitized_image(path, size, modified_at, cancellation)
+        }
+    }
+}
+
+fn prepare_direct_image(
+    path: &Path,
+    file_size: u64,
+    size: Option<String>,
+    modified_at: Option<u64>,
+    cancellation: &PreviewCancellation,
+) -> Result<PreparedPreview, ExplorerError> {
+    let unavailable = |reason, message| PreparedPreview {
+        size: size.clone(),
+        modified_at,
+        content: PreparedContent::Metadata { reason, message },
+    };
+
+    if file_size > MAX_DIRECT_IMAGE_FILE_BYTES {
+        return Ok(unavailable(
+            PreviewUnavailableReason::TooLarge,
+            "This image is too large for direct preview. Enable sanitized image preview to resize it first.",
+        ));
+    }
+
+    ensure_not_cancelled(cancellation)?;
+    let file = File::open(path).map_err(|error| ExplorerError::io("open", path, error))?;
+    let capacity = usize::try_from(file_size)
+        .unwrap_or(MAX_PREVIEW_RESOURCE_BYTES)
+        .min(MAX_PREVIEW_RESOURCE_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_DIRECT_IMAGE_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ExplorerError::io("read", path, error))?;
+    if bytes.len() > MAX_PREVIEW_RESOURCE_BYTES {
+        return Ok(unavailable(
+            PreviewUnavailableReason::TooLarge,
+            "This image is too large for direct preview. Enable sanitized image preview to resize it first.",
+        ));
+    }
+    ensure_not_cancelled(cancellation)?;
+
+    let mut reader = match ImageReader::new(Cursor::new(bytes.as_slice())).with_guessed_format() {
+        Ok(reader) => reader,
+        Err(_) => {
+            return Ok(unavailable(
+                PreviewUnavailableReason::Malformed,
+                "This image is unsupported or damaged.",
+            ));
+        }
+    };
+    let Some(format) = reader.format() else {
+        return Ok(unavailable(
+            PreviewUnavailableReason::Malformed,
+            "This image is unsupported or damaged.",
+        ));
+    };
+    let Some(media_type) = direct_media_type(format) else {
+        return Ok(unavailable(
+            PreviewUnavailableReason::Unsupported,
+            "This format requires sanitized image preview.",
+        ));
+    };
+    if direct_image_requires_sanitizing(format, &bytes) {
+        return Ok(unavailable(
+            PreviewUnavailableReason::Unsupported,
+            "This image requires sanitized image preview.",
+        ));
+    }
+
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOCATION_BYTES);
+    reader.limits(limits);
+    let mut decoder = match reader.into_decoder() {
+        Ok(decoder) => decoder,
+        Err(image::ImageError::Limits(_)) => {
+            return Ok(unavailable(
+                PreviewUnavailableReason::TooLarge,
+                "This image exceeds Explora's safe preview limits.",
+            ));
+        }
+        Err(_) => {
+            return Ok(unavailable(
+                PreviewUnavailableReason::Malformed,
+                "This image is unsupported or damaged.",
+            ));
+        }
+    };
+    let (original_width, original_height) = decoder.dimensions();
+    if !image_dimensions_are_safe(original_width, original_height) {
+        return Ok(unavailable(
+            PreviewUnavailableReason::TooLarge,
+            "This image exceeds Explora's safe preview limits.",
+        ));
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let (width, height) = oriented_dimensions(original_width, original_height, orientation);
+    drop(decoder);
+    ensure_not_cancelled(cancellation)?;
+
+    Ok(PreparedPreview {
+        size,
+        modified_at,
+        content: PreparedContent::Image {
+            bytes,
+            media_type,
+            image_mode: ImagePreviewMode::Direct,
+            width,
+            height,
+            original_width,
+            original_height,
+        },
+    })
+}
+
+fn prepare_sanitized_image(
     path: &Path,
     size: Option<String>,
     modified_at: Option<u64>,
@@ -534,12 +682,121 @@ fn prepare_image(
         modified_at,
         content: PreparedContent::Image {
             bytes,
+            media_type: "image/png",
+            image_mode: ImagePreviewMode::Sanitized,
             width,
             height,
             original_width,
             original_height,
         },
     })
+}
+
+fn direct_media_type(format: ImageFormat) -> Option<&'static str> {
+    match format {
+        ImageFormat::Bmp => Some("image/bmp"),
+        ImageFormat::Jpeg => Some("image/jpeg"),
+        ImageFormat::Png => Some("image/png"),
+        ImageFormat::WebP => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn direct_image_requires_sanitizing(format: ImageFormat, bytes: &[u8]) -> bool {
+    match format {
+        ImageFormat::Png => png_is_animated(bytes),
+        ImageFormat::WebP => webp_is_animated(bytes),
+        _ => false,
+    }
+}
+
+fn png_is_animated(bytes: &[u8]) -> bool {
+    const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if !bytes.starts_with(SIGNATURE) {
+        return true;
+    }
+
+    let mut offset = SIGNATURE.len();
+    loop {
+        let Some(header_end) = offset.checked_add(8) else {
+            return true;
+        };
+        if header_end > bytes.len() {
+            return true;
+        }
+        let length = u32::from_be_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]) as usize;
+        let Some(chunk_end) = header_end
+            .checked_add(length)
+            .and_then(|data_end| data_end.checked_add(4))
+        else {
+            return true;
+        };
+        if chunk_end > bytes.len() {
+            return true;
+        }
+        let chunk_type = &bytes[offset + 4..header_end];
+        if chunk_type == b"acTL" {
+            return true;
+        }
+        if chunk_type == b"IDAT" || chunk_type == b"IEND" {
+            return false;
+        }
+        offset = chunk_end;
+    }
+}
+
+fn webp_is_animated(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return true;
+    }
+
+    let mut offset = 12usize;
+    while offset.saturating_add(8) <= bytes.len() {
+        let chunk_type = &bytes[offset..offset + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let data_start = offset + 8;
+        let Some(data_end) = data_start.checked_add(chunk_size) else {
+            return true;
+        };
+        if data_end > bytes.len() {
+            return true;
+        }
+        if chunk_type == b"ANIM" || chunk_type == b"ANMF" {
+            return true;
+        }
+        if chunk_type == b"VP8X" && chunk_size > 0 && bytes[data_start] & 0x02 != 0 {
+            return true;
+        }
+        let Some(next_offset) = data_end.checked_add(chunk_size % 2) else {
+            return true;
+        };
+        offset = next_offset;
+    }
+    false
+}
+
+fn oriented_dimensions(width: u32, height: u32, orientation: Orientation) -> (u32, u32) {
+    if matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    ) {
+        (height, width)
+    } else {
+        (width, height)
+    }
 }
 
 fn image_dimensions_are_safe(width: u32, height: u32) -> bool {
@@ -685,7 +942,17 @@ mod tests {
     use super::*;
 
     fn prepare(path: &Path) -> PreparedPreview {
-        prepare_local_file(path, &PreviewCancellation::new()).expect("prepare preview")
+        prepare_local_file(
+            path,
+            &PreviewCancellation::new(),
+            ImagePreviewMode::Sanitized,
+        )
+        .expect("prepare preview")
+    }
+
+    fn prepare_direct(path: &Path) -> PreparedPreview {
+        prepare_local_file(path, &PreviewCancellation::new(), ImagePreviewMode::Direct)
+            .expect("prepare direct preview")
     }
 
     #[test]
@@ -746,6 +1013,8 @@ mod tests {
         let preview = prepare(&path);
         let PreparedContent::Image {
             bytes,
+            media_type,
+            image_mode,
             width,
             height,
             original_width,
@@ -756,8 +1025,76 @@ mod tests {
         };
         assert_eq!((original_width, original_height), (2_400, 1_200));
         assert_eq!((width, height), (1_920, 960));
+        assert_eq!(media_type, "image/png");
+        assert_eq!(image_mode, ImagePreviewMode::Sanitized);
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
         assert!(bytes.len() <= MAX_PREVIEW_RESOURCE_BYTES);
+    }
+
+    #[test]
+    fn direct_preview_returns_validated_original_bytes() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("photo.jpg");
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(640, 480, Rgba([34, 91, 143, 255])))
+            .save(&path)
+            .expect("write source image");
+        let original = fs::read(&path).expect("read source image");
+
+        let preview = prepare_direct(&path);
+        let PreparedContent::Image {
+            bytes,
+            media_type,
+            image_mode,
+            width,
+            height,
+            original_width,
+            original_height,
+        } = preview.content
+        else {
+            panic!("expected direct image preview");
+        };
+
+        assert_eq!(bytes, original);
+        assert_eq!(media_type, "image/jpeg");
+        assert_eq!(image_mode, ImagePreviewMode::Direct);
+        assert_eq!((width, height), (640, 480));
+        assert_eq!((original_width, original_height), (640, 480));
+    }
+
+    #[test]
+    fn direct_preview_rejects_formats_that_require_sanitizing() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("animation.gif");
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 6, Rgba([34, 91, 143, 255])))
+            .save(&path)
+            .expect("write source image");
+
+        assert!(matches!(
+            prepare_direct(&path).content,
+            PreparedContent::Metadata {
+                reason: PreviewUnavailableReason::Unsupported,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn direct_animation_detection_rejects_bounded_container_signals() {
+        let mut animated_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        animated_png.extend_from_slice(&0u32.to_be_bytes());
+        animated_png.extend_from_slice(b"acTL");
+        animated_png.extend_from_slice(&0u32.to_be_bytes());
+        assert!(png_is_animated(&animated_png));
+
+        let mut static_png = b"\x89PNG\r\n\x1a\n".to_vec();
+        static_png.extend_from_slice(&0u32.to_be_bytes());
+        static_png.extend_from_slice(b"IDAT");
+        static_png.extend_from_slice(&0u32.to_be_bytes());
+        assert!(!png_is_animated(&static_png));
+
+        let animated_webp = b"RIFF\x0e\0\0\0WEBPVP8X\x01\0\0\0\x02\0";
+        assert!(webp_is_animated(animated_webp));
+        assert!(webp_is_animated(b"malformed"));
     }
 
     #[test]
@@ -802,6 +1139,19 @@ mod tests {
 
         assert!(matches!(
             prepare(&path).content,
+            PreparedContent::Metadata {
+                reason: PreviewUnavailableReason::TooLarge,
+                ..
+            }
+        ));
+
+        let direct_path = temp.path().join("direct-too-large.png");
+        let direct_file = File::create(&direct_path).expect("create direct sparse image");
+        direct_file
+            .set_len(MAX_DIRECT_IMAGE_FILE_BYTES + 1)
+            .expect("size direct sparse image");
+        assert!(matches!(
+            prepare_direct(&direct_path).content,
             PreparedContent::Metadata {
                 reason: PreviewUnavailableReason::TooLarge,
                 ..
@@ -855,7 +1205,7 @@ mod tests {
         cancellation.cancel();
 
         assert!(matches!(
-            prepare_local_file(&path, &cancellation),
+            prepare_local_file(&path, &cancellation, ImagePreviewMode::Direct),
             Err(ExplorerError::Cancelled)
         ));
     }
@@ -893,12 +1243,23 @@ mod tests {
         let manager = PreviewManager::default();
 
         let preview = manager
-            .prepare_local("request-1".to_owned(), "entry-1".to_owned(), path)
+            .prepare_local(
+                "request-1".to_owned(),
+                "entry-1".to_owned(),
+                path,
+                ImagePreviewMode::Direct,
+            )
             .await
             .expect("prepare image");
-        let PreviewContentDto::Image { resource_id, .. } = preview.content else {
+        let PreviewContentDto::Image {
+            resource_id,
+            image_mode,
+            ..
+        } = preview.content
+        else {
             panic!("expected image resource");
         };
+        assert_eq!(image_mode, ImagePreviewMode::Direct);
         let bytes = manager
             .take_resource(&resource_id)
             .expect("consume resource");
