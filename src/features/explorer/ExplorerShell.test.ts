@@ -39,6 +39,7 @@ describe("ExplorerShell", () => {
     expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
     const titlebarLeft = document.querySelector(".explora-titlebar-left");
     expect(titlebarLeft).not.toBeNull();
+    expect(titlebarLeft).not.toHaveClass("border-b");
     expect(titlebarLeft?.textContent?.trim()).toBe("");
     expect(titlebarLeft?.querySelector("svg")).toBeNull();
 

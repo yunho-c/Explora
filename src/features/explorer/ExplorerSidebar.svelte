@@ -57,7 +57,7 @@
       class={cn(
         "flex items-center gap-2 overflow-hidden",
         titlebar
-          ? "explora-titlebar-content explora-titlebar-left h-8 shrink-0 border-b bg-muted/30"
+          ? "explora-titlebar-content explora-titlebar-left h-8 shrink-0 bg-muted/30"
           : "h-14 px-3",
       )}
       data-tauri-drag-region={titlebar && customChrome ? "" : undefined}
