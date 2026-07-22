@@ -194,11 +194,31 @@ export type PreviewUnavailableReason =
   | "malformed"
   | "timedOut";
 
+export interface ContentRequestCapability {
+  intent: "downloadToPreview";
+  providerWorkCancellable: boolean;
+}
+
+export type ContentRequestEvent =
+  | {
+      event: "started";
+      providerWorkCancellable: boolean;
+    }
+  | {
+      event: "progress";
+      availability: ContentAvailability;
+    }
+  | {
+      event: "complete";
+      availability: "local";
+    };
+
 export type PreviewContent =
   | {
       type: "metadata";
       reason: PreviewUnavailableReason;
       message: string;
+      requestContent: ContentRequestCapability | null;
     }
   | {
       type: "text";

@@ -1,10 +1,14 @@
 <script lang="ts">
+  import DownloadIcon from "@lucide/svelte/icons/download";
+  import LoaderCircleIcon from "@lucide/svelte/icons/loader-circle";
   import ShieldCheckIcon from "@lucide/svelte/icons/shield-check";
   import type { Action } from "svelte/action";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
   import { Badge } from "$lib/components/ui/badge";
+  import { Button } from "$lib/components/ui/button";
   import * as Dialog from "$lib/components/ui/dialog";
+  import { Progress } from "$lib/components/ui/progress";
   import { Skeleton } from "$lib/components/ui/skeleton";
   import { Toggle } from "$lib/components/ui/toggle";
 
@@ -12,6 +16,21 @@
   import PdfPreview from "./PdfPreview.svelte";
 
   let { state }: { state: ExplorerState } = $props();
+
+  const contentRequestStatus = (availability: string) => {
+    switch (availability) {
+      case "downloading":
+        return "The operating system is downloading this file…";
+      case "syncing":
+        return "Waiting for the current version…";
+      case "partial":
+        return "Waiting for the remaining file content…";
+      case "error":
+        return "The operating system reported a download error.";
+      default:
+        return "Waiting for the file to become available locally…";
+    }
+  };
 
   const guardImageRender: Action<
     HTMLImageElement,
@@ -173,15 +192,65 @@
         {:else}
           <div
             class="flex size-full flex-col items-center justify-center gap-4 rounded-lg border border-dashed bg-background/70 p-8 text-center"
-            role="status"
           >
             <FileGlyph kind={preview.kind} size="lg" />
             <div class="max-w-md space-y-1">
               <p class="font-medium">Preview unavailable</p>
-              <p class="text-sm text-muted-foreground">
+              <p
+                class="text-sm text-muted-foreground"
+                role="status"
+                aria-live="polite"
+              >
                 {preview.content.message}
               </p>
             </div>
+            {#if preview.content.reason === "downloadRequired" && state.previewContentRequest}
+              <div class="w-full max-w-sm space-y-3" aria-live="polite">
+                <div
+                  class="flex items-center justify-center gap-2 text-sm font-medium"
+                >
+                  <LoaderCircleIcon class="size-4 animate-spin" />
+                  <span>
+                    {contentRequestStatus(
+                      state.previewContentRequest.availability,
+                    )}
+                  </span>
+                </div>
+                <Progress
+                  aria-label="Downloading file for preview"
+                  class="[&_[data-slot=progress-indicator]]:!translate-x-0 [&_[data-slot=progress-indicator]]:animate-pulse"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onclick={() => state.stopWaitingForPreviewContent()}
+                >
+                  Stop waiting
+                </Button>
+                {#if !state.previewContentRequest.providerWorkCancellable}
+                  <p class="text-xs text-muted-foreground">
+                    Stopping here will not stop the operating system download.
+                  </p>
+                {/if}
+              </div>
+            {:else if preview.content.reason === "downloadRequired" && preview.content.requestContent}
+              <Button
+                size="sm"
+                onclick={() => void state.requestPreviewContent()}
+              >
+                <DownloadIcon />
+                Download to Preview
+              </Button>
+            {/if}
+            {#if state.previewContentRequestMessage}
+              <p
+                class="max-w-md text-sm text-destructive"
+                role="status"
+                aria-live="polite"
+              >
+                {state.previewContentRequestMessage}
+              </p>
+            {/if}
           </div>
         {/if}
       </div>

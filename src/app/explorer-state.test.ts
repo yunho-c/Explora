@@ -19,6 +19,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RequestContentOptions,
   WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
@@ -105,11 +106,36 @@ class StalePreviewDataSource extends DemoExplorerDataSource {
           type: "metadata",
           reason: "unsupported",
           message: "Test preview",
+          requestContent: null,
         },
         details: [],
       },
       dispose: () => this.disposedEntryIds.push(entry.reference.id),
     };
+  }
+}
+
+class SlowContentDataSource extends DemoExplorerDataSource {
+  aborted = false;
+
+  override async requestContent(
+    entry: FileEntrySummary,
+    { signal, onEvent }: RequestContentOptions,
+  ): Promise<void> {
+    onEvent({ event: "started", providerWorkCancellable: false });
+    onEvent({ event: "progress", availability: entry.availability });
+    await new Promise<void>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          this.aborted = true;
+          const error = new Error("Stopped waiting.");
+          error.name = "AbortError";
+          reject(error);
+        },
+        { once: true },
+      );
+    });
   }
 }
 
@@ -633,7 +659,56 @@ describe("ExplorerState", () => {
     expect(state.preview?.content).toMatchObject({
       type: "metadata",
       reason: "remote",
+      requestContent: null,
     });
+  });
+
+  it("requests online-only content explicitly and reopens the bounded preview", async () => {
+    const state = await initializedState();
+    await state.selectLocation("synced:icloud");
+    const onlineOnly = state.entries.find(
+      ({ name }) => name === "Reference library.pdf",
+    )!;
+
+    state.selectEntry(onlineOnly.reference.id);
+    await state.openPreview();
+    expect(state.preview?.content).toMatchObject({
+      type: "metadata",
+      reason: "downloadRequired",
+      requestContent: {
+        intent: "downloadToPreview",
+        providerWorkCancellable: false,
+      },
+    });
+
+    const request = state.requestPreviewContent();
+    expect(state.previewContentRequest).not.toBeNull();
+    await request;
+
+    expect(state.previewContentRequest).toBeNull();
+    expect(state.preview?.content.type).toBe("pdf");
+  });
+
+  it("stops waiting without claiming that provider-owned work was cancelled", async () => {
+    const dataSource = new SlowContentDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectLocation("synced:icloud");
+    const onlineOnly = state.entries.find(
+      ({ name }) => name === "Reference library.pdf",
+    )!;
+    state.selectEntry(onlineOnly.reference.id);
+    await state.openPreview();
+
+    const request = state.requestPreviewContent();
+    state.stopWaitingForPreviewContent();
+    await request;
+
+    expect(dataSource.aborted).toBe(true);
+    expect(state.previewContentRequest).toBeNull();
+    expect(state.previewContentRequestMessage).toContain(
+      "operating system may continue",
+    );
   });
 
   it("connects SSH targets as locations and preserves their tab when disconnected", async () => {

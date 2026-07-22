@@ -1,5 +1,6 @@
 import type {
   BreadcrumbSegment,
+  ContentRequestEvent,
   DirectoryRef,
   FileEntrySummary,
   ImagePreviewMode,
@@ -53,6 +54,11 @@ export interface PreparePreviewOptions {
   imageMode: ImagePreviewMode;
 }
 
+export interface RequestContentOptions {
+  signal: AbortSignal;
+  onEvent: (event: ContentRequestEvent) => void;
+}
+
 export interface WatchVolumesOptions {
   signal: AbortSignal;
   onSnapshot: (snapshot: VolumeSnapshot) => void;
@@ -93,4 +99,8 @@ export interface ExplorerDataSource {
     entry: FileEntrySummary,
     options: PreparePreviewOptions,
   ): Promise<PreparedPreview>;
+  requestContent(
+    entry: FileEntrySummary,
+    options: RequestContentOptions,
+  ): Promise<void>;
 }

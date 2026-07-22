@@ -229,9 +229,15 @@ Prefer a small typed command/event surface:
   snapshot reports that capability and returns only an opaque location ID; the
   selected path is not a command result.
 - `remove_synced_folder(folder_id)` removes only a manually configured location.
-- A later generic content-availability query or event stream.
-- A later task-based `request_content` operation, shared with remote and other
-  delayed-content backends where practical.
+- `request_content(request_id, entry_id, location_id, channel)` is available only
+  when preview metadata carries a `downloadToPreview` capability. It publishes
+  `started`, availability-based `progress`, and locally revalidated `complete`
+  events.
+- `cancel_content_request(request_id)` stops Explora's bounded wait. The current
+  capability reports `providerWorkCancellable: false`, so the UI states that the
+  operating-system download may continue.
+- A later generic content-availability query may reuse this task vocabulary for
+  remote and other delayed-content backends where practical.
 
 Actions should be enabled from capabilities, not provider or platform names.
 Examples include `canReadMetadata`, `canReadContent`, `requiresHydration`,
@@ -394,9 +400,16 @@ must describe the limitation honestly rather than showing an unusable mount.
 
 ### Phase 5: explicit hydration
 
-- Define the shared task, progress, cancellation, and error contract.
-- Implement platform adapters without coupling them to provider brands.
-- Route hydrated content into existing bounded preview and streaming pipelines.
+- Use at most four concurrent five-minute waits with typed lifecycle events and
+  structured cancellation, timeout, offline, stale-reference, and platform
+  errors.
+- Use internal iCloud and Windows Cloud Files access policies rather than
+  displayed provider brands to select native adapters.
+- Treat progress as indeterminate unless availability changes are authoritative;
+  do not synthesize byte percentages.
+- Revalidate the opaque entry after hydration, then reopen the existing bounded
+  preview pipeline so its byte, decoding, image, PDF, time, and resource limits
+  still apply.
 - Test offline, slow, cancelled, oversized, changed, and removed files.
 
 ## Progress checklist
@@ -406,7 +419,7 @@ must describe the limitation honestly rather than showing an unusable mount.
 - [x] Accept a synced-folders ADR.
 - [x] Update the product boundary in `AGENTS.md`.
 - [x] Define location source separately from backend transport.
-- [ ] Define synced-folder provider, status, availability, and capabilities.
+- [x] Define synced-folder provider, status, availability, and capabilities.
 - [x] Replace string-prefix backend routing with authoritative dispatch.
 - [x] Implement `SyncedFolderManager` and complete revisioned snapshots.
 - [x] Bind opaque references to synced-folder location identities.
@@ -425,6 +438,8 @@ must describe the limitation honestly rather than showing an unusable mount.
 - [x] Derive stable opaque identities without exposing account data.
 - [x] Detect provider-root addition, removal, and client restart with bounded polling.
 - [x] Inspect documented iCloud availability without hydrating content.
+- [x] Start iCloud download only from explicit Download to Preview intent.
+- [x] Keep Explora wait cancellation distinct from the OS-owned iCloud request.
 - [x] Keep third-party availability unknown pending a documented provider-neutral API.
 - [ ] Test multiple OneDrive and Google Drive accounts.
 - [ ] Test locally available, online-only, downloading, and failed items.
@@ -437,6 +452,9 @@ must describe the limitation honestly rather than showing an unusable mount.
 - [x] Enumerate current sync roots generically.
 - [x] Normalize provider display metadata without path-name heuristics.
 - [x] Read Cloud Files placeholder state from listing metadata.
+- [x] Hydrate the complete placeholder only from explicit Download to Preview intent.
+- [x] Run synchronous Cloud Files hydration off the async runtime and treat UI
+      cancellation as stopping the wait only.
 - [x] Detect sync-root registration and removal with bounded refresh.
 - [ ] Model provider disconnects that do not unregister the sync root.
 - [ ] Test OneDrive Personal and work/school roots.
@@ -468,12 +486,12 @@ must describe the limitation honestly rather than showing an unusable mount.
 
 - [x] Add an entry availability indicator with an accessible text label.
 - [x] Return `downloadRequired` instead of triggering implicit hydration.
-- [ ] Add explicit Download to Preview intent.
-- [ ] Model hydration as a bounded task with honest progress.
-- [ ] Separate cancellation of waiting from cancellation of provider work.
-- [ ] Revalidate identity and metadata after hydration.
-- [ ] Feed downloaded bytes into existing preview limits.
-- [ ] Prevent background metadata, search, and thumbnail hydration.
+- [x] Add explicit Download to Preview intent.
+- [x] Model hydration as a bounded task with honest progress.
+- [x] Separate cancellation of waiting from cancellation of provider work.
+- [x] Revalidate identity and metadata after hydration.
+- [x] Feed downloaded bytes into existing preview limits.
+- [x] Prevent background metadata, search, and thumbnail hydration.
 - [ ] Test slow, offline, oversized, malformed, changed, and removed files.
 - [ ] Test cleanup and tab continuity after provider disconnects.
 
@@ -495,7 +513,8 @@ locally mirrored folder does not exercise online-only placeholder behavior.
 
 ## Decisions for the first slice
 
-- Discovery and metadata-only browsing ship before explicit hydration.
+- Discovery and metadata-only browsing shipped before the explicit, preview-only
+  content-request slice; no other operation hydrates content.
 - Users may hide individual discovered roots; provider-wide visibility is not
   stored.
 - Duplicate provider roots receive sanitized ordinal labels such as
@@ -527,6 +546,8 @@ locally mirrored folder does not exercise online-only placeholder behavior.
 - Apple ubiquitous-item download status key and values:
   [URL resource key](https://developer.apple.com/documentation/foundation/urlresourcekey/ubiquitousitemdownloadingstatuskey),
   [download status](https://developer.apple.com/documentation/foundation/urlubiquitousitemdownloadingstatus)
+- Apple explicit ubiquitous-item download request:
+  [Apple Developer Documentation](<https://developer.apple.com/documentation/foundation/filemanager/startdownloadingubiquitousitem(at:)>)
 - Google Drive File Provider and legacy locations on macOS:
   [Google Drive Help](https://support.google.com/drive/answer/12178485?hl=en-GB)
 - Google Drive streaming and mirroring behavior:
@@ -541,6 +562,8 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ne-cfapi-cf_placeholder_state)
 - Windows metadata-only placeholder-state helper:
   [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfgetplaceholderstatefromattributetag)
+- Windows explicit placeholder hydration:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfhydrateplaceholder)
 - GIO volume monitor and user-visible mounts:
   [GNOME API Documentation](https://docs.gtk.org/gio/class.VolumeMonitor.html)
 - GIO mount semantics:

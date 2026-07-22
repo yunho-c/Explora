@@ -47,11 +47,11 @@ dispatch2 = "0.3.1"
 objc2 = "0.6.4"
 objc2-core-foundation = "0.3.2"
 objc2-disk-arbitration = "0.3.2"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSString", "NSURL", "NSValue"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL", "NSValue"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5.12.0", default-features = false, features = ["blocking"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62.2", features = ["Storage_Provider", "Win32_Foundation", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_WinRT"] }
+windows = { version = "0.62.2", features = ["Storage_Provider", "Win32_Foundation", "Win32_Security", "Win32_Storage_CloudFilters", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_WinRT"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }

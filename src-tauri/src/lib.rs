@@ -1,4 +1,5 @@
 mod commands;
+mod content_request;
 mod filesystem;
 mod local_filesystem;
 mod manual_synced_folders;
@@ -190,6 +191,8 @@ pub fn run() {
             commands::list_directory,
             commands::cancel_listing,
             commands::prepare_preview,
+            commands::request_content,
+            commands::cancel_content_request,
             commands::cancel_preview,
             commands::read_preview_resource,
             commands::discard_preview_resource,

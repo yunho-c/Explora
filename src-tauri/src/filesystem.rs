@@ -31,6 +31,21 @@ pub enum PreviewUnavailableReason {
     TimedOut,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentRequestIntent {
+    DownloadToPreview,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentRequestCapabilityDto {
+    pub intent: ContentRequestIntent,
+    /// False means cancellation ends Explora's wait only. It must not be
+    /// presented as proof that the operating system stopped downloading.
+    pub provider_work_cancellable: bool,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(
     tag = "type",
@@ -41,6 +56,7 @@ pub enum PreviewContentDto {
     Metadata {
         reason: PreviewUnavailableReason,
         message: String,
+        request_content: Option<ContentRequestCapabilityDto>,
     },
     Text {
         text: String,
@@ -195,6 +211,18 @@ pub enum ContentAvailability {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "event",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ContentRequestEventDto {
+    Started { provider_work_cancellable: bool },
+    Progress { availability: ContentAvailability },
+    Complete { availability: ContentAvailability },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntrySummaryDto {
     pub reference: EntryRefDto,
@@ -238,6 +266,7 @@ pub enum ExplorerErrorCode {
     PermissionDenied,
     NotDirectory,
     Cancelled,
+    TimedOut,
     Offline,
     AuthenticationFailed,
     HostKeyFailure,
@@ -259,6 +288,8 @@ pub enum ExplorerError {
     InvalidReference,
     #[error("The request was cancelled.")]
     Cancelled,
+    #[error("{0}")]
+    TimedOut(String),
     #[error("Explora's filesystem state is unavailable.")]
     StateUnavailable,
     #[error("{message}")]
@@ -296,6 +327,7 @@ impl From<ExplorerError> for ExplorerErrorDto {
         let code = match &error {
             ExplorerError::InvalidReference => ExplorerErrorCode::InvalidReference,
             ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
+            ExplorerError::TimedOut(_) => ExplorerErrorCode::TimedOut,
             ExplorerError::Io { kind, .. } => match kind {
                 std::io::ErrorKind::NotFound => ExplorerErrorCode::NotFound,
                 std::io::ErrorKind::PermissionDenied => ExplorerErrorCode::PermissionDenied,

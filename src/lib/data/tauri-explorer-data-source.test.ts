@@ -497,6 +497,121 @@ describe("TauriExplorerDataSource", () => {
     expect(() => prepared.dispose()).not.toThrow();
   });
 
+  it("validates an explicit content-request capability on preview metadata", async () => {
+    mockIPC((command) =>
+      command === "prepare_preview"
+        ? {
+            entryId: previewEntry.reference.id,
+            size: previewEntry.size,
+            modifiedAt: previewEntry.modifiedAt,
+            content: {
+              type: "metadata",
+              reason: "downloadRequired",
+              message: "Download this file explicitly.",
+              requestContent: {
+                intent: "downloadToPreview",
+                providerWorkCancellable: false,
+              },
+            },
+          }
+        : null,
+    );
+
+    const prepared = await new TauriExplorerDataSource().getPreview(
+      { ...previewEntry, availability: "onlineOnly" },
+      {
+        signal: new AbortController().signal,
+        imageMode: "direct",
+      },
+    );
+
+    expect(prepared.preview.content).toMatchObject({
+      type: "metadata",
+      reason: "downloadRequired",
+      requestContent: {
+        intent: "downloadToPreview",
+        providerWorkCancellable: false,
+      },
+    });
+  });
+
+  it("streams validated content-request state and completion", async () => {
+    const events: unknown[] = [];
+    mockIPC((command, payload) => {
+      if (command === "request_content") {
+        if (!payload || typeof payload !== "object") {
+          throw new Error("Expected content request arguments.");
+        }
+        sendChannelMessages(Reflect.get(payload, "onEvent"), [
+          { event: "started", providerWorkCancellable: false },
+          { event: "progress", availability: "onlineOnly" },
+          { event: "progress", availability: "downloading" },
+          { event: "complete", availability: "local" },
+        ]);
+      }
+      return null;
+    });
+
+    await new TauriExplorerDataSource().requestContent(
+      {
+        ...previewEntry,
+        reference: {
+          ...previewEntry.reference,
+          locationId: "synced:icloud",
+        },
+        availability: "onlineOnly",
+      },
+      {
+        signal: new AbortController().signal,
+        onEvent: (event) => events.push(event),
+      },
+    );
+
+    expect(events).toEqual([
+      { event: "started", providerWorkCancellable: false },
+      { event: "progress", availability: "onlineOnly" },
+      { event: "progress", availability: "downloading" },
+      { event: "complete", availability: "local" },
+    ]);
+  });
+
+  it("stops waiting for an active content request through Rust", async () => {
+    let finishRequest = () => {};
+    let eventChannel: unknown;
+    const commands: string[] = [];
+    mockIPC((command, payload) => {
+      commands.push(command);
+      if (command === "request_content") {
+        if (!payload || typeof payload !== "object") {
+          throw new Error("Expected content request arguments.");
+        }
+        eventChannel = Reflect.get(payload, "onEvent");
+        return new Promise<void>((resolve) => {
+          finishRequest = resolve;
+        });
+      }
+      if (command === "cancel_content_request") finishRequest();
+      return null;
+    });
+    const source = new TauriExplorerDataSource();
+    const controller = new AbortController();
+    const request = source.requestContent(previewEntry, {
+      signal: controller.signal,
+      onEvent: () => {},
+    });
+
+    controller.abort();
+    expect(commands).not.toContain("cancel_content_request");
+    sendChannelMessages(
+      eventChannel,
+      [{ event: "started", providerWorkCancellable: false }],
+      false,
+    );
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect(commands).toContain("cancel_content_request");
+  });
+
   it("loads raw image bytes and revokes the Blob URL on disposal", async () => {
     const createObjectUrl = vi
       .spyOn(URL, "createObjectURL")

@@ -3,6 +3,8 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   BreadcrumbSegment,
   ContentAvailability,
+  ContentRequestCapability,
+  ContentRequestEvent,
   ContentKind,
   DirectoryRef,
   EntryKind,
@@ -35,6 +37,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RequestContentOptions,
   WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
@@ -502,6 +505,7 @@ interface PreparedPreviewPayload {
         type: "metadata";
         reason: PreviewUnavailableReason;
         message: string;
+        requestContent: ContentRequestCapability | null;
       }
     | {
         type: "text";
@@ -561,6 +565,25 @@ const requirePreviewDimension = (
   return value;
 };
 
+const parseContentRequestCapability = (
+  value: unknown,
+): ContentRequestCapability | null => {
+  if (value === null) return null;
+  if (
+    !isRecord(value) ||
+    value.intent !== "downloadToPreview" ||
+    typeof value.providerWorkCancellable !== "boolean"
+  ) {
+    throw new Error(
+      "Invalid preview response: content request capability is malformed.",
+    );
+  }
+  return {
+    intent: value.intent,
+    providerWorkCancellable: value.providerWorkCancellable,
+  };
+};
+
 const parsePreparedPreview = (
   value: unknown,
   expectedEntryId: string,
@@ -591,6 +614,9 @@ const parsePreparedPreview = (
         type,
         reason: reason as PreviewUnavailableReason,
         message: requireString(value.content, "message"),
+        requestContent: parseContentRequestCapability(
+          value.content.requestContent,
+        ),
       },
     };
   }
@@ -659,6 +685,42 @@ const parsePreparedPreview = (
   }
 
   throw new Error(`Invalid preview response: unknown content type ${type}.`);
+};
+
+const parseContentRequestEvent = (value: unknown): ContentRequestEvent => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid content request response: event is malformed.");
+  }
+  const event = requireString(value, "event");
+  if (event === "started") {
+    if (typeof value.providerWorkCancellable !== "boolean") {
+      throw new Error(
+        "Invalid content request response: cancellation capability is malformed.",
+      );
+    }
+    return {
+      event,
+      providerWorkCancellable: value.providerWorkCancellable,
+    };
+  }
+  if (event === "progress") {
+    const availability = requireString(value, "availability");
+    if (!contentAvailabilities.has(availability as ContentAvailability)) {
+      throw new Error(
+        "Invalid content request response: availability is malformed.",
+      );
+    }
+    return { event, availability: availability as ContentAvailability };
+  }
+  if (event === "complete") {
+    if (value.availability !== "local") {
+      throw new Error(
+        "Invalid content request response: completion is not local.",
+      );
+    }
+    return { event, availability: value.availability };
+  }
+  throw new Error(`Invalid content request response: unknown event ${event}.`);
 };
 
 const previewDetails = (
@@ -1302,6 +1364,65 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       }
       if (imageUrl) URL.revokeObjectURL(imageUrl);
       if (signal.aborted) throw abortError();
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  async requestContent(
+    entry: FileEntrySummary,
+    { signal, onEvent }: RequestContentOptions,
+  ): Promise<void> {
+    if (signal.aborted) throw abortError();
+    const id = requestId();
+    const channel = new Channel<unknown>();
+    let payloadError: Error | null = null;
+    let registered = false;
+    const cancelRegistered = () => {
+      void invoke("cancel_content_request", { requestId: id }).catch(() => {
+        // Cancellation stops Explora's wait. OS-owned provider work may
+        // continue, as reported by the capability and started event.
+      });
+    };
+    const cancel = () => {
+      if (registered) cancelRegistered();
+    };
+    channel.onmessage = (payload) => {
+      if (payloadError) return;
+      try {
+        const event = parseContentRequestEvent(payload);
+        // Rust registers cancellation before publishing any event. Deferring
+        // an early AbortSignal until this handshake prevents cancellation from
+        // racing ahead of the native task registry.
+        registered = true;
+        if (signal.aborted) {
+          cancelRegistered();
+          return;
+        }
+        onEvent(event);
+      } catch (error) {
+        payloadError =
+          error instanceof Error
+            ? error
+            : new Error("Invalid content request response.");
+        cancelRegistered();
+      }
+    };
+
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      await invoke("request_content", {
+        requestId: id,
+        entryId: entry.reference.id,
+        locationId: entry.reference.locationId,
+        onEvent: channel,
+      });
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);

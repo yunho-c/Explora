@@ -20,7 +20,8 @@ use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::filesystem::{
-    ExplorerError, ImagePreviewMode, PreviewContentDto, PreviewResultDto, PreviewUnavailableReason,
+    ContentRequestCapabilityDto, ExplorerError, ImagePreviewMode, PreviewContentDto,
+    PreviewResultDto, PreviewUnavailableReason,
 };
 
 pub const MAX_TEXT_BYTES: usize = 256 * 1024;
@@ -995,6 +996,17 @@ pub fn metadata_result(
     reason: PreviewUnavailableReason,
     message: impl Into<String>,
 ) -> PreviewResultDto {
+    metadata_result_with_content_request(entry_id, size, modified_at, reason, message, None)
+}
+
+pub fn metadata_result_with_content_request(
+    entry_id: String,
+    size: Option<String>,
+    modified_at: Option<u64>,
+    reason: PreviewUnavailableReason,
+    message: impl Into<String>,
+    request_content: Option<ContentRequestCapabilityDto>,
+) -> PreviewResultDto {
     PreviewResultDto {
         entry_id,
         size,
@@ -1002,6 +1014,7 @@ pub fn metadata_result(
         content: PreviewContentDto::Metadata {
             reason,
             message: message.into(),
+            request_content,
         },
     }
 }

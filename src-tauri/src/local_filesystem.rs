@@ -12,6 +12,7 @@ use std::{
 
 use uuid::Uuid;
 
+use crate::content_request::ContentRequestPolicy;
 use crate::filesystem::{
     BreadcrumbSegmentDto, ContentAvailability, DirectoryListingEvent, DirectoryRefDto, EntryRefDto,
     ExplorerError, FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
@@ -107,6 +108,7 @@ pub struct LocalFilesystem {
 pub(crate) struct LocalPreviewAccess {
     pub path: PathBuf,
     pub availability: ContentAvailability,
+    pub content_request_policy: Option<ContentRequestPolicy>,
     pub size: Option<String>,
     pub modified_at: Option<u64>,
 }
@@ -359,6 +361,8 @@ impl LocalFilesystem {
         Ok(LocalPreviewAccess {
             path,
             availability,
+            content_request_policy: synced_availability
+                .and_then(SyncedAvailabilityPolicy::content_request_policy),
             size,
             modified_at,
         })
@@ -965,6 +969,7 @@ mod tests {
             .expect("file preview access");
         assert_eq!(file_access.path, file_path);
         assert_eq!(file_access.availability, ContentAvailability::Unknown);
+        assert_eq!(file_access.content_request_policy, None);
         assert_eq!(file_access.size.as_deref(), Some("0"));
 
         let directory_access = filesystem
@@ -1026,6 +1031,63 @@ mod tests {
                 .expect("preview access")
                 .availability,
             ContentAvailability::Local
+        );
+        assert_eq!(
+            filesystem
+                .resolve_preview_access(&file.reference.id, &location.id)
+                .expect("preview access")
+                .content_request_policy,
+            None
+        );
+    }
+
+    #[test]
+    fn icloud_policy_exposes_only_an_explicit_content_request() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("icloud-root");
+        fs::create_dir(&synced_path).expect("iCloud fixture root");
+        File::create(synced_path.join("placeholder.txt")).expect("placeholder fixture");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:icloud:test".to_owned(),
+                name: "iCloud Drive".to_owned(),
+                path: synced_path,
+                detail: "iCloud Drive · Synced folder".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::ICloud,
+                    status: crate::filesystem::SyncedFolderStatus::Available,
+                    source: crate::filesystem::SyncedFolderSource::System,
+                },
+                availability: SyncedAvailabilityPolicy::ICloud,
+            }])
+            .expect("synced snapshot")
+            .remove(0);
+        let mut file = None;
+
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        file = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "placeholder.txt");
+                    }
+                    Ok(())
+                },
+            )
+            .expect("iCloud listing");
+        let file = file.expect("listed placeholder");
+        let access = filesystem
+            .resolve_preview_access(&file.reference.id, &location.id)
+            .expect("preview access");
+
+        assert_eq!(access.availability, ContentAvailability::Unknown);
+        assert_eq!(
+            access.content_request_policy,
+            Some(ContentRequestPolicy::ICloud)
         );
     }
 

@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use crate::filesystem::ContentAvailability;
+use crate::{content_request::ContentRequestPolicy, filesystem::ContentAvailability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Each target constructs only its own platform policy in non-test builds.
@@ -10,6 +10,16 @@ pub(crate) enum SyncedAvailabilityPolicy {
     WindowsCloudFiles,
     LocalMirror,
     Unknown,
+}
+
+impl SyncedAvailabilityPolicy {
+    pub(crate) const fn content_request_policy(self) -> Option<ContentRequestPolicy> {
+        match self {
+            Self::ICloud => Some(ContentRequestPolicy::ICloud),
+            Self::WindowsCloudFiles => Some(ContentRequestPolicy::WindowsCloudFiles),
+            Self::LocalMirror | Self::Unknown => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -398,7 +398,7 @@ describe("ExplorerShell", () => {
     expect(screen.queryByText("/home/test/Sync")).not.toBeInTheDocument();
   });
 
-  it("labels online-only entries and requires a download before preview", async () => {
+  it("labels online-only entries and downloads only after explicit preview intent", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();
     await state.selectLocation("synced:icloud");
@@ -417,6 +417,25 @@ describe("ExplorerShell", () => {
         "Download this file before opening Quick Preview.",
       ),
     ).toBeInTheDocument();
+    await fireEvent.click(
+      within(previewDialog).getByRole("button", {
+        name: "Download to Preview",
+      }),
+    );
+    expect(
+      within(previewDialog).getByRole("button", { name: "Stop waiting" }),
+    ).toBeInTheDocument();
+    expect(
+      within(previewDialog).getByText(
+        "Stopping here will not stop the operating system download.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(state.preview?.content.type).toBe("pdf"));
+    expect(
+      within(previewDialog).queryByRole("button", {
+        name: "Download to Preview",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("opens Quick Preview with the Space key", async () => {

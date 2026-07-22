@@ -42,11 +42,27 @@ with the local filesystem boundary. It remains separate from `VolumeManager`
 because physical media and provider roots have different identity, lifecycle,
 availability, and user-action semantics.
 
-The first slice is read-only discovery and browsing. Listing may inspect locally
-available namespace metadata but must not open file content. If content is not
-available locally, preview and future operations return a typed state instead of
-silently triggering hydration. Explicit hydration, pinning, eviction, provider
-APIs, and application-owned synchronization require later vertical slices.
+Discovery and browsing remain read-only. Listing may inspect locally available
+namespace metadata but must not open file content. If content is not available
+locally, preview returns a typed state with an action only when the Rust-owned
+access policy supports an explicit operating-system content request. Pinning,
+eviction, provider service APIs, and application-owned synchronization remain out
+of scope.
+
+Explicit preview hydration is a bounded task, not an implicit file open. A typed
+`request_content` command revalidates the opaque entry, starts either the macOS
+iCloud ubiquitous-item request or Windows Cloud Files hydration on a blocking
+worker, publishes only authoritative availability changes, and waits for a
+current local copy. Completion revalidates the same entry again before reopening
+the existing bounded preview pipeline. The adapters are selected by internal
+access policy, never the displayed provider name.
+
+The current operating-system requests are not represented as safely cancellable.
+Cancelling the Explora task stops waiting and releases its task state, while the
+provider-owned download may continue. Requests time out after a fixed bound and
+report a structured error without exposing provider paths. Third-party macOS
+File Provider roots retain unknown availability and receive no download action
+until a documented provider-neutral client API is accepted.
 
 Platform adapters use the strongest provider-neutral facility available:
 
@@ -78,6 +94,9 @@ it never deletes or modifies the selected directory.
   webview receives no generic dialog or filesystem permission.
 - Metadata, preview, search, and thumbnail work may not trigger unbounded or
   implicit hydration.
+- Only the explicit preview action may invoke the native iCloud or Cloud Files
+  content-request adapters; normal listing and availability inspection remain
+  metadata-only.
 - Unsupported platforms and unavailable providers report honest capability and
   status rather than falling back to provider-name checks.
 

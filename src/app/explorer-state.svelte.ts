@@ -1,5 +1,6 @@
 import type {
   BreadcrumbSegment,
+  ContentAvailability,
   DirectoryRef,
   ExplorerTab,
   FileEntrySummary,
@@ -67,6 +68,11 @@ export interface PendingSshPrompt {
   respond: (response: SshPromptResponse) => Promise<void>;
 }
 
+export interface PreviewContentRequestState {
+  availability: ContentAvailability;
+  providerWorkCancellable: boolean;
+}
+
 export class ExplorerState {
   locations = $state<LocationSummary[]>([]);
   sshTargets = $state<SshTargetSummary[]>([]);
@@ -89,6 +95,8 @@ export class ExplorerState {
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
+  previewContentRequest = $state<PreviewContentRequestState | null>(null);
+  previewContentRequestMessage = $state<string | null>(null);
   imagePreviewMode = $state<ImagePreviewMode>("direct");
   sidebarCollapsed = $state(false);
   favoriteRoles = $state<FavoriteRole[]>([...DEFAULT_FAVORITE_ROLES]);
@@ -110,6 +118,7 @@ export class ExplorerState {
 
   private directoryController: AbortController | null = null;
   private previewController: AbortController | null = null;
+  private previewContentRequestController: AbortController | null = null;
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
   private volumeWatchController: AbortController | null = null;
@@ -1082,6 +1091,10 @@ export class ExplorerState {
     this.previewOpen = true;
     this.previewLoading = true;
     this.preview = null;
+    this.previewContentRequestController?.abort();
+    this.previewContentRequestController = null;
+    this.previewContentRequest = null;
+    this.previewContentRequestMessage = null;
     this.previewController?.abort();
     this.disposePreview();
     const controller = new AbortController();
@@ -1112,6 +1125,7 @@ export class ExplorerState {
               error instanceof Error
                 ? error.message
                 : "Explora could not prepare this preview.",
+            requestContent: null,
           },
           details: [],
         };
@@ -1124,10 +1138,97 @@ export class ExplorerState {
   closePreview(): void {
     this.previewController?.abort();
     this.previewController = null;
+    this.previewContentRequestController?.abort();
+    this.previewContentRequestController = null;
     this.disposePreview();
     this.previewOpen = false;
     this.previewLoading = false;
     this.preview = null;
+    this.previewContentRequest = null;
+    this.previewContentRequestMessage = null;
+  }
+
+  async requestPreviewContent(): Promise<void> {
+    const preview = this.preview;
+    if (
+      !preview ||
+      preview.content.type !== "metadata" ||
+      preview.content.reason !== "downloadRequired" ||
+      !preview.content.requestContent
+    ) {
+      return;
+    }
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === preview.entryId,
+    );
+    if (!entry) return;
+
+    this.previewContentRequestController?.abort();
+    const controller = new AbortController();
+    this.previewContentRequestController = controller;
+    this.previewContentRequestMessage = null;
+    this.previewContentRequest = {
+      availability: entry.availability,
+      providerWorkCancellable:
+        preview.content.requestContent.providerWorkCancellable,
+    };
+    let providerWorkStarted = false;
+
+    try {
+      await this.dataSource.requestContent(entry, {
+        signal: controller.signal,
+        onEvent: (event) => {
+          if (this.previewContentRequestController !== controller) return;
+          if (event.event === "started") {
+            providerWorkStarted = true;
+            this.previewContentRequest = {
+              availability:
+                this.previewContentRequest?.availability ?? entry.availability,
+              providerWorkCancellable: event.providerWorkCancellable,
+            };
+          } else {
+            this.previewContentRequest = {
+              availability: event.availability,
+              providerWorkCancellable:
+                this.previewContentRequest?.providerWorkCancellable ?? false,
+            };
+          }
+        },
+      });
+      if (this.previewContentRequestController !== controller) return;
+      this.previewContentRequestController = null;
+      this.previewContentRequest = null;
+      await this.openPreview(entry.reference.id);
+    } catch (error) {
+      if (this.previewContentRequestController !== controller) return;
+      this.previewContentRequestController = null;
+      const providerWorkCancellable =
+        this.previewContentRequest?.providerWorkCancellable ?? false;
+      this.previewContentRequest = null;
+      if (!isAbortError(error)) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Explora could not request this file's content.";
+        this.previewContentRequestMessage =
+          providerWorkStarted && !providerWorkCancellable
+            ? `${message} The operating system may continue downloading it.`
+            : message;
+      }
+    }
+  }
+
+  stopWaitingForPreviewContent(): void {
+    const controller = this.previewContentRequestController;
+    if (!controller) return;
+    const providerWorkCancellable =
+      this.previewContentRequest?.providerWorkCancellable ?? false;
+    this.previewContentRequestController = null;
+    this.previewContentRequest = null;
+    this.previewContentRequestMessage = providerWorkCancellable
+      ? "Explora requested cancellation. The provider may still finish the download."
+      : "Explora stopped waiting. The operating system may continue downloading this file.";
+    controller.abort();
   }
 
   async setImagePreviewMode(mode: ImagePreviewMode): Promise<void> {
@@ -1150,6 +1251,7 @@ export class ExplorerState {
         type: "metadata",
         reason: "malformed",
         message: "This image could not be rendered by the system WebView.",
+        requestContent: null,
       },
     };
   }

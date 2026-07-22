@@ -4,21 +4,24 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{Duration, Instant},
 };
 
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::{
+    content_request::{ContentRequestManager, ContentRequestPolicy},
     filesystem::{
-        ContentAvailability, DirectoryListingEvent, ExplorerError, ExplorerErrorDto,
+        ContentAvailability, ContentRequestCapabilityDto, ContentRequestEventDto,
+        ContentRequestIntent, DirectoryListingEvent, ExplorerError, ExplorerErrorDto,
         ImagePreviewMode, LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
     },
     local_filesystem::LocalFilesystem,
     preferences::{
         PreferencesSnapshotDto, PreferencesStore, UserPreferencesDto, UserPreferencesPatchDto,
     },
-    preview::{metadata_result, PreviewManager},
+    preview::{metadata_result, metadata_result_with_content_request, PreviewManager},
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
     synced_folders::{SyncedFolderManager, SyncedFolderSnapshotEventDto},
@@ -31,6 +34,7 @@ pub struct AppState {
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
     preview: Arc<PreviewManager>,
+    content_requests: Arc<ContentRequestManager>,
     volumes: Arc<VolumeManager>,
     synced_folders: Arc<SyncedFolderManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -50,6 +54,7 @@ impl AppState {
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
             preview: Arc::new(PreviewManager::default()),
+            content_requests: Arc::new(ContentRequestManager::default()),
             volumes,
             synced_folders,
             listings: Mutex::new(HashMap::new()),
@@ -88,6 +93,9 @@ impl AppState {
         Ok(())
     }
 }
+
+const CONTENT_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const CONTENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn validate_request_id(request_id: &str) -> Result<(), ExplorerError> {
     if request_id.is_empty() || request_id.len() > 128 {
@@ -467,12 +475,16 @@ pub async fn prepare_preview(
         .map_err(|error| local_preview_error(error, synced_location))?;
 
     if access.availability != ContentAvailability::Local {
-        return Ok(metadata_result(
+        let request_content = access
+            .content_request_policy
+            .map(content_request_capability);
+        return Ok(metadata_result_with_content_request(
             entry_id,
             access.size,
             access.modified_at,
             PreviewUnavailableReason::DownloadRequired,
             synced_preview_message(access.availability),
+            request_content,
         ));
     }
 
@@ -481,6 +493,56 @@ pub async fn prepare_preview(
         .prepare_local(request_id, entry_id, access.path, image_mode)
         .await
         .map_err(|error| local_preview_error(error, synced_location))
+}
+
+fn content_request_capability(_policy: ContentRequestPolicy) -> ContentRequestCapabilityDto {
+    ContentRequestCapabilityDto {
+        intent: ContentRequestIntent::DownloadToPreview,
+        // The current adapters hand work to the operating system. Cancelling
+        // this task stops Explora from waiting but does not prove the provider
+        // stopped its request.
+        provider_work_cancellable: false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentRequestPollAction {
+    Continue,
+    Complete,
+    InvalidReference,
+    AvailabilityError,
+    ProviderError,
+    TimedOut,
+}
+
+fn content_request_poll_action(
+    expected_policy: ContentRequestPolicy,
+    current_policy: Option<ContentRequestPolicy>,
+    availability: ContentAvailability,
+    has_provider_error: bool,
+    timed_out: bool,
+) -> ContentRequestPollAction {
+    if current_policy != Some(expected_policy) {
+        return ContentRequestPollAction::InvalidReference;
+    }
+    if availability == ContentAvailability::Local {
+        return ContentRequestPollAction::Complete;
+    }
+    if availability == ContentAvailability::Error {
+        return ContentRequestPollAction::AvailabilityError;
+    }
+    if has_provider_error
+        && !matches!(
+            availability,
+            ContentAvailability::Downloading | ContentAvailability::Syncing
+        )
+    {
+        return ContentRequestPollAction::ProviderError;
+    }
+    if timed_out {
+        return ContentRequestPollAction::TimedOut;
+    }
+    ContentRequestPollAction::Continue
 }
 
 fn local_preview_error(error: ExplorerError, synced_location: bool) -> ExplorerErrorDto {
@@ -513,6 +575,171 @@ fn synced_preview_message(availability: ContentAvailability) -> &'static str {
         }
         ContentAvailability::Local => "This file is available locally.",
     }
+}
+
+#[tauri::command]
+pub async fn request_content(
+    state: State<'_, AppState>,
+    request_id: String,
+    entry_id: String,
+    location_id: String,
+    on_event: Channel<ContentRequestEventDto>,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
+
+    let synced_location = state
+        .local
+        .is_synced_folder(&location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    if !synced_location {
+        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+    }
+
+    let initial = state
+        .local
+        .resolve_preview_access(&entry_id, &location_id)
+        .map_err(|error| local_preview_error(error, true))?;
+    let policy = initial.content_request_policy.ok_or_else(|| {
+        ExplorerErrorDto::from(ExplorerError::Unsupported(
+            "This synced folder does not support explicit content requests.".to_owned(),
+        ))
+    })?;
+
+    // A stale UI action may race with provider completion. Treat an already
+    // local item as an idempotent success without starting more provider work.
+    if initial.availability == ContentAvailability::Local {
+        send_content_request_event(
+            &on_event,
+            ContentRequestEventDto::Started {
+                provider_work_cancellable: false,
+            },
+        )?;
+        return send_content_request_event(
+            &on_event,
+            ContentRequestEventDto::Complete {
+                availability: ContentAvailability::Local,
+            },
+        );
+    }
+
+    // Register cancellation before publishing Started so a fast UI stop
+    // cannot race ahead of the task registry.
+    let mut request = state
+        .content_requests
+        .begin(request_id, policy, initial.path)
+        .map_err(ExplorerErrorDto::from)?;
+
+    send_content_request_event(
+        &on_event,
+        ContentRequestEventDto::Started {
+            provider_work_cancellable: false,
+        },
+    )?;
+
+    send_content_request_event(
+        &on_event,
+        ContentRequestEventDto::Progress {
+            availability: initial.availability,
+        },
+    )?;
+
+    let started_at = Instant::now();
+    let mut last_availability = initial.availability;
+    let mut provider_error = None;
+
+    loop {
+        if request.is_cancelled() {
+            return Err(ExplorerErrorDto::from(ExplorerError::Cancelled));
+        }
+        if let Some(Err(error)) = request.take_provider_result() {
+            provider_error = Some(error);
+        }
+        tokio::time::sleep(CONTENT_REQUEST_POLL_INTERVAL).await;
+
+        // Re-resolving the opaque entry catches removal, replacement by a
+        // non-file, an offline root, and policy changes before preview reads.
+        let current = state
+            .local
+            .resolve_preview_access(&entry_id, &location_id)
+            .map_err(|error| local_preview_error(error, true))?;
+        match content_request_poll_action(
+            policy,
+            current.content_request_policy,
+            current.availability,
+            provider_error.is_some(),
+            started_at.elapsed() >= CONTENT_REQUEST_TIMEOUT,
+        ) {
+            ContentRequestPollAction::Continue => {
+                // A provider request can race with an already active system
+                // download. Once authoritative state says work is underway,
+                // its redundant start error no longer controls the wait.
+                provider_error = None;
+            }
+            ContentRequestPollAction::Complete => {
+                return send_content_request_event(
+                    &on_event,
+                    ContentRequestEventDto::Complete {
+                        availability: ContentAvailability::Local,
+                    },
+                );
+            }
+            ContentRequestPollAction::InvalidReference => {
+                return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+            }
+            ContentRequestPollAction::AvailabilityError => {
+                return Err(ExplorerErrorDto::from(ExplorerError::Unexpected(
+                    "The operating system reported a download error for this file.".to_owned(),
+                )));
+            }
+            ContentRequestPollAction::ProviderError => {
+                let error = match provider_error.take() {
+                    Some(error) => error,
+                    None => ExplorerError::Unexpected(
+                        "The operating system content request failed.".to_owned(),
+                    ),
+                };
+                return Err(local_preview_error(error, true));
+            }
+            ContentRequestPollAction::TimedOut => {
+                return Err(ExplorerErrorDto::from(ExplorerError::TimedOut(
+                    "Explora stopped waiting because this download took too long. The operating system may continue downloading it."
+                        .to_owned(),
+                )));
+            }
+        }
+        if current.availability != last_availability {
+            last_availability = current.availability;
+            send_content_request_event(
+                &on_event,
+                ContentRequestEventDto::Progress {
+                    availability: current.availability,
+                },
+            )?;
+        }
+    }
+}
+
+fn send_content_request_event(
+    channel: &Channel<ContentRequestEventDto>,
+    event: ContentRequestEventDto,
+) -> Result<(), ExplorerErrorDto> {
+    channel
+        .send(event)
+        .map_err(|_| ExplorerErrorDto::from(ExplorerError::ChannelClosed))
+}
+
+#[tauri::command]
+pub fn cancel_content_request(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .content_requests
+        .cancel(&request_id)
+        .map_err(ExplorerErrorDto::from)
 }
 
 #[tauri::command]
@@ -585,6 +812,94 @@ mod tests {
             message: "failed".to_owned(),
         };
         assert_eq!(error.code, crate::filesystem::ExplorerErrorCode::Unexpected);
+    }
+
+    #[test]
+    fn content_request_contract_is_explicit_and_never_claims_provider_cancellation() {
+        let capability = content_request_capability(ContentRequestPolicy::ICloud);
+        let capability_json = serde_json::to_value(capability).expect("serialize capability");
+        assert_eq!(capability_json["intent"], "downloadToPreview");
+        assert_eq!(capability_json["providerWorkCancellable"], false);
+
+        let progress = serde_json::to_value(ContentRequestEventDto::Progress {
+            availability: ContentAvailability::Downloading,
+        })
+        .expect("serialize progress");
+        assert_eq!(progress["event"], "progress");
+        assert_eq!(progress["availability"], "downloading");
+
+        let timeout = ExplorerErrorDto::from(ExplorerError::TimedOut("slow".to_owned()));
+        assert_eq!(timeout.code, crate::filesystem::ExplorerErrorCode::TimedOut);
+    }
+
+    #[test]
+    fn content_request_polling_prioritizes_revalidation_over_timeout() {
+        let policy = ContentRequestPolicy::ICloud;
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(policy),
+                ContentAvailability::Local,
+                false,
+                true,
+            ),
+            ContentRequestPollAction::Complete
+        );
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(ContentRequestPolicy::WindowsCloudFiles),
+                ContentAvailability::Local,
+                false,
+                false,
+            ),
+            ContentRequestPollAction::InvalidReference
+        );
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(policy),
+                ContentAvailability::OnlineOnly,
+                false,
+                true,
+            ),
+            ContentRequestPollAction::TimedOut
+        );
+    }
+
+    #[test]
+    fn content_request_polling_handles_provider_and_availability_errors_honestly() {
+        let policy = ContentRequestPolicy::WindowsCloudFiles;
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(policy),
+                ContentAvailability::OnlineOnly,
+                true,
+                false,
+            ),
+            ContentRequestPollAction::ProviderError
+        );
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(policy),
+                ContentAvailability::Downloading,
+                true,
+                false,
+            ),
+            ContentRequestPollAction::Continue
+        );
+        assert_eq!(
+            content_request_poll_action(
+                policy,
+                Some(policy),
+                ContentAvailability::Error,
+                false,
+                false,
+            ),
+            ContentRequestPollAction::AvailabilityError
+        );
     }
 
     #[test]

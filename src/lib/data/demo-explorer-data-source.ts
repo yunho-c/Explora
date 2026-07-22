@@ -17,6 +17,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RequestContentOptions,
   WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
@@ -690,6 +691,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   ];
   private dynamicLocations = new Map<string, LocationSummary>();
   private dynamicRoots = new Map<string, DirectoryRef>();
+  private hydratedEntryIds = new Set<string>();
 
   async listLocations(
     signal: AbortSignal,
@@ -916,17 +918,25 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       ({ id }) => id === entry.reference.locationId,
     );
     let content: PreviewContent;
-    if (entry.availability !== "local") {
+    if (
+      entry.availability !== "local" &&
+      !this.hydratedEntryIds.has(entry.reference.id)
+    ) {
       content = {
         type: "metadata",
         reason: "downloadRequired",
         message: "Download this file before opening Quick Preview.",
+        requestContent: {
+          intent: "downloadToPreview",
+          providerWorkCancellable: false,
+        },
       };
     } else if (location?.backend === "ssh") {
       content = {
         type: "metadata",
         reason: "remote",
         message: "Remote content preview is not available yet.",
+        requestContent: null,
       };
     } else if (entry.contentKind === "image") {
       content = {
@@ -962,6 +972,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         message:
           excerpts[entry.contentKind] ??
           "Content preview is not available for this file type yet.",
+        requestContent: null,
       };
     }
     return {
@@ -987,5 +998,21 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       },
       dispose: () => {},
     };
+  }
+
+  async requestContent(
+    entry: FileEntrySummary,
+    { signal, onEvent }: RequestContentOptions,
+  ): Promise<void> {
+    if (entry.reference.locationId !== "synced:icloud") {
+      throw new Error("This demo location cannot request cloud content.");
+    }
+    onEvent({ event: "started", providerWorkCancellable: false });
+    onEvent({ event: "progress", availability: entry.availability });
+    await wait(120, signal);
+    onEvent({ event: "progress", availability: "downloading" });
+    await wait(180, signal);
+    this.hydratedEntryIds.add(entry.reference.id);
+    onEvent({ event: "complete", availability: "local" });
   }
 }
