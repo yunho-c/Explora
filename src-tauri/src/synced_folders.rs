@@ -78,6 +78,7 @@ struct SyncedFolderCandidate {
     identity: Vec<u8>,
     path: PathBuf,
     provider: SyncedFolderProvider,
+    status: SyncedFolderStatus,
     availability: SyncedAvailabilityPolicy,
 }
 
@@ -272,6 +273,7 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
             identity: path_identity(&icloud),
             path: icloud,
             provider: SyncedFolderProvider::ICloud,
+            status: SyncedFolderStatus::Available,
             availability: SyncedAvailabilityPolicy::ICloud,
         });
     }
@@ -296,6 +298,7 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
                     identity: path_identity(&path),
                     path,
                     provider,
+                    status: SyncedFolderStatus::Available,
                     availability: SyncedAvailabilityPolicy::Unknown,
                 });
             }
@@ -358,10 +361,10 @@ fn roots_from_candidates(
             id,
             name,
             path: candidate.path,
-            detail: format!("{} · Synced folder", candidate.provider.display_name()),
+            detail: synced_folder_detail(candidate.provider, candidate.status),
             metadata: SyncedFolderMetadataDto {
                 provider: candidate.provider,
-                status: SyncedFolderStatus::Available,
+                status: candidate.status,
                 source: SyncedFolderSource::System,
             },
             availability: candidate.availability,
@@ -388,11 +391,51 @@ fn discover_windows_roots() -> Result<Vec<SyncedFolderRoot>, ExplorerError> {
             provider: provider_from_windows_registration_provider_id(
                 &root.registration_provider_id,
             ),
+            status: synced_status_from_windows_provider_status(root.provider_status),
             availability: SyncedAvailabilityPolicy::WindowsCloudFiles,
         });
     }
 
     roots_from_candidates(candidates)
+}
+
+fn synced_folder_detail(provider: SyncedFolderProvider, status: SyncedFolderStatus) -> String {
+    let state = match status {
+        SyncedFolderStatus::Available => "Synced folder",
+        SyncedFolderStatus::Offline => "Provider offline",
+        SyncedFolderStatus::Paused => "Sync paused",
+        SyncedFolderStatus::Error => "Provider error",
+        SyncedFolderStatus::Unknown => "Provider status unknown",
+    };
+    format!("{} · {state}", provider.display_name())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn synced_status_from_windows_provider_status(status: Option<u32>) -> SyncedFolderStatus {
+    const DISCONNECTED: u32 = 0x0000_0000;
+    const IDLE: u32 = 0x0000_0001;
+    const POPULATE_NAMESPACE: u32 = 0x0000_0002;
+    const POPULATE_METADATA: u32 = 0x0000_0004;
+    const POPULATE_CONTENT: u32 = 0x0000_0008;
+    const SYNC_INCREMENTAL: u32 = 0x0000_0010;
+    const SYNC_FULL: u32 = 0x0000_0020;
+    const CONNECTIVITY_LOST: u32 = 0x0000_0040;
+    const TERMINATED: u32 = 0xC000_0001;
+    const ERROR: u32 = 0xC000_0002;
+    const ACTIVE: u32 = IDLE
+        | POPULATE_NAMESPACE
+        | POPULATE_METADATA
+        | POPULATE_CONTENT
+        | SYNC_INCREMENTAL
+        | SYNC_FULL;
+
+    match status {
+        Some(ERROR) => SyncedFolderStatus::Error,
+        Some(DISCONNECTED) | Some(TERMINATED) => SyncedFolderStatus::Offline,
+        Some(raw) if raw & CONNECTIVITY_LOST != 0 => SyncedFolderStatus::Offline,
+        Some(raw) if raw & ACTIVE != 0 => SyncedFolderStatus::Available,
+        Some(_) | None => SyncedFolderStatus::Unknown,
+    }
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -537,6 +580,56 @@ mod tests {
     }
 
     #[test]
+    fn maps_windows_provider_status_without_guessing_unknown_values() {
+        assert_eq!(
+            synced_status_from_windows_provider_status(None),
+            SyncedFolderStatus::Unknown
+        );
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0)),
+            SyncedFolderStatus::Offline
+        );
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0x40 | 0x01)),
+            SyncedFolderStatus::Offline
+        );
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0xC000_0001)),
+            SyncedFolderStatus::Offline
+        );
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0xC000_0002)),
+            SyncedFolderStatus::Error
+        );
+        for status in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x31] {
+            assert_eq!(
+                synced_status_from_windows_provider_status(Some(status)),
+                SyncedFolderStatus::Available
+            );
+        }
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0x8000_0000)),
+            SyncedFolderStatus::Unknown
+        );
+        assert_eq!(
+            synced_status_from_windows_provider_status(Some(0x80)),
+            SyncedFolderStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn provider_details_expose_only_sanitized_status() {
+        assert_eq!(
+            synced_folder_detail(SyncedFolderProvider::OneDrive, SyncedFolderStatus::Offline),
+            "OneDrive · Provider offline"
+        );
+        assert_eq!(
+            synced_folder_detail(SyncedFolderProvider::GoogleDrive, SyncedFolderStatus::Error),
+            "Google Drive · Provider error"
+        );
+    }
+
+    #[test]
     fn normalizes_platform_candidates_with_private_stable_identities() {
         let temp = TempDir::new().expect("temporary roots");
         let one = temp.path().join("one");
@@ -547,18 +640,21 @@ mod tests {
                 identity: b"OneDrive!private-account-one".to_vec(),
                 path: one,
                 provider: SyncedFolderProvider::OneDrive,
+                status: SyncedFolderStatus::Available,
                 availability: SyncedAvailabilityPolicy::Unknown,
             },
             SyncedFolderCandidate {
                 identity: b"OneDrive!private-account-two".to_vec(),
                 path: two,
                 provider: SyncedFolderProvider::OneDrive,
+                status: SyncedFolderStatus::Available,
                 availability: SyncedAvailabilityPolicy::Unknown,
             },
             SyncedFolderCandidate {
                 identity: b"duplicate-registration".to_vec(),
                 path: duplicate_path,
                 provider: SyncedFolderProvider::Other,
+                status: SyncedFolderStatus::Available,
                 availability: SyncedAvailabilityPolicy::Unknown,
             },
         ])

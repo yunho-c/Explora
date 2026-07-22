@@ -8,6 +8,7 @@ import type {
   ContentKind,
   DirectoryRef,
   EntryKind,
+  ExplorerFilesystemErrorCode,
   FileEntrySummary,
   ImagePreviewMode,
   LocationKind,
@@ -31,6 +32,7 @@ import type {
   SyncedFolderStatus,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
+import { ExplorerFilesystemError } from "$lib/data/explorer-data-source";
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
@@ -68,6 +70,23 @@ const contentAvailabilities = new Set<ContentAvailability>([
   "error",
   "unknown",
 ]);
+const explorerFilesystemErrorCodes: ReadonlySet<string> =
+  new Set<ExplorerFilesystemErrorCode>([
+    "invalidReference",
+    "staleReference",
+    "notFound",
+    "permissionDenied",
+    "notDirectory",
+    "cancelled",
+    "timedOut",
+    "offline",
+    "unavailable",
+    "authenticationFailed",
+    "hostKeyFailure",
+    "unsupported",
+    "invalidConfiguration",
+    "unexpected",
+  ]);
 const locationBackends = new Set<LocationBackend>(["local", "gio", "ssh"]);
 const locationKinds = new Set<LocationKind>([
   "local",
@@ -861,8 +880,19 @@ const abortError = () => {
   return error;
 };
 
+const isExplorerFilesystemErrorCode = (
+  value: unknown,
+): value is ExplorerFilesystemErrorCode =>
+  typeof value === "string" && explorerFilesystemErrorCodes.has(value);
+
 const commandError = (error: unknown): Error => {
   if (isRecord(error) && typeof error.message === "string") {
+    if (
+      isExplorerFilesystemErrorCode(error.code) &&
+      error.code !== "cancelled"
+    ) {
+      return new ExplorerFilesystemError(error.code, error.message);
+    }
     const result = new Error(error.message);
     result.name =
       error.code === "cancelled" ? "AbortError" : "ExplorerFilesystemError";

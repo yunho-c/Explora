@@ -134,6 +134,31 @@ discovery pattern. Removing a root revokes its opaque references before the new
 snapshot is published. Open tabs retain an offline tombstone so a transient sync
 client restart does not discard user context.
 
+Backends keep a bounded tombstone history containing opaque location/reference
+IDs only. Lifecycle failures have deliberately different meanings:
+
+- `invalidReference` means the identity was never valid for that location (or
+  was claimed under the wrong location).
+- `unavailable` means a recently known provider root or mounted volume was
+  removed. A still-configured manual root that cannot currently be reached uses
+  `offline` instead.
+- `staleReference` means the location is active again, but the caller retained
+  an entry token from an earlier root lifetime and must refresh it.
+
+The history is capped and may eventually forget old tombstones; it does not
+retain filesystem paths, provider URIs, or account labels. The TypeScript data
+source preserves recognized structured codes on `ExplorerFilesystemError` so UI
+recovery does not need to parse human-readable messages. An `unavailable` or
+`offline` listing marks the dynamic location offline immediately, even if the
+next discovery snapshot has not arrived; the tab remains in place while preview
+and hydration work is cancelled. A `staleReference` retries only at a newer
+registered root and resets that tab's history rather than guessing a path.
+
+Snapshot reconciliation also treats a changed opaque root token as a new root
+lifetime, even when no intermediate offline snapshot was observed. Every tab for
+that location resets to the new authoritative root before listing resumes. This
+handles fast provider restarts without retaining invalid entry references.
+
 ### Location model
 
 Filesystem transport and presentation source are separate concerns. A synced
@@ -144,7 +169,7 @@ behavior.
 The current frontend contract is:
 
 ```ts
-type LocationBackend = "local" | "ssh";
+type LocationBackend = "local" | "gio" | "ssh";
 type LocationKind = "local" | "volume" | "syncedFolder" | "ssh";
 
 type SyncedFolderProvider = "iCloud" | "oneDrive" | "googleDrive" | "other";
@@ -157,11 +182,11 @@ interface SyncedFolderMetadata {
 ```
 
 The important invariant is that provider names and string ID prefixes do not
-become backend dispatch. Rust now resolves an ID against registered local roots
-or active SSH sessions and rejects unknown or ambiguous identities. Availability
-inspection is also selected by a Rust-owned access policy—iCloud metadata,
-Windows Cloud Files, known local mirror, or unknown—rather than provider brand.
-A later GIO transport must extend the backend contract explicitly.
+become backend dispatch. Rust resolves an ID against registered local roots,
+active GIO roots, or active SSH sessions and rejects unknown or ambiguous
+identities. Availability inspection is also selected by a Rust-owned access
+policy—iCloud metadata, Windows Cloud Files, known local mirror, or
+unknown—rather than provider brand.
 
 ### Identity and privacy
 
@@ -215,6 +240,13 @@ Content access follows a task lifecycle:
    streaming pipeline.
 6. Keep cancellation and provider completion distinct. A cancelled Explora task
    may stop waiting even when an OS-owned download cannot be cancelled.
+
+The content-request capability is valid only for a regular file. Revalidation
+returns `notFound` if the entry was removed and drops the capability if the path
+became a directory, symlink, or special entry. An in-flight request whose file
+type or provider access policy changed fails with `staleReference`; it must not
+report successful hydration merely because a non-file replacement is locally
+present.
 
 No preview, metadata extractor, search, thumbnail job, or recursive operation
 may silently launch one hydration task per entry.
@@ -298,8 +330,17 @@ registration ID into Explora's stable location identity and decodes only the
 provider component before the first `!` as a display hint. The SID and account
 components never enter UI state, logs, or persisted metadata. Duplicate paths
 and identities are removed before roots are published, and the existing bounded
-refresh detects registration and removal. Provider disconnects that leave a
-root registered still need an explicit status model.
+refresh detects registration and removal.
+
+For a registered root, the adapter also queries
+`CfGetSyncRootInfoByPath(CF_SYNC_ROOT_INFO_PROVIDER)` and consumes only the
+provider status field. Known disconnected, connectivity-lost, terminated, and
+error states are mapped conservatively; an unrecognized value or failed query
+remains `unknown`. Provider status and namespace accessibility are separate: a
+registered root remains browsable while its local namespace exists, even if its
+provider is offline or in error. Cached local files can still be previewed, but
+Explora does not offer or continue explicit placeholder hydration unless the
+provider reports an available state.
 
 Use the Windows Cloud Files API to inspect placeholder state. It distinguishes a
 placeholder, sync root, in-sync item, partial item, and content that is only
@@ -460,7 +501,7 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Revoke references before publishing root removal.
 - [x] Add Cloud Storage sidebar UI and visibility preferences.
 - [x] Add deterministic demo roots and frontend tests.
-- [ ] Add structured offline, permission, stale, and unavailable errors.
+- [x] Add structured offline, permission, stale, and unavailable errors.
 - [x] Add privacy and log-redaction tests.
 - [x] Document the supported platform/provider matrix in `README.md`.
 
@@ -490,7 +531,7 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Run synchronous Cloud Files hydration off the async runtime and treat UI
       cancellation as stopping the wait only.
 - [x] Detect sync-root registration and removal with bounded refresh.
-- [ ] Model provider disconnects that do not unregister the sync root.
+- [x] Model provider disconnects that do not unregister the sync root.
 - [ ] Test OneDrive Personal and work/school roots.
 - [ ] Test multiple OneDrive accounts.
 - [ ] Test Google Drive streaming to a drive letter and folder.
@@ -528,8 +569,12 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Revalidate identity and metadata after hydration.
 - [x] Feed downloaded bytes into existing preview limits.
 - [x] Prevent background metadata, search, and thumbnail hydration.
-- [ ] Test slow, offline, oversized, malformed, changed, and removed files.
-- [ ] Test cleanup and tab continuity after provider disconnects.
+- [x] Add deterministic coverage for timeout decisions, offline and cancelled
+      requests, oversized and malformed previews, and changed or removed files.
+- [ ] Exercise those failure states against real platform providers.
+- [x] Test deterministic cleanup, tab continuity, and root replacement after a
+      provider disconnect.
+- [ ] Test cleanup and tab continuity with real provider disconnects.
 
 ## Validation requirements
 
@@ -590,6 +635,12 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [Microsoft Learn](https://learn.microsoft.com/en-us/uwp/api/windows.storage.provider.storageprovidersyncrootmanager.getcurrentsyncroots)
 - Windows sync-root registration identity:
   [Microsoft Learn](https://learn.microsoft.com/en-us/uwp/api/windows.storage.provider.storageprovidersyncrootinfo.id)
+- Windows sync-root information query:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfgetsyncrootinfobypath)
+- Windows sync-root provider information:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ns-cfapi-cf_sync_root_provider_info)
+- Windows sync-provider status values:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ne-cfapi-cf_sync_provider_status)
 - Windows Cloud Files placeholder states:
   [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ne-cfapi-cf_placeholder_state)
 - Windows metadata-only placeholder-state helper:

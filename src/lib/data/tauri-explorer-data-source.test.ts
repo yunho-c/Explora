@@ -489,6 +489,40 @@ describe("TauriExplorerDataSource", () => {
     expect(commands).toContain("cancel_listing");
   });
 
+  it("preserves structured stale and unavailable filesystem errors", async () => {
+    const failures = [
+      {
+        code: "staleReference",
+        message:
+          "This filesystem reference is stale. Refresh the location and try again.",
+      },
+      {
+        code: "unavailable",
+        message: "This location is no longer available.",
+      },
+    ] as const;
+
+    for (const failure of failures) {
+      mockIPC((command) => {
+        if (command === "list_directory") return Promise.reject(failure);
+        return null;
+      });
+      const listing = new TauriExplorerDataSource().listDirectory(root, {
+        signal: new AbortController().signal,
+        onStart: () => {},
+        onBatch: () => {},
+        onComplete: () => {},
+      });
+
+      await expect(listing).rejects.toMatchObject({
+        name: "ExplorerFilesystemError",
+        code: failure.code,
+        message: failure.message,
+      });
+      clearMocks();
+    }
+  });
+
   it("validates and returns a bounded text preview", async () => {
     mockIPC((command) => {
       if (command === "prepare_preview") {

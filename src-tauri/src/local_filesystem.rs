@@ -16,7 +16,7 @@ use crate::content_request::ContentRequestPolicy;
 use crate::filesystem::{
     BreadcrumbSegmentDto, ContentAvailability, DirectoryListingEvent, DirectoryRefDto, EntryRefDto,
     ExplorerError, FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
-    SyncedFolderMetadataDto, LISTING_BATCH_SIZE,
+    RevocationTracker, SyncedFolderMetadataDto, SyncedFolderStatus, LISTING_BATCH_SIZE,
 };
 use crate::synced_availability::{SyncedAvailabilityInspector, SyncedAvailabilityPolicy};
 
@@ -33,6 +33,8 @@ struct PathRegistryInner {
     paths_by_id: HashMap<String, PathBuf>,
     locations_by_id: HashMap<String, String>,
     ids_by_path: HashMap<(String, PathBuf), String>,
+    revoked_locations: RevocationTracker,
+    revoked_references: RevocationTracker,
 }
 
 #[derive(Default)]
@@ -66,8 +68,19 @@ impl PathRegistry {
             .inner
             .lock()
             .map_err(|_| ExplorerError::StateUnavailable)?;
-        if inner.locations_by_id.get(id).map(String::as_str) != Some(location_id) {
-            return Err(ExplorerError::InvalidReference);
+        match inner.locations_by_id.get(id) {
+            Some(registered_location) if registered_location == location_id => {}
+            Some(_) => return Err(ExplorerError::InvalidReference),
+            None if inner.revoked_locations.contains(location_id) => {
+                return Err(location_unavailable())
+            }
+            None if inner
+                .revoked_references
+                .contains(&reference_revocation_key(location_id, id)) =>
+            {
+                return Err(ExplorerError::StaleReference)
+            }
+            None => return Err(ExplorerError::InvalidReference),
         }
         inner
             .paths_by_id
@@ -93,9 +106,37 @@ impl PathRegistry {
                 inner.ids_by_path.remove(&(location_id.to_owned(), path));
             }
             inner.locations_by_id.remove(&id);
+            inner
+                .revoked_references
+                .record(reference_revocation_key(location_id, &id));
         }
+        inner.revoked_locations.record(location_id.to_owned());
         Ok(())
     }
+
+    fn activate_location(&self, location_id: &str) -> Result<(), ExplorerError> {
+        self.inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .revoked_locations
+            .forget(location_id);
+        Ok(())
+    }
+
+    fn is_unavailable_location(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        self.inner
+            .lock()
+            .map(|inner| inner.revoked_locations.contains(location_id))
+            .map_err(|_| ExplorerError::StateUnavailable)
+    }
+}
+
+fn reference_revocation_key(location_id: &str, reference_id: &str) -> String {
+    format!("{location_id}\0{reference_id}")
+}
+
+fn location_unavailable() -> ExplorerError {
+    ExplorerError::Unavailable("This location is no longer available.".to_owned())
 }
 
 pub struct LocalFilesystem {
@@ -109,6 +150,7 @@ pub(crate) struct LocalPreviewAccess {
     pub path: PathBuf,
     pub availability: ContentAvailability,
     pub content_request_policy: Option<ContentRequestPolicy>,
+    pub provider_status: Option<SyncedFolderStatus>,
     pub size: Option<String>,
     pub modified_at: Option<u64>,
 }
@@ -198,6 +240,10 @@ impl LocalFilesystem {
             .map_err(|_| ExplorerError::StateUnavailable)
     }
 
+    pub fn is_unavailable_location(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        self.registry.is_unavailable_location(location_id)
+    }
+
     pub fn replace_volumes(
         &self,
         volumes: Vec<VolumeRoot>,
@@ -230,6 +276,7 @@ impl LocalFilesystem {
                 self.registry.remove_location(&volume.id)?;
                 directory_ref(&self.registry, &volume.path, &volume.id, Some(&volume.name))?
             };
+            self.registry.activate_location(&volume.id)?;
             summaries.push(LocationSummaryDto {
                 id: volume.id,
                 name: volume.name,
@@ -274,8 +321,9 @@ impl LocalFilesystem {
 
         let mut summaries = Vec::with_capacity(folders.len());
         for folder in folders {
+            let is_browsable = folder.path.is_dir();
             if folder.metadata.status == crate::filesystem::SyncedFolderStatus::Available
-                && !folder.path.is_dir()
+                && !is_browsable
             {
                 continue;
             }
@@ -291,6 +339,7 @@ impl LocalFilesystem {
                 self.registry.remove_location(&folder.id)?;
                 directory_ref(&self.registry, &folder.path, &folder.id, Some(&folder.name))?
             };
+            self.registry.activate_location(&folder.id)?;
             next_availability.insert(folder.id.clone(), folder.availability);
             summaries.push(LocationSummaryDto {
                 id: folder.id,
@@ -298,13 +347,7 @@ impl LocalFilesystem {
                 backend: LocationBackend::Local,
                 kind: "syncedFolder",
                 role: LocationRole::SyncedFolder,
-                status: if folder.metadata.status
-                    == crate::filesystem::SyncedFolderStatus::Available
-                {
-                    "available"
-                } else {
-                    "offline"
-                },
+                status: if is_browsable { "available" } else { "offline" },
                 display_path: directory.display_path.clone(),
                 detail: folder.detail,
                 root: directory,
@@ -335,16 +378,14 @@ impl LocalFilesystem {
         let path = self.registry.resolve(location_id, entry_id)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
-        let size = metadata
-            .file_type()
-            .is_file()
-            .then(|| metadata.len().to_string());
+        let is_file = metadata.file_type().is_file();
+        let size = is_file.then(|| metadata.len().to_string());
         let modified_at = metadata
             .modified()
             .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-        let availability = if metadata.file_type().is_file() {
+        let availability = if is_file {
             synced_availability
                 .map(|policy| {
                     self.availability_inspector
@@ -361,8 +402,15 @@ impl LocalFilesystem {
         Ok(LocalPreviewAccess {
             path,
             availability,
-            content_request_policy: synced_availability
-                .and_then(SyncedAvailabilityPolicy::content_request_policy),
+            content_request_policy: is_file
+                .then(|| {
+                    synced_availability.and_then(SyncedAvailabilityPolicy::content_request_policy)
+                })
+                .flatten(),
+            provider_status: location
+                .synced_folder
+                .as_ref()
+                .map(|metadata| metadata.status),
             size,
             modified_at,
         })
@@ -540,11 +588,17 @@ impl LocalFilesystem {
             .locations
             .read()
             .map_err(|_| ExplorerError::StateUnavailable)?;
-        let location = locations
+        let location = match locations
             .iter()
             .find(|location| location.id == location_id)
             .cloned()
-            .ok_or(ExplorerError::InvalidReference)?;
+        {
+            Some(location) => location,
+            None if self.registry.is_unavailable_location(location_id)? => {
+                return Err(location_unavailable())
+            }
+            None => return Err(ExplorerError::InvalidReference),
+        };
         let availability = self
             .synced_availability
             .read()
@@ -847,7 +901,21 @@ mod tests {
                 Ok(())
             });
 
-        assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+        assert!(matches!(result, Err(ExplorerError::Unavailable(_))));
+
+        filesystem
+            .replace_volumes(vec![VolumeRoot {
+                id: volume.id.clone(),
+                name: "Test Volume".to_owned(),
+                path: temp.path().join("mounted-volume"),
+                detail: "900 MB available".to_owned(),
+            }])
+            .expect("volume restoration");
+        let stale =
+            filesystem.list_directory(&volume.root.id, &volume.id, &AtomicBool::new(false), |_| {
+                Ok(())
+            });
+        assert!(matches!(stale, Err(ExplorerError::StaleReference)));
     }
 
     #[test]
@@ -880,7 +948,7 @@ mod tests {
         let refreshed = filesystem
             .replace_synced_folders(vec![SyncedFolderRoot {
                 name: "Renamed Cloud Storage".to_owned(),
-                ..root
+                ..root.clone()
             }])
             .expect("synced metadata refresh")
             .remove(0);
@@ -911,7 +979,18 @@ mod tests {
             &AtomicBool::new(false),
             |_| Ok(()),
         );
-        assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+        assert!(matches!(result, Err(ExplorerError::Unavailable(_))));
+
+        filesystem
+            .replace_synced_folders(vec![root])
+            .expect("synced root restoration");
+        let stale = filesystem.list_directory(
+            &refreshed.root.id,
+            &refreshed.id,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+        );
+        assert!(matches!(stale, Err(ExplorerError::StaleReference)));
     }
 
     #[test]
@@ -1092,6 +1171,64 @@ mod tests {
     }
 
     #[test]
+    fn content_request_revalidation_rejects_removed_or_type_changed_files() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("changing-icloud-root");
+        let changing_path = synced_path.join("changing.txt");
+        fs::create_dir(&synced_path).expect("iCloud fixture root");
+        File::create(&changing_path).expect("placeholder fixture");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:icloud:changing".to_owned(),
+                name: "iCloud Drive".to_owned(),
+                path: synced_path,
+                detail: "iCloud Drive · Synced folder".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::ICloud,
+                    status: crate::filesystem::SyncedFolderStatus::Available,
+                    source: crate::filesystem::SyncedFolderSource::System,
+                },
+                availability: SyncedAvailabilityPolicy::ICloud,
+            }])
+            .expect("synced snapshot")
+            .remove(0);
+        let mut entry = None;
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        entry = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "changing.txt");
+                    }
+                    Ok(())
+                },
+            )
+            .expect("iCloud listing");
+        let entry = entry.expect("changing entry");
+
+        fs::remove_file(&changing_path).expect("remove placeholder");
+        assert!(matches!(
+            filesystem.resolve_preview_access(&entry.reference.id, &location.id),
+            Err(ExplorerError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+
+        fs::create_dir(&changing_path).expect("replace placeholder with directory");
+        let changed = filesystem
+            .resolve_preview_access(&entry.reference.id, &location.id)
+            .expect("revalidate changed entry");
+        assert_eq!(changed.availability, ContentAvailability::Local);
+        assert_eq!(changed.size, None);
+        assert_eq!(changed.content_request_policy, None);
+    }
+
+    #[test]
     fn offline_manual_roots_remain_listed_but_cannot_be_traversed() {
         let (temp, filesystem, _) = fixture();
         let missing_path = temp.path().join("temporarily-unavailable");
@@ -1124,7 +1261,71 @@ mod tests {
     }
 
     #[test]
+    fn provider_status_does_not_hide_a_browsable_local_namespace() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("registered-offline-provider");
+        fs::create_dir(&synced_path).expect("registered root");
+        File::create(synced_path.join("cached.txt")).expect("cached file");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:windows:offline".to_owned(),
+                name: "OneDrive".to_owned(),
+                path: synced_path,
+                detail: "OneDrive · Provider offline".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::OneDrive,
+                    status: crate::filesystem::SyncedFolderStatus::Offline,
+                    source: crate::filesystem::SyncedFolderSource::System,
+                },
+                availability: SyncedAvailabilityPolicy::WindowsCloudFiles,
+            }])
+            .expect("synced snapshot")
+            .remove(0);
+
+        assert_eq!(location.status, "available");
+        assert_eq!(
+            location
+                .synced_folder
+                .as_ref()
+                .map(|metadata| metadata.status),
+            Some(crate::filesystem::SyncedFolderStatus::Offline)
+        );
+        let mut names = Vec::new();
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        names.extend(entries.into_iter().map(|entry| entry.name));
+                    }
+                    Ok(())
+                },
+            )
+            .expect("cached namespace remains browsable");
+        assert_eq!(names, ["cached.txt"]);
+    }
+
+    #[test]
     fn maps_filesystem_errors_to_stable_ipc_codes() {
+        let stale = ExplorerErrorDto::from(ExplorerError::StaleReference);
+        assert_eq!(stale.code, ExplorerErrorCode::StaleReference);
+        assert_eq!(
+            serde_json::to_value(stale).expect("serialize stale error")["code"],
+            "staleReference"
+        );
+        let unavailable = ExplorerErrorDto::from(ExplorerError::Unavailable("removed".to_owned()));
+        assert_eq!(unavailable.code, ExplorerErrorCode::Unavailable);
+        assert_eq!(
+            serde_json::to_value(unavailable).expect("serialize unavailable error")["code"],
+            "unavailable"
+        );
+        assert_eq!(
+            ExplorerErrorDto::from(ExplorerError::Offline("offline".to_owned())).code,
+            ExplorerErrorCode::Offline
+        );
+
         let cases = [
             (std::io::ErrorKind::NotFound, ExplorerErrorCode::NotFound),
             (

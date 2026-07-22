@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type {
   DirectoryRef,
+  ExplorerFilesystemErrorCode,
   FileEntrySummary,
   LocationSummary,
   SshConnectionEvent,
@@ -14,6 +15,7 @@ import type {
   UserPreferencesPatch,
 } from "$lib/contracts/preferences";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
+import { ExplorerFilesystemError } from "$lib/data/explorer-data-source";
 import type {
   ConnectSshOptions,
   ListDirectoryOptions,
@@ -206,6 +208,8 @@ class ControllableVolumeDataSource extends DemoExplorerDataSource {
 
 class ControllableSyncedFolderDataSource extends DemoExplorerDataSource {
   listingCount = 0;
+  contentRequestAborted = false;
+  private nextListingError: ExplorerFilesystemError | null = null;
   private onSyncedFolderSnapshot:
     ((snapshot: SyncedFolderSnapshot) => void) | null = null;
 
@@ -224,7 +228,50 @@ class ControllableSyncedFolderDataSource extends DemoExplorerDataSource {
     options: ListDirectoryOptions,
   ): Promise<void> {
     this.listingCount += 1;
+    if (this.nextListingError) {
+      const error = this.nextListingError;
+      this.nextListingError = null;
+      throw error;
+    }
+    if (directory.id.startsWith("replacement-root:")) {
+      options.onStart({
+        directory,
+        parent: null,
+        breadcrumbs: [{ label: directory.name, directory }],
+      });
+      options.onComplete({ skippedEntries: 0 });
+      return;
+    }
     return super.listDirectory(directory, options);
+  }
+
+  override async requestContent(
+    entry: FileEntrySummary,
+    { signal, onEvent }: RequestContentOptions,
+  ): Promise<void> {
+    onEvent({ event: "started", providerWorkCancellable: false });
+    onEvent({ event: "progress", availability: entry.availability });
+    await new Promise<void>((_resolve, reject) => {
+      signal.addEventListener(
+        "abort",
+        () => {
+          this.contentRequestAborted = true;
+          const error = new Error("Stopped waiting.");
+          error.name = "AbortError";
+          reject(error);
+        },
+        { once: true },
+      );
+    });
+  }
+
+  failNextListing(code: ExplorerFilesystemErrorCode): void {
+    this.nextListingError = new ExplorerFilesystemError(
+      code,
+      code === "staleReference"
+        ? "This filesystem reference is stale."
+        : "This location is no longer available.",
+    );
   }
 
   emitSyncedFolders(
@@ -315,6 +362,111 @@ describe("ExplorerState", () => {
     );
     expect(state.activeDirectory?.id).toBe(icloud?.root.id);
     expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
+  it("resets synced-folder tabs when a provider replaces its opaque root without an offline snapshot", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const icloud = state.locations.find(({ id }) => id === "synced:icloud")!;
+    await state.selectLocation(icloud.id);
+    const listingCount = dataSource.listingCount;
+    const replacement: LocationSummary = {
+      ...icloud,
+      root: {
+        ...icloud.root,
+        id: "replacement-root:icloud",
+      },
+    };
+
+    dataSource.emitSyncedFolders(1, [replacement]);
+    await vi.waitFor(() =>
+      expect(state.activeDirectory?.id).toBe(replacement.root.id),
+    );
+
+    expect(state.activeTab?.history).toEqual([replacement.root]);
+    expect(dataSource.listingCount).toBe(listingCount + 1);
+    expect(state.errorMessage).toBeNull();
+    state.dispose();
+  });
+
+  it("turns an unavailable listing into an immediate offline tombstone and restores it", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const icloud = state.locations.find(({ id }) => id === "synced:icloud")!;
+    await state.selectLocation(icloud.id);
+    const entries = state.entries;
+
+    dataSource.failNextListing("unavailable");
+    await state.refreshDirectory();
+
+    expect(state.activeLocation?.status).toBe("offline");
+    expect(state.activeTab?.locationId).toBe(icloud.id);
+    expect(state.entries).toEqual(entries);
+    expect(state.errorMessage).toBeNull();
+    expect(state.warningMessage).toContain("sync provider");
+
+    dataSource.emitSyncedFolders(1, [icloud]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("available"),
+    );
+    expect(state.activeDirectory?.id).toBe(icloud.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
+  it("recovers a stale directory token at the latest registered root", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectLocation("synced:icloud");
+    const current = state.activeLocation!;
+    const replacementRoot: DirectoryRef = {
+      ...current.root,
+      id: "replacement-root:stale-recovery",
+    };
+    state.locations = state.locations.map((location) =>
+      location.id === current.id
+        ? { ...location, root: replacementRoot }
+        : location,
+    );
+    dataSource.failNextListing("staleReference");
+
+    await state.refreshDirectory();
+
+    expect(state.activeDirectory).toEqual(replacementRoot);
+    expect(state.activeTab?.history).toEqual([replacementRoot]);
+    expect(state.errorMessage).toBeNull();
+    expect(state.warningMessage).toContain("returned to its root");
+    state.dispose();
+  });
+
+  it("cancels preview hydration but preserves the tab when its provider disappears", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectLocation("synced:icloud");
+    const onlineOnly = state.entries.find(
+      ({ name }) => name === "Reference library.pdf",
+    )!;
+    state.selectEntry(onlineOnly.reference.id);
+    await state.openPreview();
+    const request = state.requestPreviewContent();
+    expect(state.previewContentRequest).not.toBeNull();
+
+    dataSource.emitSyncedFolders(1, []);
+    await request;
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("offline"),
+    );
+
+    expect(dataSource.contentRequestAborted).toBe(true);
+    expect(state.previewOpen).toBe(false);
+    expect(state.previewContentRequest).toBeNull();
+    expect(state.activeTab?.locationId).toBe("synced:icloud");
+    expect(state.warningMessage).toContain("sync provider");
     state.dispose();
   });
 

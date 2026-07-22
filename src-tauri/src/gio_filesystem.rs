@@ -14,8 +14,8 @@ use crate::filesystem::{
 
 #[cfg(any(target_os = "linux", test))]
 use crate::filesystem::{
-    BreadcrumbSegmentDto, DirectoryRefDto, LocationBackend, LocationRole, SyncedFolderMetadataDto,
-    SyncedFolderProvider, SyncedFolderSource, SyncedFolderStatus,
+    BreadcrumbSegmentDto, DirectoryRefDto, LocationBackend, LocationRole, RevocationTracker,
+    SyncedFolderMetadataDto, SyncedFolderProvider, SyncedFolderSource, SyncedFolderStatus,
 };
 
 #[cfg(any(target_os = "linux", test))]
@@ -98,6 +98,10 @@ struct GioState {
     references: HashMap<String, GioReference>,
     #[cfg(any(target_os = "linux", test))]
     ids_by_uri: HashMap<(String, String), String>,
+    #[cfg(any(target_os = "linux", test))]
+    revoked_locations: RevocationTracker,
+    #[cfg(any(target_os = "linux", test))]
+    revoked_references: RevocationTracker,
 }
 
 #[derive(Default)]
@@ -130,6 +134,22 @@ impl GioFilesystem {
                     .any(|location| location.id == location_id)
             })
             .map_err(|_| ExplorerError::StateUnavailable)
+    }
+
+    pub fn is_unavailable_location(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        #[cfg(any(target_os = "linux", test))]
+        {
+            self.state
+                .read()
+                .map(|state| state.revoked_locations.contains(location_id))
+                .map_err(|_| ExplorerError::StateUnavailable)
+        }
+
+        #[cfg(not(any(target_os = "linux", test)))]
+        {
+            let _ = location_id;
+            Ok(false)
+        }
     }
 
     pub fn list_directory<F>(
@@ -239,6 +259,7 @@ impl GioFilesystem {
             let key = (root.uri.clone(), root.name.clone());
             if state.root_keys.get(&root.location_id) == Some(&key) {
                 if let Some(location) = previous_locations.get(&root.location_id) {
+                    state.revoked_locations.forget(&root.location_id);
                     locations.push(location.clone());
                     continue;
                 }
@@ -261,6 +282,7 @@ impl GioFilesystem {
                 },
             )?;
             state.root_keys.insert(root.location_id.clone(), key);
+            state.revoked_locations.forget(&root.location_id);
             locations.push(LocationSummaryDto {
                 id: root.location_id,
                 name: root.name.clone(),
@@ -292,19 +314,20 @@ impl GioFilesystem {
             .state
             .read()
             .map_err(|_| ExplorerError::StateUnavailable)?;
-        if !state
-            .locations
-            .iter()
-            .any(|location| location.id == location_id)
-        {
-            return Err(ExplorerError::InvalidReference);
+        if !location_is_active(&state, location_id) {
+            return Err(missing_location_error(&state, location_id));
         }
-        state
-            .references
-            .get(reference_id)
-            .filter(|reference| reference.location_id == location_id)
-            .cloned()
-            .ok_or(ExplorerError::InvalidReference)
+        match state.references.get(reference_id) {
+            Some(reference) if reference.location_id == location_id => Ok(reference.clone()),
+            Some(_) => Err(ExplorerError::InvalidReference),
+            None if state
+                .revoked_references
+                .contains(&reference_revocation_key(location_id, reference_id)) =>
+            {
+                Err(ExplorerError::StaleReference)
+            }
+            None => Err(ExplorerError::InvalidReference),
+        }
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -318,7 +341,7 @@ impl GioFilesystem {
             .iter()
             .find(|location| location.id == location_id)
             .map(|location| location.root.id.as_str())
-            .ok_or(ExplorerError::InvalidReference)?;
+            .ok_or_else(|| missing_location_error(&state, location_id))?;
         state
             .references
             .get(root_id)
@@ -343,11 +366,14 @@ impl GioFilesystem {
             .state
             .read()
             .map_err(|_| ExplorerError::StateUnavailable)?;
+        if !location_is_active(&state, location_id) {
+            return Err(missing_location_error(&state, location_id));
+        }
         let current = state
             .references
             .get(directory_id)
             .filter(|reference| reference.location_id == location_id)
-            .ok_or(ExplorerError::InvalidReference)?;
+            .ok_or_else(|| missing_reference_error(&state, location_id, directory_id))?;
         let parent = current
             .parent_id
             .as_ref()
@@ -383,19 +409,15 @@ impl GioFilesystem {
             .state
             .write()
             .map_err(|_| ExplorerError::StateUnavailable)?;
-        if !state
-            .locations
-            .iter()
-            .any(|location| location.id == location_id)
-        {
-            return Err(ExplorerError::InvalidReference);
+        if !location_is_active(&state, location_id) {
+            return Err(missing_location_error(&state, location_id));
         }
         let parent = state
             .references
             .get(parent_id)
             .filter(|reference| reference.location_id == location_id)
             .cloned()
-            .ok_or(ExplorerError::InvalidReference)?;
+            .ok_or_else(|| missing_reference_error(&state, location_id, parent_id))?;
         let display_path = format!("{}/{}", parent.display_path.trim_end_matches('/'), name);
         register_reference(
             &mut state,
@@ -495,6 +517,44 @@ fn register_reference(
 }
 
 #[cfg(any(target_os = "linux", test))]
+fn location_is_active(state: &GioState, location_id: &str) -> bool {
+    state
+        .locations
+        .iter()
+        .any(|location| location.id == location_id)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn missing_location_error(state: &GioState, location_id: &str) -> ExplorerError {
+    if state.revoked_locations.contains(location_id) {
+        ExplorerError::Unavailable("This location is no longer available.".to_owned())
+    } else {
+        ExplorerError::InvalidReference
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn missing_reference_error(
+    state: &GioState,
+    location_id: &str,
+    reference_id: &str,
+) -> ExplorerError {
+    if state
+        .revoked_references
+        .contains(&reference_revocation_key(location_id, reference_id))
+    {
+        ExplorerError::StaleReference
+    } else {
+        ExplorerError::InvalidReference
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn reference_revocation_key(location_id: &str, reference_id: &str) -> String {
+    format!("{location_id}\0{reference_id}")
+}
+
+#[cfg(any(target_os = "linux", test))]
 fn remove_location(state: &mut GioState, location_id: &str) {
     state.root_keys.remove(location_id);
     let removed = state
@@ -507,7 +567,11 @@ fn remove_location(state: &mut GioState, location_id: &str) {
     for (id, uri) in removed {
         state.references.remove(&id);
         state.ids_by_uri.remove(&(location_id.to_owned(), uri));
+        state
+            .revoked_references
+            .record(reference_revocation_key(location_id, &id));
     }
+    state.revoked_locations.record(location_id.to_owned());
 }
 
 #[cfg(target_os = "linux")]
@@ -882,7 +946,9 @@ mod tests {
             )
             .expect("child reference");
 
-        filesystem.replace_roots(vec![root]).expect("same roots");
+        filesystem
+            .replace_roots(vec![root.clone()])
+            .expect("same roots");
         assert_eq!(
             filesystem
                 .resolve_reference(&location.id, &child.id)
@@ -894,6 +960,16 @@ mod tests {
         filesystem.replace_roots(Vec::new()).expect("remove roots");
         assert!(matches!(
             filesystem.resolve_reference(&location.id, &child.id),
+            Err(ExplorerError::Unavailable(_))
+        ));
+
+        filesystem.replace_roots(vec![root]).expect("restore root");
+        assert!(matches!(
+            filesystem.resolve_reference(&location.id, &child.id),
+            Err(ExplorerError::StaleReference)
+        ));
+        assert!(matches!(
+            filesystem.resolve_reference(&location.id, "never-valid"),
             Err(ExplorerError::InvalidReference)
         ));
     }

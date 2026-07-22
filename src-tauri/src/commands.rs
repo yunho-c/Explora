@@ -16,7 +16,7 @@ use crate::{
         ContentAvailability, ContentRequestCapabilityDto, ContentRequestEventDto,
         ContentRequestIntent, DirectoryListingEvent, ExplorerError, ExplorerErrorDto,
         ImagePreviewMode, LocationBackend, LocationSummaryDto, PreviewResultDto,
-        PreviewUnavailableReason,
+        PreviewUnavailableReason, SyncedFolderStatus,
     },
     gio_filesystem::GioFilesystem,
     local_filesystem::LocalFilesystem,
@@ -112,6 +112,14 @@ impl AppState {
             (true, false, false) => Ok(LocationBackend::Local),
             (false, true, false) => Ok(LocationBackend::Gio),
             (false, false, true) => Ok(LocationBackend::Ssh),
+            (false, false, false)
+                if self.local.is_unavailable_location(location_id)?
+                    || self.gio.is_unavailable_location(location_id)? =>
+            {
+                Err(ExplorerError::Unavailable(
+                    "This location is no longer available.".to_owned(),
+                ))
+            }
             _ => Err(ExplorerError::InvalidReference),
         }
     }
@@ -546,17 +554,17 @@ pub async fn prepare_preview(
         .local
         .resolve_preview_access(&entry_id, &location_id)
         .map_err(|error| local_preview_error(error, synced_location))?;
-
     if access.availability != ContentAvailability::Local {
         let request_content = access
             .content_request_policy
+            .filter(|_| access.provider_status == Some(SyncedFolderStatus::Available))
             .map(content_request_capability);
         return Ok(metadata_result_with_content_request(
             entry_id,
             access.size,
             access.modified_at,
             PreviewUnavailableReason::DownloadRequired,
-            synced_preview_message(access.availability),
+            synced_preview_message(access.availability, access.provider_status),
             request_content,
         ));
     }
@@ -582,7 +590,7 @@ fn content_request_capability(_policy: ContentRequestPolicy) -> ContentRequestCa
 enum ContentRequestPollAction {
     Continue,
     Complete,
-    InvalidReference,
+    StaleReference,
     AvailabilityError,
     ProviderError,
     TimedOut,
@@ -596,7 +604,7 @@ fn content_request_poll_action(
     timed_out: bool,
 ) -> ContentRequestPollAction {
     if current_policy != Some(expected_policy) {
-        return ContentRequestPollAction::InvalidReference;
+        return ContentRequestPollAction::StaleReference;
     }
     if availability == ContentAvailability::Local {
         return ContentRequestPollAction::Complete;
@@ -626,7 +634,25 @@ fn local_preview_error(error: ExplorerError, synced_location: bool) -> ExplorerE
     })
 }
 
-fn synced_preview_message(availability: ContentAvailability) -> &'static str {
+fn synced_preview_message(
+    availability: ContentAvailability,
+    provider_status: Option<SyncedFolderStatus>,
+) -> &'static str {
+    match provider_status {
+        Some(SyncedFolderStatus::Offline) => {
+            return "The sync provider is offline. This file is not available locally."
+        }
+        Some(SyncedFolderStatus::Paused) => {
+            return "Syncing is paused. This file is not available locally."
+        }
+        Some(SyncedFolderStatus::Error) => {
+            return "The sync provider reported an error. This file is not available locally."
+        }
+        Some(SyncedFolderStatus::Unknown) => {
+            return "Explora cannot verify the sync provider's status or access this file locally."
+        }
+        Some(SyncedFolderStatus::Available) | None => {}
+    }
     match availability {
         ContentAvailability::OnlineOnly => {
             "This file is online-only. Download it explicitly before previewing."
@@ -650,6 +676,26 @@ fn synced_preview_message(availability: ContentAvailability) -> &'static str {
     }
 }
 
+fn content_request_provider_status_error(
+    status: Option<SyncedFolderStatus>,
+) -> Option<ExplorerError> {
+    match status {
+        Some(SyncedFolderStatus::Available) => None,
+        Some(SyncedFolderStatus::Offline) => Some(ExplorerError::Offline(
+            "The sync provider is offline.".to_owned(),
+        )),
+        Some(SyncedFolderStatus::Paused) => Some(ExplorerError::Unsupported(
+            "Syncing is paused for this provider.".to_owned(),
+        )),
+        Some(SyncedFolderStatus::Error) => Some(ExplorerError::Unexpected(
+            "The sync provider reported an error.".to_owned(),
+        )),
+        Some(SyncedFolderStatus::Unknown) | None => Some(ExplorerError::Unsupported(
+            "Explora cannot verify that this sync provider is available.".to_owned(),
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn request_content(
     state: State<'_, AppState>,
@@ -662,23 +708,29 @@ pub async fn request_content(
     validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
     validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
 
-    let synced_location = state
-        .local
-        .is_synced_folder(&location_id)
-        .map_err(ExplorerErrorDto::from)?;
-    if !synced_location {
-        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+    match state
+        .resolve_location_backend(&location_id)
+        .map_err(ExplorerErrorDto::from)?
+    {
+        LocationBackend::Local
+            if state
+                .local
+                .is_synced_folder(&location_id)
+                .map_err(ExplorerErrorDto::from)? => {}
+        LocationBackend::Gio => {
+            return Err(ExplorerErrorDto::from(ExplorerError::Unsupported(
+                "This synced folder does not support explicit content requests.".to_owned(),
+            )))
+        }
+        LocationBackend::Local | LocationBackend::Ssh => {
+            return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference))
+        }
     }
 
     let initial = state
         .local
         .resolve_preview_access(&entry_id, &location_id)
         .map_err(|error| local_preview_error(error, true))?;
-    let policy = initial.content_request_policy.ok_or_else(|| {
-        ExplorerErrorDto::from(ExplorerError::Unsupported(
-            "This synced folder does not support explicit content requests.".to_owned(),
-        ))
-    })?;
 
     // A stale UI action may race with provider completion. Treat an already
     // local item as an idempotent success without starting more provider work.
@@ -696,6 +748,15 @@ pub async fn request_content(
             },
         );
     }
+
+    if let Some(error) = content_request_provider_status_error(initial.provider_status) {
+        return Err(ExplorerErrorDto::from(error));
+    }
+    let policy = initial.content_request_policy.ok_or_else(|| {
+        ExplorerErrorDto::from(ExplorerError::Unsupported(
+            "This synced folder does not support explicit content requests.".to_owned(),
+        ))
+    })?;
 
     // Register cancellation before publishing Started so a fast UI stop
     // cannot race ahead of the task registry.
@@ -737,6 +798,11 @@ pub async fn request_content(
             .local
             .resolve_preview_access(&entry_id, &location_id)
             .map_err(|error| local_preview_error(error, true))?;
+        if current.availability != ContentAvailability::Local {
+            if let Some(error) = content_request_provider_status_error(current.provider_status) {
+                return Err(local_preview_error(error, true));
+            }
+        }
         match content_request_poll_action(
             policy,
             current.content_request_policy,
@@ -758,8 +824,8 @@ pub async fn request_content(
                     },
                 );
             }
-            ContentRequestPollAction::InvalidReference => {
-                return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+            ContentRequestPollAction::StaleReference => {
+                return Err(ExplorerErrorDto::from(ExplorerError::StaleReference));
             }
             ContentRequestPollAction::AvailabilityError => {
                 return Err(ExplorerErrorDto::from(ExplorerError::Unexpected(
@@ -926,7 +992,7 @@ mod tests {
                 false,
                 false,
             ),
-            ContentRequestPollAction::InvalidReference
+            ContentRequestPollAction::StaleReference
         );
         assert_eq!(
             content_request_poll_action(
@@ -1019,10 +1085,37 @@ mod tests {
 
     #[test]
     fn synced_preview_messages_distinguish_authoritative_availability() {
-        assert!(synced_preview_message(ContentAvailability::OnlineOnly).contains("online-only"));
-        assert!(synced_preview_message(ContentAvailability::Downloading).contains("downloading"));
-        assert!(synced_preview_message(ContentAvailability::Syncing).contains("not current"));
-        assert!(synced_preview_message(ContentAvailability::Error).contains("download error"));
-        assert!(synced_preview_message(ContentAvailability::Unknown).contains("cannot verify"));
+        let available = Some(SyncedFolderStatus::Available);
+        assert!(
+            synced_preview_message(ContentAvailability::OnlineOnly, available)
+                .contains("online-only")
+        );
+        assert!(
+            synced_preview_message(ContentAvailability::Downloading, available)
+                .contains("downloading")
+        );
+        assert!(
+            synced_preview_message(ContentAvailability::Syncing, available).contains("not current")
+        );
+        assert!(
+            synced_preview_message(ContentAvailability::Error, available)
+                .contains("download error")
+        );
+        assert!(
+            synced_preview_message(ContentAvailability::Unknown, available)
+                .contains("cannot verify")
+        );
+        assert!(synced_preview_message(
+            ContentAvailability::OnlineOnly,
+            Some(SyncedFolderStatus::Offline)
+        )
+        .contains("provider is offline"));
+        assert!(matches!(
+            content_request_provider_status_error(Some(SyncedFolderStatus::Offline)),
+            Some(ExplorerError::Offline(_))
+        ));
+        assert!(
+            content_request_provider_status_error(Some(SyncedFolderStatus::Available)).is_none()
+        );
     }
 }

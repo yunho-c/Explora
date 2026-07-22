@@ -71,6 +71,11 @@ Platform adapters use the strongest provider-neutral facility available:
 - macOS discovers accessible user-visible File Provider roots and iCloud Drive,
   preserving path authority in Rust and validating behavior in a packaged app.
 - Windows uses the Storage Provider sync-root registry and Cloud Files metadata.
+  A read-only sync-root information query supplies provider status without a
+  provider connection key. Namespace accessibility remains independent from
+  provider status, so cached content stays browsable during a disconnect while
+  nonlocal hydration is withheld unless the provider reports an available state.
+  Failed or unfamiliar status queries remain unknown rather than being guessed.
 - Linux uses ordinary local roots and accepts a narrow GIO backend for
   `google-drive://` mounts surfaced by `GVolumeMonitor`. Other GVfs schemes are
   not classified as synced folders.
@@ -94,6 +99,20 @@ then reuse the same decoding, image, PDF, timeout, concurrency, and cleanup
 limits as local previews. No URI is converted to a POSIX path or exposed over
 IPC.
 
+Local and GIO registries retain a bounded history of revoked opaque identities.
+This lets IPC distinguish a removed root (`unavailable`), an entry token from a
+previous lifetime of a restored root (`staleReference`), and an identity that
+was never valid for the claimed location (`invalidReference`). Configured manual
+roots remain registered and use `offline` when their directory is temporarily
+missing. Revocation history contains no paths, URIs, or account labels, and its
+oldest entries are evicted at a fixed limit.
+
+The frontend preserves those structured codes. It creates an offline tab
+tombstone immediately when a dynamic root reports unavailable, cancels preview
+and hydration work owned by that location, and reconciles later snapshots. A
+changed opaque root token is a new root lifetime even if no offline snapshot was
+observed; affected tabs reset to that root and discard stale navigation history.
+
 ## Security and privacy invariants
 
 - Display paths, folder names, account labels, and provider names are never
@@ -102,6 +121,7 @@ IPC.
   identities and account email addresses do not cross IPC or enter logs.
 - Removing a root revokes every opaque path reference for that location before
   the removal snapshot is published.
+- Revocation tombstones are bounded and contain opaque identities only.
 - A non-file URI is never coerced into a local path or passed through a shell.
 - Native folder selection and saved-path authority remain behind Rust; the
   webview receives no generic dialog or filesystem permission.
@@ -110,6 +130,9 @@ IPC.
 - Only the explicit preview action may invoke the native iCloud or Cloud Files
   content-request adapters; normal listing and availability inspection remain
   metadata-only.
+- A native content request is authorized only for a currently registered regular
+  file and is revalidated before completion; removal or replacement cannot be
+  reported as a successful download.
 - Unsupported platforms and unavailable providers report honest capability and
   status rather than falling back to provider-name checks.
 

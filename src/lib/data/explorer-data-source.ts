@@ -2,6 +2,7 @@ import type {
   BreadcrumbSegment,
   ContentRequestEvent,
   DirectoryRef,
+  ExplorerFilesystemErrorCode,
   FileEntrySummary,
   ImagePreviewMode,
   LocationSummary,
@@ -13,6 +14,16 @@ import type {
   SyncedFolderSnapshot,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
+
+export class ExplorerFilesystemError extends Error {
+  readonly code: ExplorerFilesystemErrorCode;
+
+  constructor(code: ExplorerFilesystemErrorCode, message: string) {
+    super(message);
+    this.name = "ExplorerFilesystemError";
+    this.code = code;
+  }
+}
 
 export interface DirectoryStart {
   directory: DirectoryRef;

@@ -1,14 +1,56 @@
-use std::{path::Path, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    path::Path,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const LISTING_BATCH_SIZE: usize = 256;
+pub(crate) const REVOCATION_HISTORY_LIMIT: usize = 1_024;
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 pub const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 pub const SSH_KEEPALIVE_MAX: usize = 3;
 pub const SFTP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+
+/// Keeps enough opaque lifecycle history to distinguish stale UI state from
+/// forged references without retaining paths, provider URIs, or unbounded data.
+#[derive(Debug, Default)]
+pub(crate) struct RevocationTracker {
+    order: VecDeque<String>,
+    identities: HashSet<String>,
+}
+
+impl RevocationTracker {
+    pub(crate) fn record(&mut self, identity: String) {
+        if !self.identities.insert(identity.clone()) {
+            return;
+        }
+        self.order.push_back(identity);
+        while self.order.len() > REVOCATION_HISTORY_LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.identities.remove(&expired);
+            }
+        }
+    }
+
+    pub(crate) fn forget(&mut self, identity: &str) {
+        if self.identities.remove(identity) {
+            self.order.retain(|recorded| recorded != identity);
+        }
+    }
+
+    pub(crate) fn contains(&self, identity: &str) -> bool {
+        self.identities.contains(identity)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.identities.len()
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -265,12 +307,14 @@ pub enum DirectoryListingEvent {
 #[serde(rename_all = "camelCase")]
 pub enum ExplorerErrorCode {
     InvalidReference,
+    StaleReference,
     NotFound,
     PermissionDenied,
     NotDirectory,
     Cancelled,
     TimedOut,
     Offline,
+    Unavailable,
     AuthenticationFailed,
     HostKeyFailure,
     Unsupported,
@@ -289,6 +333,8 @@ pub struct ExplorerErrorDto {
 pub enum ExplorerError {
     #[error("This filesystem reference is no longer valid.")]
     InvalidReference,
+    #[error("This filesystem reference is stale. Refresh the location and try again.")]
+    StaleReference,
     #[error("The request was cancelled.")]
     Cancelled,
     #[error("{0}")]
@@ -304,6 +350,8 @@ pub enum ExplorerError {
     ChannelClosed,
     #[error("{0}")]
     Offline(String),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     AuthenticationFailed(String),
     #[error("{0}")]
@@ -329,6 +377,7 @@ impl From<ExplorerError> for ExplorerErrorDto {
     fn from(error: ExplorerError) -> Self {
         let code = match &error {
             ExplorerError::InvalidReference => ExplorerErrorCode::InvalidReference,
+            ExplorerError::StaleReference => ExplorerErrorCode::StaleReference,
             ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
             ExplorerError::TimedOut(_) => ExplorerErrorCode::TimedOut,
             ExplorerError::Io { kind, .. } => match kind {
@@ -338,6 +387,7 @@ impl From<ExplorerError> for ExplorerErrorDto {
                 _ => ExplorerErrorCode::Unexpected,
             },
             ExplorerError::Offline(_) => ExplorerErrorCode::Offline,
+            ExplorerError::Unavailable(_) => ExplorerErrorCode::Unavailable,
             ExplorerError::AuthenticationFailed(_) => ExplorerErrorCode::AuthenticationFailed,
             ExplorerError::HostKeyFailure(_) => ExplorerErrorCode::HostKeyFailure,
             ExplorerError::Unsupported(_) => ExplorerErrorCode::Unsupported,
@@ -351,5 +401,26 @@ impl From<ExplorerError> for ExplorerErrorDto {
             code,
             message: error.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RevocationTracker, REVOCATION_HISTORY_LIMIT};
+
+    #[test]
+    fn revocation_history_is_bounded_and_can_forget_reactivated_ids() {
+        let mut tracker = RevocationTracker::default();
+        for index in 0..=REVOCATION_HISTORY_LIMIT {
+            tracker.record(format!("opaque-{index}"));
+        }
+
+        assert_eq!(tracker.len(), REVOCATION_HISTORY_LIMIT);
+        assert!(!tracker.contains("opaque-0"));
+        assert!(tracker.contains("opaque-1"));
+
+        tracker.forget("opaque-1");
+        assert!(!tracker.contains("opaque-1"));
+        assert_eq!(tracker.len(), REVOCATION_HISTORY_LIMIT - 1);
     }
 }

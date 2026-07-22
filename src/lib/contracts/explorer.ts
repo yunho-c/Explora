@@ -178,6 +178,22 @@ export interface SortDescriptor {
   direction: SortDirection;
 }
 
+export type ExplorerFilesystemErrorCode =
+  | "invalidReference"
+  | "staleReference"
+  | "notFound"
+  | "permissionDenied"
+  | "notDirectory"
+  | "cancelled"
+  | "timedOut"
+  | "offline"
+  | "unavailable"
+  | "authenticationFailed"
+  | "hostKeyFailure"
+  | "unsupported"
+  | "invalidConfiguration"
+  | "unexpected";
+
 export interface PreviewDetail {
   label: string;
   value: string;

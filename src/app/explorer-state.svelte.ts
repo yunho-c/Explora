@@ -17,6 +17,7 @@ import type {
   ViewMode,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
+import { ExplorerFilesystemError } from "$lib/data/explorer-data-source";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
@@ -35,6 +36,12 @@ const nameCollator = new Intl.Collator(undefined, {
 
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
+
+const isFilesystemError = (
+  error: unknown,
+  ...codes: ExplorerFilesystemError["code"][]
+): error is ExplorerFilesystemError =>
+  error instanceof ExplorerFilesystemError && codes.includes(error.code);
 
 const PREFERENCES_LOAD_TIMEOUT_MS = 2_000;
 
@@ -347,23 +354,23 @@ export class ExplorerState {
       ? offlineVolumes.find(({ id }) => id === activeTab.locationId)
       : undefined;
     if (removedActiveVolume) {
-      this.directoryController?.abort();
-      this.previewController?.abort();
-      this.loading = false;
+      this.cancelActiveLocationWork();
       this.warningMessage = `“${removedActiveVolume.name}” is no longer available. Reconnect the volume to continue.`;
     }
 
-    const restoredIds = snapshot.volumes
-      .filter(
-        ({ id }) =>
-          previousVolumes.find((location) => location.id === id)?.status ===
-          "offline",
-      )
+    const resetIds = snapshot.volumes
+      .filter(({ id, root }) => {
+        const previous = previousVolumes.find((location) => location.id === id);
+        return (
+          previous?.status === "offline" ||
+          (previous !== undefined && previous.root.id !== root.id)
+        );
+      })
       .map(({ id }) => id);
-    if (restoredIds.length === 0) return;
+    if (resetIds.length === 0) return;
 
     for (const tab of this.tabs) {
-      if (!restoredIds.includes(tab.locationId)) continue;
+      if (!resetIds.includes(tab.locationId)) continue;
       const volume = snapshot.volumes.find(({ id }) => id === tab.locationId);
       if (!volume) continue;
       tab.directory = volume.root;
@@ -371,7 +378,7 @@ export class ExplorerState {
       tab.historyIndex = 0;
       tab.title = volume.name;
     }
-    if (activeTab && restoredIds.includes(activeTab.locationId)) {
+    if (activeTab && resetIds.includes(activeTab.locationId)) {
       const volume = snapshot.volumes.find(
         ({ id }) => id === activeTab.locationId,
       );
@@ -456,27 +463,26 @@ export class ExplorerState {
     const unavailableActiveFolder =
       removedActiveFolder ?? transitionedOfflineFolder;
     if (unavailableActiveFolder) {
-      this.directoryController?.abort();
-      this.previewController?.abort();
-      this.loading = false;
-      this.warningMessage =
-        unavailableActiveFolder.syncedFolder?.source === "manual"
-          ? `“${unavailableActiveFolder.name}” is no longer available. Restore the folder or add it again to continue.`
-          : `“${unavailableActiveFolder.name}” is no longer available. Restart its sync provider to continue.`;
+      this.cancelActiveLocationWork();
+      this.warningMessage = this.unavailableLocationMessage(
+        unavailableActiveFolder,
+      );
     }
 
-    const restoredIds = snapshot.folders
-      .filter(
-        ({ id, status }) =>
+    const resetIds = snapshot.folders
+      .filter(({ id, root, status }) => {
+        const previous = previousFolders.find((location) => location.id === id);
+        return (
           status === "available" &&
-          previousFolders.find((location) => location.id === id)?.status ===
-            "offline",
-      )
+          (previous?.status === "offline" ||
+            (previous !== undefined && previous.root.id !== root.id))
+        );
+      })
       .map(({ id }) => id);
-    if (restoredIds.length === 0) return;
+    if (resetIds.length === 0) return;
 
     for (const tab of this.tabs) {
-      if (!restoredIds.includes(tab.locationId)) continue;
+      if (!resetIds.includes(tab.locationId)) continue;
       const folder = snapshot.folders.find(({ id }) => id === tab.locationId);
       if (!folder) continue;
       tab.directory = folder.root;
@@ -484,7 +490,7 @@ export class ExplorerState {
       tab.historyIndex = 0;
       tab.title = folder.name;
     }
-    if (activeTab && restoredIds.includes(activeTab.locationId)) {
+    if (activeTab && resetIds.includes(activeTab.locationId)) {
       const folder = snapshot.folders.find(
         ({ id }) => id === activeTab.locationId,
       );
@@ -1289,6 +1295,74 @@ export class ExplorerState {
     };
   }
 
+  private unavailableLocationMessage(location: LocationSummary): string {
+    if (location.kind === "volume") {
+      return `“${location.name}” is no longer available. Reconnect the volume to continue.`;
+    }
+    return location.syncedFolder?.source === "manual"
+      ? `“${location.name}” is no longer available. Restore the folder or add it again to continue.`
+      : `“${location.name}” is no longer available. Restart its sync provider to continue.`;
+  }
+
+  private cancelActiveLocationWork(): void {
+    this.directoryController?.abort();
+    this.directoryController = null;
+    this.loading = false;
+    this.closePreview();
+  }
+
+  private markDynamicLocationUnavailable(location: LocationSummary): void {
+    this.locations = this.locations.map((candidate) =>
+      candidate.id === location.id
+        ? {
+            ...candidate,
+            status: "offline",
+            detail:
+              candidate.kind === "volume"
+                ? "Volume unavailable"
+                : "Synced folder unavailable",
+            syncedFolder: candidate.syncedFolder
+              ? { ...candidate.syncedFolder, status: "offline" }
+              : null,
+          }
+        : candidate,
+    );
+    if (this.activeTab?.locationId === location.id) {
+      this.cancelActiveLocationWork();
+    }
+    this.errorMessage = null;
+    this.warningMessage = this.unavailableLocationMessage(location);
+  }
+
+  private async recoverStaleDirectory(target: DirectoryRef): Promise<boolean> {
+    const location = this.locations.find(({ id }) => id === target.locationId);
+    const tab = this.activeTab;
+    if (!location || !tab) return false;
+    if (location.status === "offline") {
+      if (location.kind === "volume" || location.kind === "syncedFolder") {
+        this.markDynamicLocationUnavailable(location);
+      }
+      return false;
+    }
+    if (location.root.id === target.id) {
+      this.errorMessage = null;
+      this.warningMessage = `“${location.name}” changed. Waiting for the latest provider state.`;
+      return false;
+    }
+
+    const recovered = await this.loadDirectory(location.root, (directory) => {
+      tab.locationId = location.id;
+      tab.directory = directory;
+      tab.history = [directory];
+      tab.historyIndex = 0;
+      tab.title = directory.name;
+    });
+    if (recovered) {
+      this.warningMessage = `“${location.name}” changed, so Explora returned to its root.`;
+    }
+    return recovered;
+  }
+
   private clearDirectoryPresentation(): void {
     this.entries = [];
     this.breadcrumbs = [];
@@ -1312,7 +1386,7 @@ export class ExplorerState {
       return false;
     }
     if (location?.kind === "syncedFolder" && location.status === "offline") {
-      this.warningMessage = `“${location.name}” is no longer available. Restart its sync provider to continue.`;
+      this.warningMessage = this.unavailableLocationMessage(location);
       return false;
     }
     this.directoryController?.abort();
@@ -1349,6 +1423,17 @@ export class ExplorerState {
       });
     } catch (error) {
       if (!isAbortError(error) && this.directoryController === controller) {
+        if (isFilesystemError(error, "staleReference")) {
+          return await this.recoverStaleDirectory(target);
+        }
+        if (
+          isFilesystemError(error, "offline", "unavailable") &&
+          location &&
+          (location.kind === "volume" || location.kind === "syncedFolder")
+        ) {
+          this.markDynamicLocationUnavailable(location);
+          return false;
+        }
         this.errorMessage =
           error instanceof Error
             ? error.message

@@ -1,9 +1,13 @@
 use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
 
 use windows::{
+    core::PCWSTR,
     Storage::Provider::StorageProviderSyncRootManager,
     Win32::{
         Foundation::RPC_E_CHANGED_MODE,
+        Storage::CloudFilters::{
+            CfGetSyncRootInfoByPath, CF_SYNC_ROOT_INFO_PROVIDER, CF_SYNC_ROOT_PROVIDER_INFO,
+        },
         System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED},
     },
 };
@@ -13,6 +17,7 @@ pub(crate) struct WindowsSyncRoot {
     pub identity: Vec<u8>,
     pub path: PathBuf,
     pub registration_provider_id: String,
+    pub provider_status: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -81,14 +86,40 @@ pub(crate) fn discover() -> Result<Vec<WindowsSyncRoot>, WindowsSyncRootError> {
             .iter()
             .position(|unit| *unit == u16::from(b'!'))
             .unwrap_or(registration_id.len());
+        let path = PathBuf::from(OsString::from_wide(&path_value));
         roots.push(WindowsSyncRoot {
             identity,
-            path: PathBuf::from(OsString::from_wide(&path_value)),
+            provider_status: query_provider_status(&path),
+            path,
             registration_provider_id: String::from_utf16_lossy(&registration_id[..provider_end]),
         });
     }
 
     Ok(roots)
+}
+
+fn query_provider_status(path: &std::path::Path) -> Option<u32> {
+    let mut wide_path = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if wide_path.is_empty() || wide_path.contains(&0) {
+        return None;
+    }
+    wide_path.push(0);
+    let mut provider_info = CF_SYNC_ROOT_PROVIDER_INFO::default();
+
+    // SAFETY: `wide_path` is null-terminated for the duration of the call and
+    // `provider_info` is a correctly sized writable buffer for the requested
+    // CF_SYNC_ROOT_INFO_PROVIDER class. Provider name/version are ignored.
+    unsafe {
+        CfGetSyncRootInfoByPath(
+            PCWSTR(wide_path.as_ptr()),
+            CF_SYNC_ROOT_INFO_PROVIDER,
+            std::ptr::from_mut(&mut provider_info).cast(),
+            u32::try_from(std::mem::size_of::<CF_SYNC_ROOT_PROVIDER_INFO>()).ok()?,
+            None,
+        )
+    }
+    .ok()?;
+    Some(provider_info.ProviderStatus.0)
 }
 
 fn platform_error(action: &'static str, error: windows::core::Error) -> WindowsSyncRootError {
