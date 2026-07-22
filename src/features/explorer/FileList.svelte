@@ -32,7 +32,7 @@
 
 <ContextMenu.Root>
   <ContextMenu.Trigger>
-    <Table.Root>
+    <Table.Root aria-multiselectable="true">
       <Table.Header>
         <Table.Row>
           <Table.Head>
@@ -82,14 +82,37 @@
       <Table.Body>
         {#each state.visibleEntries as entry (entry.reference.id)}
           <Table.Row
-            data-state={state.selectedEntryId === entry.reference.id
+            data-state={state.isEntrySelected(entry.reference.id)
               ? "selected"
               : undefined}
-            aria-selected={state.selectedEntryId === entry.reference.id}
+            aria-selected={state.isEntrySelected(entry.reference.id)}
+            draggable={state.renamingEntryId !== entry.reference.id}
+            data-cut={state.isEntryCut(entry.reference.id) || undefined}
+            data-drop-target={entry.directory &&
+            state.isDirectoryDropTarget(entry.directory)
+              ? "true"
+              : undefined}
+            class={`${state.isEntryCut(entry.reference.id) ? "opacity-50" : ""} ${entry.directory && state.isDirectoryDropTarget(entry.directory) ? "outline-2 outline-offset-[-2px] outline-ring" : ""}`}
             tabindex={0}
-            oncontextmenu={() => state.selectEntry(entry.reference.id)}
-            onclick={() => state.selectEntry(entry.reference.id)}
+            oncontextmenu={() =>
+              state.selectEntryForContextMenu(entry.reference.id)}
+            onclick={(event) =>
+              state.selectEntry(entry.reference.id, {
+                toggle: event.metaKey || event.ctrlKey,
+                range: event.shiftKey,
+              })}
             ondblclick={() => void state.openEntry(entry.reference.id)}
+            ondragstart={(event) =>
+              state.startEntryDrag(entry.reference.id, event)}
+            ondragover={(event) =>
+              entry.directory &&
+              state.dragOverDirectory(entry.directory, event)}
+            ondragleave={() =>
+              entry.directory && state.leaveDropDirectory(entry.directory)}
+            ondrop={(event) =>
+              entry.directory &&
+              void state.dropDraggedEntries(entry.directory, event)}
+            ondragend={() => state.endEntryDrag()}
             onkeydown={(event) => {
               if (isRenameShortcut(event)) {
                 event.preventDefault();
@@ -130,22 +153,33 @@
   </ContextMenu.Trigger>
   <ContextMenu.Content>
     <ContextMenu.Item
-      disabled={!state.selectedEntry}
+      disabled={state.selectedEntries.length !== 1}
       onclick={() => void state.openPreview()}>Quick Preview</ContextMenu.Item
     >
     <ContextMenu.Separator />
     <ContextMenu.Item
-      disabled={!state.selectedEntry?.capabilities.rename ||
+      disabled={!state.canRenameSelection ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => state.startRename()}>Rename</ContextMenu.Item
     >
     <ContextMenu.Item
-      disabled={!state.selectedEntry?.capabilities.move ||
+      disabled={!state.canCutSelection ||
+        state.fileOperations.activeEntryId !== null}
+      onclick={() => state.cutSelected()}>Cut</ContextMenu.Item
+    >
+    <ContextMenu.Item
+      disabled={!state.canMoveSelection ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => void state.openMoveSelected()}>Move…</ContextMenu.Item
     >
     <ContextMenu.Item
-      disabled={!state.selectedEntry?.capabilities.trash ||
+      disabled={!state.canPasteCutEntries ||
+        state.fileOperations.activeEntryId !== null}
+      onclick={() => void state.pasteCutEntries()}
+      >Paste into This Folder</ContextMenu.Item
+    >
+    <ContextMenu.Item
+      disabled={!state.canTrashSelection ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => void state.moveSelectedToTrash()}
       >Move to Trash</ContextMenu.Item
@@ -153,7 +187,7 @@
     <ContextMenu.Separator />
     <ContextMenu.Item
       class="text-destructive focus:text-destructive"
-      disabled={!state.selectedEntry?.capabilities.deletePermanently ||
+      disabled={!state.canDeleteSelectionPermanently ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => void state.deleteSelectedPermanently()}
       >Delete Permanently</ContextMenu.Item

@@ -5,7 +5,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/svelte";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
 import {
@@ -65,6 +65,98 @@ describe("ExplorerShell", () => {
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
   });
 
+  it("exposes pointer and keyboard multi-selection semantics", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const [first, second, third] = state.visibleEntries;
+    const table = screen.getByRole("table");
+    const rowFor = (name: string) => {
+      const row = within(table).getByText(name).closest("tr");
+      expect(row).not.toBeNull();
+      return row!;
+    };
+
+    await fireEvent.click(rowFor(first.name));
+    await fireEvent.click(rowFor(second.name), { ctrlKey: true });
+    expect(state.selectedEntryIds).toEqual([
+      first.reference.id,
+      second.reference.id,
+    ]);
+    expect(rowFor(first.name)).toHaveAttribute("aria-selected", "true");
+    expect(rowFor(second.name)).toHaveAttribute("aria-selected", "true");
+
+    await fireEvent.click(rowFor(third.name), { shiftKey: true });
+    expect(state.selectedEntryIds).toEqual(
+      state.visibleEntries.slice(1, 3).map(({ reference }) => reference.id),
+    );
+
+    await fireEvent.keyDown(window, { key: "a", ctrlKey: true });
+    expect(state.selectedEntryIds).toHaveLength(state.visibleEntries.length);
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(state.selectedEntryIds).toEqual([]);
+  });
+
+  it("cuts and pastes multiple entries with complete keyboard alternatives", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    const table = screen.getByRole("table");
+    await fireEvent.click(within(table).getByText(notes.name).closest("tr")!);
+    await fireEvent.click(within(table).getByText(image.name).closest("tr")!, {
+      ctrlKey: true,
+    });
+
+    await fireEvent.keyDown(window, { key: "x", ctrlKey: true });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "2 items are ready to move",
+    );
+    expect(within(table).getByText(notes.name).closest("tr")).toHaveAttribute(
+      "data-cut",
+      "true",
+    );
+
+    await state.openDirectory(projects.directory!);
+    await fireEvent.keyDown(window, { key: "v", ctrlKey: true });
+    await waitFor(() => {
+      expect(state.cutEntries).toEqual([]);
+      expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+      expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
+    });
+  });
+
+  it("moves a dragged selection onto a capable directory target", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const table = screen.getByRole("table");
+    const source = within(table).getByText("explora-notes.md").closest("tr")!;
+    const destination = within(table).getByText("Projects").closest("tr")!;
+    const dataTransfer = {
+      effectAllowed: "none",
+      dropEffect: "none",
+      setData: vi.fn(),
+    };
+
+    await fireEvent.dragStart(source, { dataTransfer });
+    await fireEvent.dragOver(destination, { dataTransfer });
+    expect(destination).toHaveAttribute("data-drop-target", "true");
+    await fireEvent.drop(destination, { dataTransfer });
+
+    await waitFor(() =>
+      expect(
+        state.entries.some(({ name }) => name === "explora-notes.md"),
+      ).toBe(false),
+    );
+  });
+
   it("announces item-based progress for a recursive filesystem action", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();
@@ -78,6 +170,8 @@ describe("ExplorerShell", () => {
       totalItems: 7,
       completedBytes: null,
       totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
     };
 
     expect(await screen.findByRole("status")).toHaveTextContent(
@@ -89,6 +183,8 @@ describe("ExplorerShell", () => {
       totalItems: 1,
       completedBytes: "2000",
       totalBytes: "10000",
+      currentItemCompleted: null,
+      currentItemTotal: null,
     };
     await waitFor(() =>
       expect(screen.getByRole("status")).toHaveTextContent(
@@ -203,6 +299,42 @@ describe("ExplorerShell", () => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
     );
     expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
+  });
+
+  it("uses one explicit confirmation for a permanent-delete batch", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const first = screen.getByText("explora-notes.md").closest("tr");
+    const second = screen.getByText("summer-light.jpg").closest("tr");
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    await fireEvent.click(first!);
+    await fireEvent.click(second!, { ctrlKey: true });
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+      altKey: mac,
+      shiftKey: !mac,
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Delete 2 items permanently?",
+      }),
+    ).toBeInTheDocument();
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Delete Permanently" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument();
+      expect(screen.queryByText("summer-light.jpg")).not.toBeInTheDocument();
+    });
   });
 
   it("provides a keyboard-accessible destination chooser for local moves", async () => {

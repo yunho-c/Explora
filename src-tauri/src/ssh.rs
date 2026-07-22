@@ -2176,6 +2176,40 @@ impl SshConnectionManager {
         finish_remote_result(&session, result)
     }
 
+    pub(crate) fn validate_batch_sources(
+        &self,
+        sources: &[EntryRefDto],
+    ) -> Result<(), ExplorerError> {
+        let first = sources.first().ok_or_else(|| {
+            ExplorerError::InvalidConfiguration(
+                "A filesystem action requires at least one selected item.".to_owned(),
+            )
+        })?;
+        let session = self.active_session(&first.location_id)?;
+        let mut paths = Vec::with_capacity(sources.len());
+        for source in sources {
+            if source.location_id != first.location_id {
+                return Err(ExplorerError::InvalidConfiguration(
+                    "A batch filesystem action must use items from one location.".to_owned(),
+                ));
+            }
+            paths.push(session.paths.resolve(&source.id)?);
+        }
+        for (index, path) in paths.iter().enumerate() {
+            if paths
+                .iter()
+                .skip(index + 1)
+                .any(|other| remote_path_contains(path, other) || remote_path_contains(other, path))
+            {
+                return Err(ExplorerError::InvalidConfiguration(
+                    "A batch action cannot include both a folder and one of its descendants."
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn permanently_delete_entry<F>(
         &self,
         source: &EntryRefDto,
@@ -2208,6 +2242,18 @@ impl SshConnectionManager {
         }
         Ok(session)
     }
+}
+
+fn remote_path_contains(ancestor: &str, candidate: &str) -> bool {
+    if ancestor == candidate {
+        return true;
+    }
+    if ancestor == "/" {
+        return candidate.starts_with('/');
+    }
+    candidate
+        .strip_prefix(ancestor)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn finish_remote_result<T>(

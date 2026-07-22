@@ -2,6 +2,8 @@ import type {
   ContentKind,
   DirectoryRef,
   FileEntrySummary,
+  FileOperationBatchResult,
+  FileOperationItemOutcome,
   FileMoveResult,
   FileOperationConfirmation,
   FileOperationPrompt,
@@ -946,6 +948,16 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     };
   }
 
+  async moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    return this.runBatch(entries, options, (entry) =>
+      this.moveEntry(entry, destination, options),
+    );
+  }
+
   async trashEntry(
     entry: FileEntrySummary,
     { signal }: RemoveEntryOptions,
@@ -957,6 +969,15 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     return this.removeDemoEntry(entry, "trashed");
   }
 
+  async trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    return this.runBatch(entries, options, (entry) =>
+      this.trashEntry(entry, options),
+    );
+  }
+
   async deleteEntryPermanently(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,
@@ -964,10 +985,105 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     if (!entry.capabilities.deletePermanently) {
       throw new Error("This item cannot be deleted permanently.");
     }
-    const response = await this.awaitDeleteConfirmation(entry, options);
+    const response = await this.awaitDeleteConfirmation([entry], options);
     if (response === "cancel") throw abortError();
     await wait(40, options.signal);
     return this.removeDemoEntry(entry, "deletedPermanently");
+  }
+
+  async deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const response = await this.awaitDeleteConfirmation(entries, options);
+    if (response === "cancel") {
+      return {
+        kind: "batch",
+        status: "cancelled",
+        items: entries.map((entry) => ({
+          status: "notStarted",
+          source: entry.reference,
+        })),
+      };
+    }
+    return this.runBatch(entries, options, async (entry) => {
+      if (!entry.capabilities.deletePermanently) {
+        throw new Error("This item cannot be deleted permanently.");
+      }
+      await wait(40, options.signal);
+      return this.removeDemoEntry(entry, "deletedPermanently");
+    });
+  }
+
+  private async runBatch(
+    entries: readonly FileEntrySummary[],
+    options: FileOperationOptions,
+    run: (entry: FileEntrySummary) => Promise<FileOperationItemOutcome>,
+  ): Promise<FileOperationBatchResult> {
+    const items: FileOperationBatchResult["items"][number][] = [];
+    let completed = 0;
+    let failed = false;
+    options.onProgress?.({
+      completedItems: 0,
+      totalItems: entries.length,
+      completedBytes: null,
+      totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
+    });
+    for (const [index, entry] of entries.entries()) {
+      if (options.signal.aborted) {
+        items.push({ status: "cancelled", source: entry.reference });
+        items.push(
+          ...entries.slice(index + 1).map((remaining) => ({
+            status: "notStarted" as const,
+            source: remaining.reference,
+          })),
+        );
+        return { kind: "batch", status: "cancelled", items };
+      }
+      try {
+        const outcome = await run(entry);
+        items.push({ status: "completed", source: entry.reference, outcome });
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          items.push({ status: "cancelled", source: entry.reference });
+          items.push(
+            ...entries.slice(index + 1).map((remaining) => ({
+              status: "notStarted" as const,
+              source: remaining.reference,
+            })),
+          );
+          return { kind: "batch", status: "cancelled", items };
+        }
+        failed = true;
+        items.push({
+          status: "failed",
+          source: entry.reference,
+          error: {
+            code: "unexpected",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Explora could not complete this item.",
+          },
+        });
+      }
+      completed += 1;
+      options.onProgress?.({
+        completedItems: completed,
+        totalItems: entries.length,
+        completedBytes: null,
+        totalBytes: null,
+        currentItemCompleted: null,
+        currentItemTotal: null,
+      });
+    }
+    return {
+      kind: "batch",
+      status: failed ? "partial" : "completed",
+      items,
+    };
   }
 
   private removeDemoEntry(
@@ -999,7 +1115,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   }
 
   private awaitDeleteConfirmation(
-    entry: FileEntrySummary,
+    entries: readonly FileEntrySummary[],
     { signal, onPrompt }: RemoveEntryOptions,
   ): Promise<FileOperationPromptResponse> {
     return new Promise((resolve, reject) => {
@@ -1014,18 +1130,27 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         reject(abortError());
       };
       signal.addEventListener("abort", abort, { once: true });
+      const entry = entries[0];
+      const count = entries.length;
       const location =
         locations.find(({ id }) => id === entry.reference.locationId) ??
         this.dynamicLocations.get(entry.reference.locationId);
       const remote = location?.kind === "ssh";
       const confirmation: FileOperationConfirmation = {
-        id: `demo-delete-${entry.reference.id}`,
+        id: `demo-delete-${entries.map(({ reference }) => reference.id).join("-")}`,
         kind: "permanentDelete",
-        title: `Delete “${entry.name}” permanently?`,
+        title:
+          count === 1
+            ? `Delete “${entry.name}” permanently?`
+            : `Delete ${count} items permanently?`,
         message: remote
-          ? `This remote item on ${location.name} will be removed immediately. It cannot be recovered from Trash.`
-          : "This item will be removed immediately and cannot be recovered from Trash.",
-        targetName: entry.name,
+          ? count === 1
+            ? `This remote item on ${location.name} will be removed immediately. It cannot be recovered from Trash.`
+            : `These remote items on ${location.name} will be removed immediately. They cannot be recovered from Trash.`
+          : count === 1
+            ? "This item will be removed immediately and cannot be recovered from Trash."
+            : "These items will be removed immediately and cannot be recovered from Trash.",
+        targetName: count === 1 ? entry.name : `${count} selected items`,
         locationName: location
           ? remote
             ? `${location.name} (${location.detail})`

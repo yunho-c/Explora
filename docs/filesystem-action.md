@@ -57,9 +57,10 @@ The implementation must:
 - Report partial and uncertain outcomes honestly.
 - Apply the same domain and lifecycle model to local and remote locations.
 
-The first shipped slice supports exactly one selected entry. The domain and IPC
-shapes accept entry collections so multi-selection can be enabled later. The
-following are deferred:
+Rename remains a single-entry action. Move, Trash, and permanent deletion accept
+bounded entry collections from one source location, execute them sequentially
+under one operation ID, and return a structured result for every selected item.
+The following are deferred:
 
 - Directory merging.
 - Undo beyond recovery through the operating system's trash facility.
@@ -70,8 +71,8 @@ following are deferred:
 
 ## Current implementation
 
-Phases 1 through 5 are implemented for single entries. Native Trash and local
-move still require packaged validation on every supported platform:
+Phases 1 through 8 are implemented. Native Trash and local move still require
+packaged validation on every supported platform:
 
 - Local and remote paths are represented by opaque, location-scoped tokens.
 - Directory listings already use typed incremental events and cancellation.
@@ -99,13 +100,33 @@ move still require packaged validation on every supported platform:
   `outcomeUncertain` error and takes the session offline without retry. Failure
   after some recursive removals becomes `partialCompletion`.
 - The accessible destination chooser consumes opaque directory references and
-  capability data. Cross-location destinations remain visibly unavailable until
-  transfer-based moves are implemented.
+  capability data, including compatible cross-location destinations.
 - The frontend validates IPC responses through a replaceable data-source
   boundary.
-- List and grid views expose capability-gated context and platform-keyboard
-  actions with accessible blocking dialogs for permanent deletion and move
-  conflicts.
+- List and grid views expose modifier-toggle, contiguous range, Select All, and
+  keyboard-extended multi-selection. Context and platform-keyboard actions use
+  capability intersections, with accessible blocking dialogs for permanent
+  deletion and move conflicts.
+- Batch operations are bounded to 1,000 unique sources from one location and run
+  sequentially so cancellation is checked between entries. Rename remains
+  single-entry. A folder and its descendant cannot appear in the same request.
+  Aggregate selection progress and current-entry progress remain distinct.
+- Batch terminal results preserve input order and distinguish completed, failed,
+  cancelled, and unstarted entries. Failed or cancelled lifecycle events carry
+  the partial result so the frontend can reconcile mutations that already
+  completed without presenting the overall operation as successful.
+- Permanent deletion uses one Rust-authoritative confirmation for the entire
+  selection. Move conflicts remain per-entry decisions with Keep Both, Skip, or
+  Cancel; a skip is a completed, explicit item result.
+- Cut/paste stores opaque entry snapshots only in frontend memory and submits
+  paste through the same move request. Completed items leave the clipboard;
+  skipped, failed, cancelled, and unstarted items remain available for an
+  explicit retry.
+- Internal drag-and-drop carries no authoritative path through browser drag
+  data. It uses the current selected references and exposes only
+  capability-compatible directory rows, favorites, mounted volumes, and
+  connected SSH roots as drop targets. Explicit Move and cut/paste commands are
+  complete keyboard alternatives.
 - Disposable SSH/SFTP tests cover real authentication, trust, listing,
   relocation conflicts, permission failures, symlink-safe recursive deletion,
   partial completion, cancellation, disconnect, timeout, and reconnect behavior.
@@ -114,9 +135,9 @@ Packaged native trash and same-filesystem move must still be exercised on macOS,
 Linux, and Windows before those phases are considered complete across all
 supported targets.
 
-The remaining work is transfer-based moves with verified finalization,
-multi-selection and collision planning, undo, and the corresponding
-cross-platform/native validation.
+The implementation phases in this plan are complete. Cross-platform
+packaged/native validation remains required. Undo beyond operating-system Trash
+recovery remains explicitly deferred.
 
 ## Architecture
 
@@ -612,10 +633,47 @@ link or guessing whether to create a file or directory link.
   structured partial results.
 - Test mixed entry types and capability intersections.
 
+Implemented. Requests are capped at 1,000 unique sources from one location;
+rename still requires exactly one, and overlapping ancestor/descendant sources
+are rejected before mutation. The coordinator executes entries in request order,
+continues after item-local failures, stops after uncertain or systemic failures,
+and checks cancellation between entries. Terminal batch results carry one
+ordered status per source, including entries that were cancelled or never
+started. Aggregate selected-item progress is separate from current-directory
+entry and byte progress.
+
+List and grid selection support ordinary replacement, platform-modifier toggles,
+Shift ranges, Shift-arrow extension, and Select All. A retained primary entry
+continues to drive preview and keyboard focus, while rename and preview require a
+single selection and destructive/move commands use the capability intersection.
+The move chooser rejects every selected directory as its own destination.
+
+Permanent deletion presents one authoritative confirmation for the batch. Move
+conflicts are decided per source and preserve Keep Both, Skip, and Cancel without
+silent replacement. Completed prefixes are reconciled even when the terminal
+state is partial or cancelled.
+
 ### Phase 8: Additional interaction surfaces
 
 - Implement drag-and-drop and cut/paste as clients of the same operation API.
 - Keep explicit commands available as complete keyboard alternatives.
+
+Implemented. Cut uses an application-local, in-memory clipboard of typed entry
+summaries; paste sends only their opaque references through the existing move
+operation. The clipboard survives navigation, never writes private paths to the
+operating-system clipboard, and removes only sources whose move result completed.
+Skipped, failed, cancelled, and unstarted sources remain cut so the user can
+choose another destination or retry deliberately.
+
+HTML drag data contains only an internal marker. The authoritative dragged
+selection remains in frontend state and is discarded at drag end, so arbitrary
+external drop payloads cannot become filesystem references. File-list and grid
+directories, favorite roots, mounted volumes, and connected SSH roots advertise
+drop state from their directory capabilities. Invalid self, source-parent, and
+unsupported destinations never accept the drop; deeper ancestry and mutable
+state are still revalidated by Rust. Move commands and platform cut/paste
+shortcuts provide complete keyboard alternatives, and cut state has a visible,
+screen-reader-announced status with an explicit cancel action.
 
 ## Testing strategy
 

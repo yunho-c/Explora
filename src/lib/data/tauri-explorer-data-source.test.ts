@@ -336,6 +336,109 @@ describe("TauriExplorerDataSource", () => {
     });
   });
 
+  it("resolves structured partial results for a batch move", async () => {
+    const secondEntry: FileEntrySummary = {
+      ...previewEntry,
+      reference: { id: "second-entry-token", locationId: "home" },
+      name: "photo.jpg",
+      displayPath: "/Users/test/photo.jpg",
+      contentKind: "image",
+    };
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      expect(Reflect.get(payload, "request")).toEqual({
+        sources: [previewEntry.reference, secondEntry.reference],
+        action: { kind: "move", destination },
+      });
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "queued",
+          operationId: "operation-batch-move",
+          sequence: 0,
+          action: "move",
+          completedItems: 0,
+          totalItems: 2,
+        },
+        {
+          event: "running",
+          operationId: "operation-batch-move",
+          sequence: 1,
+          action: "move",
+          completedItems: 1,
+          totalItems: 2,
+          currentItemCompleted: 2,
+          currentItemTotal: 4,
+        },
+        {
+          event: "failed",
+          operationId: "operation-batch-move",
+          sequence: 2,
+          action: "move",
+          completedItems: 2,
+          totalItems: 2,
+          error: {
+            code: "partialCompletion",
+            message: "Explora completed 1 of 2 selected items.",
+          },
+          outcome: {
+            kind: "batch",
+            status: "partial",
+            items: [
+              {
+                status: "completed",
+                source: previewEntry.reference,
+                outcome: {
+                  kind: "moved",
+                  entry: {
+                    ...entryPayload,
+                    displayPath: "/Users/test/Archive/notes.md",
+                  },
+                  sourceParent: root,
+                  destination,
+                  rebasedEntryIds: [previewEntry.reference.id],
+                  invalidatedEntryIds: [],
+                },
+              },
+              {
+                status: "failed",
+                source: secondEntry.reference,
+                error: {
+                  code: "permissionDenied",
+                  message: "This item could not be moved.",
+                },
+              },
+            ],
+          },
+        },
+      ]);
+      return "operation-batch-move";
+    });
+
+    await expect(
+      new TauriExplorerDataSource().moveEntries(
+        [previewEntry, secondEntry],
+        destination,
+        {
+          signal: new AbortController().signal,
+          onPrompt: vi.fn(),
+        },
+      ),
+    ).resolves.toMatchObject({
+      kind: "batch",
+      status: "partial",
+      items: [
+        { status: "completed", outcome: { kind: "moved" } },
+        {
+          status: "failed",
+          error: { code: "permissionDenied" },
+        },
+      ],
+    });
+  });
+
   it("answers an authoritative move conflict with keep-both", async () => {
     let operationChannel: unknown;
     let prompt:
@@ -696,12 +799,16 @@ describe("TauriExplorerDataSource", () => {
       totalItems: 3,
       completedBytes: null,
       totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
     });
     expect(onProgress).toHaveBeenCalledWith({
       completedItems: 2,
       totalItems: 3,
       completedBytes: null,
       totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
     });
   });
 

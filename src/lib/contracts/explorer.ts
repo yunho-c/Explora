@@ -200,6 +200,33 @@ export interface FileRemovalResult {
   invalidatedEntryIds: readonly string[];
 }
 
+export interface FileOperationItemError {
+  code: string;
+  message: string;
+}
+
+export type FileOperationItemOutcome = FileMoveResult | FileRemovalResult;
+
+export type FileOperationBatchItem =
+  | {
+      status: "completed";
+      source: EntryRef;
+      outcome: FileOperationItemOutcome;
+    }
+  | {
+      status: "failed";
+      source: EntryRef;
+      error: FileOperationItemError;
+    }
+  | { status: "cancelled"; source: EntryRef }
+  | { status: "notStarted"; source: EntryRef };
+
+export interface FileOperationBatchResult {
+  kind: "batch";
+  status: "completed" | "partial" | "cancelled";
+  items: readonly FileOperationBatchItem[];
+}
+
 export interface ExplorerTab {
   id: string;
   title: string;

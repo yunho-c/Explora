@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc, Mutex,
@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     filesystem::{
-        DirectoryRefDto, EntryRefDto, ExplorerError, ExplorerErrorDto, FileEntrySummaryDto,
-        PROMPT_TIMEOUT,
+        DirectoryRefDto, EntryRefDto, ExplorerError, ExplorerErrorCode, ExplorerErrorDto,
+        FileEntrySummaryDto, PROMPT_TIMEOUT,
     },
     local_filesystem::{
         LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, PreparedLocalFileDestination,
@@ -30,7 +30,7 @@ use crate::{
     transfer::{LocalTransferEntryKind, TRANSFER_CHUNK_BYTES},
 };
 
-const MAX_OPERATION_SOURCES: usize = 1;
+const MAX_OPERATION_SOURCES: usize = 1_000;
 const BYTE_PROGRESS_EVENT_INTERVAL: u64 = 4 * 1024 * 1024;
 const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -140,6 +140,41 @@ pub enum FileOperationOutcomeDto {
         name: String,
         invalidated_entry_ids: Vec<String>,
     },
+    Batch {
+        status: FileOperationBatchStatusDto,
+        items: Vec<FileOperationBatchItemDto>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FileOperationBatchStatusDto {
+    Completed,
+    Partial,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FileOperationBatchItemDto {
+    Completed {
+        source: EntryRefDto,
+        outcome: Box<FileOperationOutcomeDto>,
+    },
+    Failed {
+        source: EntryRefDto,
+        error: ExplorerErrorDto,
+    },
+    Cancelled {
+        source: EntryRefDto,
+    },
+    NotStarted {
+        source: EntryRefDto,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -157,6 +192,8 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
     },
     Running {
         operation_id: String,
@@ -166,6 +203,8 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
     },
     AwaitingConfirmation {
         operation_id: String,
@@ -175,6 +214,8 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
         prompt: FileOperationPromptDto,
     },
     AwaitingConflict {
@@ -185,6 +226,8 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
         prompt: FileOperationPromptDto,
     },
     Completed {
@@ -195,6 +238,8 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
         outcome: FileOperationOutcomeDto,
     },
     Cancelled {
@@ -205,6 +250,9 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
+        outcome: Option<FileOperationOutcomeDto>,
     },
     Failed {
         operation_id: String,
@@ -214,8 +262,33 @@ pub enum FileOperationEventDto {
         total_items: u64,
         completed_bytes: Option<String>,
         total_bytes: Option<String>,
+        current_item_completed: Option<u64>,
+        current_item_total: Option<u64>,
         error: ExplorerErrorDto,
+        outcome: Option<FileOperationOutcomeDto>,
     },
+}
+
+enum OperationTerminal {
+    Completed(FileOperationOutcomeDto),
+    Cancelled(Option<FileOperationOutcomeDto>),
+    Failed {
+        error: ExplorerErrorDto,
+        outcome: Option<FileOperationOutcomeDto>,
+    },
+}
+
+impl From<Result<FileOperationOutcomeDto, ExplorerError>> for OperationTerminal {
+    fn from(result: Result<FileOperationOutcomeDto, ExplorerError>) -> Self {
+        match result {
+            Ok(outcome) => Self::Completed(outcome),
+            Err(ExplorerError::Cancelled) => Self::Cancelled(None),
+            Err(error) => Self::Failed {
+                error: ExplorerErrorDto::from(error),
+                outcome: None,
+            },
+        }
+    }
 }
 
 struct PendingPrompt {
@@ -361,6 +434,8 @@ struct OperationEventEmitter {
     total_items: u64,
     completed_bytes: Option<u64>,
     total_bytes: Option<u64>,
+    current_item_completed: Option<u64>,
+    current_item_total: Option<u64>,
     channel: Channel<FileOperationEventDto>,
 }
 
@@ -382,6 +457,8 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.completed_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
+                current_item_completed: self.current_item_completed,
+                current_item_total: self.current_item_total,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
     }
@@ -400,6 +477,8 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.completed_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
+                current_item_completed: self.current_item_completed,
+                current_item_total: self.current_item_total,
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
@@ -416,6 +495,8 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.completed_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
+                current_item_completed: self.current_item_completed,
+                current_item_total: self.current_item_total,
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
@@ -425,9 +506,28 @@ impl OperationEventEmitter {
         if total_items == 0 || completed_items > total_items {
             return Err(ExplorerError::StateUnavailable);
         }
-        self.completed_items = completed_items;
-        self.total_items = total_items;
+        self.current_item_completed = Some(completed_items);
+        self.current_item_total = Some(total_items);
         self.running()
+    }
+
+    fn begin_item(&mut self) {
+        self.completed_bytes = None;
+        self.total_bytes = None;
+        self.current_item_completed = None;
+        self.current_item_total = None;
+    }
+
+    fn settle_item(&mut self) -> Result<(), ExplorerError> {
+        if self.completed_items >= self.total_items {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        self.completed_items += 1;
+        self.begin_item();
+        if self.completed_items < self.total_items {
+            self.running()?;
+        }
+        Ok(())
     }
 
     fn byte_progress(
@@ -443,10 +543,10 @@ impl OperationEventEmitter {
         self.running()
     }
 
-    fn terminal(&mut self, result: Result<FileOperationOutcomeDto, ExplorerError>) {
+    fn terminal(&mut self, terminal: OperationTerminal) {
         let sequence = self.next_sequence();
-        let event = match result {
-            Ok(outcome) => FileOperationEventDto::Completed {
+        let event = match terminal {
+            OperationTerminal::Completed(outcome) => FileOperationEventDto::Completed {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
@@ -454,9 +554,11 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.total_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
+                current_item_completed: self.current_item_total,
+                current_item_total: self.current_item_total,
                 outcome,
             },
-            Err(ExplorerError::Cancelled) => FileOperationEventDto::Cancelled {
+            OperationTerminal::Cancelled(outcome) => FileOperationEventDto::Cancelled {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
@@ -464,8 +566,11 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.completed_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
+                current_item_completed: self.current_item_completed,
+                current_item_total: self.current_item_total,
+                outcome,
             },
-            Err(error) => FileOperationEventDto::Failed {
+            OperationTerminal::Failed { error, outcome } => FileOperationEventDto::Failed {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
@@ -473,7 +578,10 @@ impl OperationEventEmitter {
                 total_items: self.total_items,
                 completed_bytes: self.completed_bytes.map(|value| value.to_string()),
                 total_bytes: self.total_bytes.map(|value| value.to_string()),
-                error: ExplorerErrorDto::from(error),
+                current_item_completed: self.current_item_completed,
+                current_item_total: self.current_item_total,
+                error,
+                outcome,
             },
         };
         let _ = self.channel.send(event);
@@ -529,6 +637,9 @@ impl FileOperationCoordinator {
     ) -> Result<String, ExplorerError> {
         validate_request(&request)?;
         let action = request.action.kind();
+        let total_items = u64::try_from(request.sources.len()).map_err(|_| {
+            ExplorerError::InvalidConfiguration("Too many selected items.".to_owned())
+        })?;
         let operation_id = Uuid::new_v4().to_string();
         let active = Arc::new(ActiveOperation::default());
         self.active
@@ -541,9 +652,11 @@ impl FileOperationCoordinator {
                 sequence: 0,
                 action,
                 completed_items: 0,
-                total_items: 1,
+                total_items,
                 completed_bytes: None,
                 total_bytes: None,
+                current_item_completed: None,
+                current_item_total: None,
             })
             .is_err()
         {
@@ -566,18 +679,32 @@ impl FileOperationCoordinator {
                     action,
                     sequence: 1,
                     completed_items: 0,
-                    total_items: 1,
+                    total_items,
                     completed_bytes: None,
                     total_bytes: None,
+                    current_item_completed: None,
+                    current_item_total: None,
                     channel: on_event,
                 };
                 let result = if request.sources[0].location_id.starts_with("ssh:") {
                     coordinator
-                        .run_remote(local.clone(), &ssh, &request, active.clone(), &mut events)
+                        .run_remote_batch(
+                            local.clone(),
+                            &ssh,
+                            &request,
+                            active.clone(),
+                            &mut events,
+                        )
                         .await
                 } else {
                     coordinator
-                        .run_local_to_remote(local, ssh, &request, active.clone(), &mut events)
+                        .run_local_to_remote_batch(
+                            local,
+                            ssh,
+                            &request,
+                            active.clone(),
+                            &mut events,
+                        )
                         .await
                 };
                 active.clear_prompt();
@@ -591,12 +718,14 @@ impl FileOperationCoordinator {
                     action,
                     sequence: 1,
                     completed_items: 0,
-                    total_items: 1,
+                    total_items,
                     completed_bytes: None,
                     total_bytes: None,
+                    current_item_completed: None,
+                    current_item_total: None,
                     channel: on_event,
                 };
-                let result = coordinator.run_local(&local, &request, &active, &mut events);
+                let result = coordinator.run_local_batch(&local, &request, &active, &mut events);
                 active.clear_prompt();
                 events.terminal(result);
                 coordinator.finish(&task_operation_id);
@@ -633,12 +762,160 @@ impl FileOperationCoordinator {
             .respond(prompt_id, response)
     }
 
-    fn run_local(
+    fn run_local_batch(
         &self,
         local: &LocalFilesystem,
         request: &FileOperationRequestDto,
         active: &ActiveOperation,
         events: &mut OperationEventEmitter,
+    ) -> OperationTerminal {
+        if request.sources.len() == 1 {
+            return self
+                .run_local_single(local, request, active, events, false)
+                .into();
+        }
+        if let Err(error) = local.validate_batch_sources(&request.sources) {
+            return OperationTerminal::from(Err(error));
+        }
+
+        let delete_confirmed =
+            if matches!(request.action, FileOperationActionDto::DeletePermanently {}) {
+                match self.confirm_local_batch_delete(local, request, active, events) {
+                    Ok(()) => true,
+                    Err(ExplorerError::Cancelled) => {
+                        return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                            &request.sources,
+                            Vec::new(),
+                            0,
+                        )));
+                    }
+                    Err(error) => return OperationTerminal::from(Err(error)),
+                }
+            } else {
+                false
+            };
+
+        let mut items = Vec::with_capacity(request.sources.len());
+        let mut successful = 0_usize;
+        let mut failures = 0_usize;
+        for (index, source) in request.sources.iter().enumerate() {
+            events.begin_item();
+            if active.ensure_not_cancelled().is_err() {
+                return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                    &request.sources,
+                    items,
+                    index,
+                )));
+            }
+            let single = single_source_request(request, source.clone());
+            match self.run_local_single(local, &single, active, events, delete_confirmed) {
+                Ok(outcome) => {
+                    successful += 1;
+                    items.push(FileOperationBatchItemDto::Completed {
+                        source: source.clone(),
+                        outcome: Box::new(outcome),
+                    });
+                    if let Err(error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(error),
+                        );
+                    }
+                }
+                Err(ExplorerError::Cancelled) => {
+                    items.push(FileOperationBatchItemDto::Cancelled {
+                        source: source.clone(),
+                    });
+                    return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                        &request.sources,
+                        items,
+                        index + 1,
+                    )));
+                }
+                Err(error) => {
+                    let stop = should_stop_batch(&error);
+                    let error = ExplorerErrorDto::from(error);
+                    failures += 1;
+                    items.push(FileOperationBatchItemDto::Failed {
+                        source: source.clone(),
+                        error: error.clone(),
+                    });
+                    if let Err(progress_error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(progress_error),
+                        );
+                    }
+                    if stop {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            error,
+                        );
+                    }
+                }
+            }
+        }
+
+        completed_batch_terminal(items, successful, failures, request.sources.len())
+    }
+
+    fn confirm_local_batch_delete(
+        &self,
+        local: &LocalFilesystem,
+        request: &FileOperationRequestDto,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<(), ExplorerError> {
+        let (_, location_name) = local.describe_operation_target(&request.sources[0])?;
+        for source in request.sources.iter().skip(1) {
+            local.describe_operation_target(source)?;
+        }
+        let count = request.sources.len();
+        let target_name = format!("{count} selected items");
+        let prompt_id = Uuid::new_v4().to_string();
+        let response = active.begin_prompt(
+            prompt_id.clone(),
+            vec![
+                FileOperationPromptResponseDto::Confirm,
+                FileOperationPromptResponseDto::Cancel,
+            ],
+        )?;
+        events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+            id: prompt_id,
+            title: format!("Delete {count} items permanently?"),
+            message: "These items will be removed immediately and cannot be recovered from Trash."
+                .to_owned(),
+            target_name,
+            location_name,
+            confirm_label: "Delete Permanently",
+        })?;
+        match active.await_prompt(response)? {
+            FileOperationPromptResponseDto::Confirm => Ok(()),
+            FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+            FileOperationPromptResponseDto::KeepBoth | FileOperationPromptResponseDto::Skip => {
+                Err(ExplorerError::InvalidConfiguration(
+                    "That response is not valid for permanent deletion.".to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn run_local_single(
+        &self,
+        local: &LocalFilesystem,
+        request: &FileOperationRequestDto,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+        delete_confirmed: bool,
     ) -> Result<FileOperationOutcomeDto, ExplorerError> {
         active.ensure_not_cancelled()?;
         events.running()?;
@@ -729,33 +1006,37 @@ impl FileOperationCoordinator {
                 })
                 .map(trashed_outcome),
             FileOperationActionDto::DeletePermanently {} => {
-                let (target_name, location_name) = local.describe_operation_target(source)?;
-                let prompt_id = Uuid::new_v4().to_string();
-                let response = active.begin_prompt(
-                    prompt_id.clone(),
-                    vec![
-                        FileOperationPromptResponseDto::Confirm,
-                        FileOperationPromptResponseDto::Cancel,
-                    ],
-                )?;
-                events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
-                    id: prompt_id,
-                    title: format!("Delete “{target_name}” permanently?"),
-                    message:
-                        "This item will be removed immediately and cannot be recovered from Trash."
-                            .to_owned(),
-                    target_name,
-                    location_name,
-                    confirm_label: "Delete Permanently",
-                })?;
-                match active.await_prompt(response)? {
-                    FileOperationPromptResponseDto::Confirm => {}
-                    FileOperationPromptResponseDto::Cancel => return Err(ExplorerError::Cancelled),
-                    FileOperationPromptResponseDto::KeepBoth
-                    | FileOperationPromptResponseDto::Skip => {
-                        return Err(ExplorerError::InvalidConfiguration(
-                            "That response is not valid for permanent deletion.".to_owned(),
-                        ));
+                if !delete_confirmed {
+                    let (target_name, location_name) = local.describe_operation_target(source)?;
+                    let prompt_id = Uuid::new_v4().to_string();
+                    let response = active.begin_prompt(
+                        prompt_id.clone(),
+                        vec![
+                            FileOperationPromptResponseDto::Confirm,
+                            FileOperationPromptResponseDto::Cancel,
+                        ],
+                    )?;
+                    events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+                        id: prompt_id,
+                        title: format!("Delete “{target_name}” permanently?"),
+                        message:
+                            "This item will be removed immediately and cannot be recovered from Trash."
+                                .to_owned(),
+                        target_name,
+                        location_name,
+                        confirm_label: "Delete Permanently",
+                    })?;
+                    match active.await_prompt(response)? {
+                        FileOperationPromptResponseDto::Confirm => {}
+                        FileOperationPromptResponseDto::Cancel => {
+                            return Err(ExplorerError::Cancelled);
+                        }
+                        FileOperationPromptResponseDto::KeepBoth
+                        | FileOperationPromptResponseDto::Skip => {
+                            return Err(ExplorerError::InvalidConfiguration(
+                                "That response is not valid for permanent deletion.".to_owned(),
+                            ));
+                        }
                     }
                 }
                 events.running()?;
@@ -846,7 +1127,107 @@ impl FileOperationCoordinator {
         }
     }
 
-    async fn run_local_to_remote(
+    async fn run_local_to_remote_batch(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: Arc<SshConnectionManager>,
+        request: &FileOperationRequestDto,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+    ) -> OperationTerminal {
+        if request.sources.len() == 1 {
+            return self
+                .run_local_to_remote_single(local, ssh, request, active, events)
+                .await
+                .into();
+        }
+        if let Err(error) = local.validate_batch_sources(&request.sources) {
+            return OperationTerminal::from(Err(error));
+        }
+
+        let mut items = Vec::with_capacity(request.sources.len());
+        let mut successful = 0_usize;
+        let mut failures = 0_usize;
+        for (index, source) in request.sources.iter().enumerate() {
+            events.begin_item();
+            if active.ensure_not_cancelled().is_err() {
+                return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                    &request.sources,
+                    items,
+                    index,
+                )));
+            }
+            let single = single_source_request(request, source.clone());
+            match self
+                .run_local_to_remote_single(
+                    local.clone(),
+                    ssh.clone(),
+                    &single,
+                    active.clone(),
+                    events,
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    successful += 1;
+                    items.push(FileOperationBatchItemDto::Completed {
+                        source: source.clone(),
+                        outcome: Box::new(outcome),
+                    });
+                    if let Err(error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(error),
+                        );
+                    }
+                }
+                Err(ExplorerError::Cancelled) => {
+                    items.push(FileOperationBatchItemDto::Cancelled {
+                        source: source.clone(),
+                    });
+                    return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                        &request.sources,
+                        items,
+                        index + 1,
+                    )));
+                }
+                Err(error) => {
+                    let stop = should_stop_batch(&error);
+                    let error = ExplorerErrorDto::from(error);
+                    failures += 1;
+                    items.push(FileOperationBatchItemDto::Failed {
+                        source: source.clone(),
+                        error: error.clone(),
+                    });
+                    if let Err(progress_error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(progress_error),
+                        );
+                    }
+                    if stop {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            error,
+                        );
+                    }
+                }
+            }
+        }
+
+        completed_batch_terminal(items, successful, failures, request.sources.len())
+    }
+
+    async fn run_local_to_remote_single(
         &self,
         local: Arc<LocalFilesystem>,
         ssh: Arc<SshConnectionManager>,
@@ -1419,13 +1800,177 @@ impl FileOperationCoordinator {
         })
     }
 
-    async fn run_remote(
+    async fn run_remote_batch(
         &self,
         local: Arc<LocalFilesystem>,
         ssh: &SshConnectionManager,
         request: &FileOperationRequestDto,
         active: Arc<ActiveOperation>,
         events: &mut OperationEventEmitter,
+    ) -> OperationTerminal {
+        if request.sources.len() == 1 {
+            return self
+                .run_remote_single(local, ssh, request, active, events, false)
+                .await
+                .into();
+        }
+        if let Err(error) = ssh.validate_batch_sources(&request.sources) {
+            return OperationTerminal::from(Err(error));
+        }
+
+        let delete_confirmed =
+            if matches!(request.action, FileOperationActionDto::DeletePermanently {}) {
+                match self
+                    .confirm_remote_batch_delete(ssh, request, &active, events)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(ExplorerError::Cancelled) => {
+                        return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                            &request.sources,
+                            Vec::new(),
+                            0,
+                        )));
+                    }
+                    Err(error) => return OperationTerminal::from(Err(error)),
+                }
+            } else {
+                false
+            };
+
+        let mut items = Vec::with_capacity(request.sources.len());
+        let mut successful = 0_usize;
+        let mut failures = 0_usize;
+        for (index, source) in request.sources.iter().enumerate() {
+            events.begin_item();
+            if active.ensure_not_cancelled().is_err() {
+                return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                    &request.sources,
+                    items,
+                    index,
+                )));
+            }
+            let single = single_source_request(request, source.clone());
+            match self
+                .run_remote_single(
+                    local.clone(),
+                    ssh,
+                    &single,
+                    active.clone(),
+                    events,
+                    delete_confirmed,
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    successful += 1;
+                    items.push(FileOperationBatchItemDto::Completed {
+                        source: source.clone(),
+                        outcome: Box::new(outcome),
+                    });
+                    if let Err(error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(error),
+                        );
+                    }
+                }
+                Err(ExplorerError::Cancelled) => {
+                    items.push(FileOperationBatchItemDto::Cancelled {
+                        source: source.clone(),
+                    });
+                    return OperationTerminal::Cancelled(Some(cancelled_batch_outcome(
+                        &request.sources,
+                        items,
+                        index + 1,
+                    )));
+                }
+                Err(error) => {
+                    let stop = should_stop_batch(&error);
+                    let error = ExplorerErrorDto::from(error);
+                    failures += 1;
+                    items.push(FileOperationBatchItemDto::Failed {
+                        source: source.clone(),
+                        error: error.clone(),
+                    });
+                    if let Err(progress_error) = events.settle_item() {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            ExplorerErrorDto::from(progress_error),
+                        );
+                    }
+                    if stop {
+                        return failed_batch_terminal(
+                            &request.sources,
+                            items,
+                            index + 1,
+                            successful,
+                            error,
+                        );
+                    }
+                }
+            }
+        }
+
+        completed_batch_terminal(items, successful, failures, request.sources.len())
+    }
+
+    async fn confirm_remote_batch_delete(
+        &self,
+        ssh: &SshConnectionManager,
+        request: &FileOperationRequestDto,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<(), ExplorerError> {
+        let (_, location_name) = ssh.describe_operation_target(&request.sources[0]).await?;
+        for source in request.sources.iter().skip(1) {
+            ssh.describe_operation_target(source).await?;
+        }
+        let count = request.sources.len();
+        let target_name = format!("{count} selected items");
+        let prompt_id = Uuid::new_v4().to_string();
+        let response = active.begin_prompt(
+            prompt_id.clone(),
+            vec![
+                FileOperationPromptResponseDto::Confirm,
+                FileOperationPromptResponseDto::Cancel,
+            ],
+        )?;
+        events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+            id: prompt_id,
+            title: format!("Delete {count} items permanently?"),
+            message: format!(
+                "These remote items on {location_name} will be removed immediately. They cannot be recovered from Trash."
+            ),
+            target_name,
+            location_name,
+            confirm_label: "Delete Permanently",
+        })?;
+        match active.await_prompt_async(response).await? {
+            FileOperationPromptResponseDto::Confirm => Ok(()),
+            FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+            FileOperationPromptResponseDto::KeepBoth | FileOperationPromptResponseDto::Skip => {
+                Err(ExplorerError::InvalidConfiguration(
+                    "That response is not valid for permanent deletion.".to_owned(),
+                ))
+            }
+        }
+    }
+
+    async fn run_remote_single(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: &SshConnectionManager,
+        request: &FileOperationRequestDto,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+        delete_confirmed: bool,
     ) -> Result<FileOperationOutcomeDto, ExplorerError> {
         active.ensure_not_cancelled()?;
         events.running()?;
@@ -1521,33 +2066,38 @@ impl FileOperationCoordinator {
                 "Remote items cannot be moved to the local operating-system Trash.".to_owned(),
             )),
             FileOperationActionDto::DeletePermanently {} => {
-                let (target_name, location_name) = ssh.describe_operation_target(source).await?;
-                let prompt_id = Uuid::new_v4().to_string();
-                let response = active.begin_prompt(
-                    prompt_id.clone(),
-                    vec![
-                        FileOperationPromptResponseDto::Confirm,
-                        FileOperationPromptResponseDto::Cancel,
-                    ],
-                )?;
-                events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
-                    id: prompt_id,
-                    title: format!("Delete “{target_name}” permanently?"),
-                    message: format!(
-                        "This remote item on {location_name} will be removed immediately. It cannot be recovered from Trash."
-                    ),
-                    target_name,
-                    location_name,
-                    confirm_label: "Delete Permanently",
-                })?;
-                match active.await_prompt_async(response).await? {
-                    FileOperationPromptResponseDto::Confirm => {}
-                    FileOperationPromptResponseDto::Cancel => return Err(ExplorerError::Cancelled),
-                    FileOperationPromptResponseDto::KeepBoth
-                    | FileOperationPromptResponseDto::Skip => {
-                        return Err(ExplorerError::InvalidConfiguration(
-                            "That response is not valid for permanent deletion.".to_owned(),
-                        ));
+                if !delete_confirmed {
+                    let (target_name, location_name) =
+                        ssh.describe_operation_target(source).await?;
+                    let prompt_id = Uuid::new_v4().to_string();
+                    let response = active.begin_prompt(
+                        prompt_id.clone(),
+                        vec![
+                            FileOperationPromptResponseDto::Confirm,
+                            FileOperationPromptResponseDto::Cancel,
+                        ],
+                    )?;
+                    events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+                        id: prompt_id,
+                        title: format!("Delete “{target_name}” permanently?"),
+                        message: format!(
+                            "This remote item on {location_name} will be removed immediately. It cannot be recovered from Trash."
+                        ),
+                        target_name,
+                        location_name,
+                        confirm_label: "Delete Permanently",
+                    })?;
+                    match active.await_prompt_async(response).await? {
+                        FileOperationPromptResponseDto::Confirm => {}
+                        FileOperationPromptResponseDto::Cancel => {
+                            return Err(ExplorerError::Cancelled);
+                        }
+                        FileOperationPromptResponseDto::KeepBoth
+                        | FileOperationPromptResponseDto::Skip => {
+                            return Err(ExplorerError::InvalidConfiguration(
+                                "That response is not valid for permanent deletion.".to_owned(),
+                            ));
+                        }
                     }
                 }
                 events.running()?;
@@ -1575,6 +2125,101 @@ impl FileOperationCoordinator {
     fn finish(&self, operation_id: &str) {
         if let Ok(mut active) = self.active.lock() {
             active.remove(operation_id);
+        }
+    }
+}
+
+fn single_source_request(
+    request: &FileOperationRequestDto,
+    source: EntryRefDto,
+) -> FileOperationRequestDto {
+    FileOperationRequestDto {
+        sources: vec![source],
+        action: request.action.clone(),
+    }
+}
+
+fn should_stop_batch(error: &ExplorerError) -> bool {
+    !matches!(
+        error,
+        ExplorerError::InvalidReference
+            | ExplorerError::InvalidName(_)
+            | ExplorerError::Conflict
+            | ExplorerError::SourceChanged
+            | ExplorerError::Io { .. }
+            | ExplorerError::Unsupported(_)
+    )
+}
+
+fn partial_batch_error(successful: usize, total: usize) -> ExplorerErrorDto {
+    ExplorerErrorDto {
+        code: ExplorerErrorCode::PartialCompletion,
+        message: format!(
+            "Explora completed {successful} of {total} selected items. Review the item results before retrying."
+        ),
+    }
+}
+
+fn batch_outcome(
+    status: FileOperationBatchStatusDto,
+    items: Vec<FileOperationBatchItemDto>,
+) -> FileOperationOutcomeDto {
+    FileOperationOutcomeDto::Batch { status, items }
+}
+
+fn cancelled_batch_outcome(
+    sources: &[EntryRefDto],
+    mut items: Vec<FileOperationBatchItemDto>,
+    next_index: usize,
+) -> FileOperationOutcomeDto {
+    items.extend(
+        sources
+            .iter()
+            .skip(next_index)
+            .cloned()
+            .map(|source| FileOperationBatchItemDto::NotStarted { source }),
+    );
+    batch_outcome(FileOperationBatchStatusDto::Cancelled, items)
+}
+
+fn failed_batch_terminal(
+    sources: &[EntryRefDto],
+    mut items: Vec<FileOperationBatchItemDto>,
+    next_index: usize,
+    successful: usize,
+    error: ExplorerErrorDto,
+) -> OperationTerminal {
+    items.extend(
+        sources
+            .iter()
+            .skip(next_index)
+            .cloned()
+            .map(|source| FileOperationBatchItemDto::NotStarted { source }),
+    );
+    let total = sources.len();
+    let terminal_error = if successful > 0 {
+        partial_batch_error(successful, total)
+    } else {
+        error
+    };
+    OperationTerminal::Failed {
+        error: terminal_error,
+        outcome: Some(batch_outcome(FileOperationBatchStatusDto::Partial, items)),
+    }
+}
+
+fn completed_batch_terminal(
+    items: Vec<FileOperationBatchItemDto>,
+    successful: usize,
+    failures: usize,
+    total: usize,
+) -> OperationTerminal {
+    if failures == 0 {
+        OperationTerminal::Completed(batch_outcome(FileOperationBatchStatusDto::Completed, items))
+    } else {
+        OperationTerminal::Failed {
+            error: partial_batch_error(successful, total),
+            outcome: Some(batch_outcome(FileOperationBatchStatusDto::Partial, items)),
         }
     }
 }
@@ -2639,17 +3284,37 @@ async fn abandon_remote_after_error(
 
 fn validate_request(request: &FileOperationRequestDto) -> Result<(), ExplorerError> {
     if request.sources.is_empty() || request.sources.len() > MAX_OPERATION_SOURCES {
+        return Err(ExplorerError::InvalidConfiguration(format!(
+            "Filesystem actions require between 1 and {MAX_OPERATION_SOURCES} selected items."
+        )));
+    }
+    if matches!(request.action, FileOperationActionDto::Rename { .. }) && request.sources.len() != 1
+    {
         return Err(ExplorerError::InvalidConfiguration(
-            "Filesystem actions currently require exactly one selected item.".to_owned(),
+            "Rename requires exactly one selected item.".to_owned(),
         ));
     }
-    let source = &request.sources[0];
-    if source.id.is_empty()
-        || source.id.len() > 256
-        || source.location_id.is_empty()
-        || source.location_id.len() > 256
-    {
-        return Err(ExplorerError::InvalidReference);
+
+    let source_location = &request.sources[0].location_id;
+    let mut unique_sources = HashSet::with_capacity(request.sources.len());
+    for source in &request.sources {
+        if source.id.is_empty()
+            || source.id.len() > 256
+            || source.location_id.is_empty()
+            || source.location_id.len() > 256
+        {
+            return Err(ExplorerError::InvalidReference);
+        }
+        if source.location_id != *source_location {
+            return Err(ExplorerError::InvalidConfiguration(
+                "A batch filesystem action must use items from one location.".to_owned(),
+            ));
+        }
+        if !unique_sources.insert((source.location_id.as_str(), source.id.as_str())) {
+            return Err(ExplorerError::InvalidConfiguration(
+                "A selected item can appear only once in a filesystem action.".to_owned(),
+            ));
+        }
     }
     if let FileOperationActionDto::Move { destination } = &request.action {
         if destination.id.is_empty()
@@ -2755,6 +3420,40 @@ mod tests {
             let name = path.file_name().ok_or(ExplorerError::InvalidReference)?;
             fs::rename(path, self.destination.join(name))
                 .map_err(|error| ExplorerError::io("trash", path, error))
+        }
+    }
+
+    struct PausingTrash {
+        destination: PathBuf,
+        first_moved: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        release_first: StdMutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl PlatformTrash for PausingTrash {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn move_to_trash(&self, path: &Path) -> Result<(), ExplorerError> {
+            let name = path.file_name().ok_or(ExplorerError::InvalidReference)?;
+            fs::rename(path, self.destination.join(name))
+                .map_err(|error| ExplorerError::io("trash", path, error))?;
+            let notify = self
+                .first_moved
+                .lock()
+                .map_err(|_| ExplorerError::StateUnavailable)?
+                .take();
+            if let Some(notify) = notify {
+                notify
+                    .send(())
+                    .map_err(|_| ExplorerError::StateUnavailable)?;
+                self.release_first
+                    .lock()
+                    .map_err(|_| ExplorerError::StateUnavailable)?
+                    .recv_timeout(Duration::from_secs(2))
+                    .map_err(|_| ExplorerError::StateUnavailable)?;
+            }
+            Ok(())
         }
     }
 
@@ -3055,6 +3754,62 @@ mod tests {
             "action": { "kind": "trash", "force": true }
         }))
         .is_err());
+
+        let duplicate = FileOperationRequestDto {
+            sources: vec![
+                EntryRefDto {
+                    id: "entry".to_owned(),
+                    location_id: "home".to_owned(),
+                },
+                EntryRefDto {
+                    id: "entry".to_owned(),
+                    location_id: "home".to_owned(),
+                },
+            ],
+            action: FileOperationActionDto::Trash {},
+        };
+        assert!(matches!(
+            validate_request(&duplicate),
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+
+        let mixed_locations = FileOperationRequestDto {
+            sources: vec![
+                EntryRefDto {
+                    id: "first".to_owned(),
+                    location_id: "home".to_owned(),
+                },
+                EntryRefDto {
+                    id: "second".to_owned(),
+                    location_id: "ssh:server".to_owned(),
+                },
+            ],
+            action: FileOperationActionDto::Trash {},
+        };
+        assert!(matches!(
+            validate_request(&mixed_locations),
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+
+        let batch_rename = FileOperationRequestDto {
+            sources: vec![
+                EntryRefDto {
+                    id: "first".to_owned(),
+                    location_id: "home".to_owned(),
+                },
+                EntryRefDto {
+                    id: "second".to_owned(),
+                    location_id: "home".to_owned(),
+                },
+            ],
+            action: FileOperationActionDto::Rename {
+                new_name: "renamed".to_owned(),
+            },
+        };
+        assert!(matches!(
+            validate_request(&batch_rename),
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
     }
 
     #[test]
@@ -3067,6 +3822,9 @@ mod tests {
             total_items: 1,
             completed_bytes: None,
             total_bytes: None,
+            current_item_completed: None,
+            current_item_total: None,
+            outcome: None,
         };
         assert_eq!(
             serde_json::to_value(event).expect("serializable event"),
@@ -3078,7 +3836,10 @@ mod tests {
                 "completedItems": 0,
                 "totalItems": 1,
                 "completedBytes": null,
-                "totalBytes": null
+                "totalBytes": null,
+                "currentItemCompleted": null,
+                "currentItemTotal": null,
+                "outcome": null
             })
         );
     }
@@ -3153,6 +3914,182 @@ mod tests {
             .any(|event| event["event"] == "awaitingConfirmation"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batch_trash_returns_structured_partial_results_and_continues_safely() {
+        let (temp, local, source) = fixture();
+        fs::write(temp.path().join("second.txt"), b"second").expect("second source");
+        let changed_source = listed_entry_ref(&local, "second.txt");
+        let trash_destination = temp.path().join("native-trash");
+        fs::create_dir(&trash_destination).expect("trash fixture");
+        let (first_moved_tx, first_moved_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let coordinator = Arc::new(FileOperationCoordinator::with_platform_trash(Arc::new(
+            PausingTrash {
+                destination: trash_destination.clone(),
+                first_moved: StdMutex::new(Some(first_moved_tx)),
+                release_first: StdMutex::new(release_rx),
+            },
+        )));
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source, changed_source],
+                    action: FileOperationActionDto::Trash {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start batch Trash");
+        first_moved_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first item moved");
+        fs::remove_file(temp.path().join("second.txt")).expect("change second source");
+        release_tx.send(()).expect("release first item");
+        wait_for_event(&events, "failed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal")
+            .clone();
+        assert_eq!(terminal["error"]["code"], "partialCompletion");
+        assert_eq!(terminal["outcome"]["status"], "partial");
+        assert_eq!(terminal["outcome"]["items"][0]["status"], "completed");
+        assert_eq!(terminal["outcome"]["items"][1]["status"], "failed");
+        assert_eq!(
+            terminal["outcome"]["items"][1]["error"]["code"],
+            "sourceChanged"
+        );
+        assert!(trash_destination.join("notes.md").is_file());
+        assert!(!temp.path().join("notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn batch_actions_reject_overlapping_source_subtrees_before_mutation() {
+        let (temp, local, _) = fixture();
+        fs::create_dir(temp.path().join("Folder")).expect("folder source");
+        fs::write(temp.path().join("Folder/child.txt"), b"child").expect("child source");
+        let folder = listed_entry_ref(&local, "Folder");
+        let root = local.locations().expect("locations")[0].root.clone();
+        let mut folder_directory = None;
+        local
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        folder_directory = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "Folder")
+                            .and_then(|entry| entry.directory);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("root listing");
+        let folder_directory = folder_directory.expect("folder directory");
+        let mut child = None;
+        local
+            .list_directory(
+                &folder_directory.id,
+                &folder_directory.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        child = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "child.txt")
+                            .map(|entry| entry.reference);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("folder listing");
+        let trash_destination = temp.path().join("native-trash");
+        fs::create_dir(&trash_destination).expect("trash fixture");
+        let coordinator = Arc::new(FileOperationCoordinator::with_platform_trash(Arc::new(
+            FakeTrash {
+                destination: trash_destination,
+            },
+        )));
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![folder, child.expect("child reference")],
+                    action: FileOperationActionDto::Trash {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start overlapping batch");
+        wait_for_event(&events, "failed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal")
+            .clone();
+        assert_eq!(terminal["error"]["code"], "invalidConfiguration");
+        assert!(terminal["outcome"].is_null());
+        assert!(temp.path().join("Folder/child.txt").is_file());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_between_batch_items_preserves_unstarted_sources() {
+        let (temp, local, first) = fixture();
+        fs::write(temp.path().join("second.txt"), b"second").expect("second source");
+        let second = listed_entry_ref(&local, "second.txt");
+        let trash_destination = temp.path().join("native-trash");
+        fs::create_dir(&trash_destination).expect("trash fixture");
+        let (first_moved_tx, first_moved_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let coordinator = Arc::new(FileOperationCoordinator::with_platform_trash(Arc::new(
+            PausingTrash {
+                destination: trash_destination.clone(),
+                first_moved: StdMutex::new(Some(first_moved_tx)),
+                release_first: StdMutex::new(release_rx),
+            },
+        )));
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![first, second],
+                    action: FileOperationActionDto::Trash {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start cancellable batch");
+
+        first_moved_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first item moved");
+        coordinator.cancel(&operation_id).expect("cancel batch");
+        release_tx.send(()).expect("release first item");
+        wait_for_event(&events, "cancelled").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal")
+            .clone();
+        assert_eq!(terminal["completedItems"], 1);
+        assert_eq!(terminal["outcome"]["status"], "cancelled");
+        assert_eq!(terminal["outcome"]["items"][0]["status"], "completed");
+        assert_eq!(terminal["outcome"]["items"][1]["status"], "notStarted");
+        assert!(trash_destination.join("notes.md").is_file());
+        assert!(temp.path().join("second.txt").is_file());
+    }
+
     #[tokio::test]
     async fn coordinator_moves_locally_with_a_typed_terminal_result() {
         let (temp, local, source) = fixture();
@@ -3180,6 +4117,73 @@ mod tests {
         assert_eq!(events[2]["outcome"]["destination"]["id"], destination.id);
         assert!(temp.path().join("destination/notes.md").is_file());
         assert!(!temp.path().join("notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn batch_move_reports_conflict_skips_and_mixed_entry_results() {
+        let (temp, local, notes) = fixture();
+        fs::create_dir(temp.path().join("Projects")).expect("directory source");
+        fs::write(temp.path().join("Projects/readme.md"), b"project").expect("directory child");
+        let projects = listed_entry_ref(&local, "Projects");
+        let destination = destination_fixture(&temp, &local, "destination");
+        fs::write(temp.path().join("destination/notes.md"), b"existing")
+            .expect("conflicting destination");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        let operation_id = coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![notes.clone(), projects.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: destination.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start batch move");
+        wait_for_event(&events, "awaitingConflict").await;
+        let prompt_id = events
+            .lock()
+            .expect("events")
+            .iter()
+            .find(|event| event["event"] == "awaitingConflict")
+            .expect("batch conflict")["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        coordinator
+            .respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::Skip,
+            )
+            .expect("skip conflict");
+        wait_for_event(&events, "completed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal")
+            .clone();
+        assert_eq!(terminal["completedItems"], 2);
+        assert_eq!(terminal["totalItems"], 2);
+        assert_eq!(terminal["outcome"]["kind"], "batch");
+        assert_eq!(terminal["outcome"]["status"], "completed");
+        assert_eq!(
+            terminal["outcome"]["items"][0]["outcome"]["kind"],
+            "moveSkipped"
+        );
+        assert_eq!(terminal["outcome"]["items"][1]["outcome"]["kind"], "moved");
+        assert_eq!(
+            fs::read(temp.path().join("destination/notes.md")).expect("existing target"),
+            b"existing"
+        );
+        assert!(temp.path().join("notes.md").is_file());
+        assert!(temp.path().join("destination/Projects/readme.md").is_file());
+        assert!(!temp.path().join("Projects").exists());
     }
 
     #[tokio::test]
@@ -4682,6 +5686,74 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_batch_deletes_mixed_remote_entries_after_one_confirmation() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        server.create_symlink("/readme-link", "/README.md").await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let location = connect_remote_fixture(&server, ssh.clone()).await;
+        let remote_entries = remote_root_entries(&ssh, &location).await;
+        let readme = remote_entries
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("remote file")
+            .reference
+            .clone();
+        let link = remote_entries
+            .iter()
+            .find(|entry| entry.name == "readme-link")
+            .expect("remote link")
+            .reference
+            .clone();
+        let (_temp, local, _) = fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![readme, link],
+                    action: FileOperationActionDto::DeletePermanently {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start remote batch delete");
+        wait_for_event(&events, "awaitingConfirmation").await;
+        let prompt = events
+            .lock()
+            .expect("events")
+            .iter()
+            .find(|event| event["event"] == "awaitingConfirmation")
+            .expect("confirmation")["prompt"]
+            .clone();
+        assert_eq!(prompt["targetName"], "2 selected items");
+        coordinator
+            .respond(
+                &operation_id,
+                prompt["id"].as_str().expect("prompt id"),
+                FileOperationPromptResponseDto::Confirm,
+            )
+            .expect("confirm remote batch delete");
+        wait_for_event(&events, "completed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal")
+            .clone();
+        assert_eq!(terminal["outcome"]["status"], "completed");
+        assert_eq!(terminal["outcome"]["items"][0]["status"], "completed");
+        assert_eq!(terminal["outcome"]["items"][1]["status"], "completed");
+        assert!(!server.path_exists("/README.md").await);
+        assert!(!server.path_exists("/readme-link").await);
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
     #[tokio::test]
     async fn permanent_delete_requires_the_matching_single_use_confirmation() {
         let (temp, local, source) = fixture();
@@ -4730,6 +5802,61 @@ mod tests {
             ),
             Err(ExplorerError::InvalidReference)
         ));
+    }
+
+    #[tokio::test]
+    async fn batch_permanent_delete_uses_one_authoritative_confirmation() {
+        let (temp, local, first) = fixture();
+        fs::write(temp.path().join("second.txt"), b"second").expect("second source");
+        let second = listed_entry_ref(&local, "second.txt");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![first, second],
+                    action: FileOperationActionDto::DeletePermanently {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start batch delete");
+        wait_for_event(&events, "awaitingConfirmation").await;
+
+        let captured = events.lock().expect("events").clone();
+        let prompts = captured
+            .iter()
+            .filter(|event| event["event"] == "awaitingConfirmation")
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["prompt"]["targetName"], "2 selected items");
+        let prompt_id = prompts[0]["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        coordinator
+            .respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::Confirm,
+            )
+            .expect("confirm batch delete");
+        wait_for_event(&events, "completed").await;
+
+        let captured = events.lock().expect("events");
+        assert_eq!(
+            captured
+                .iter()
+                .filter(|event| event["event"] == "awaitingConfirmation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            captured.last().expect("terminal")["outcome"]["status"],
+            "completed"
+        );
+        assert!(!temp.path().join("notes.md").exists());
+        assert!(!temp.path().join("second.txt").exists());
     }
 
     #[tokio::test]

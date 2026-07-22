@@ -6,6 +6,7 @@ import type {
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
+  FileOperationBatchResult,
   FileMoveResult,
   FileOperationPrompt,
   FileRemovalResult,
@@ -405,7 +406,8 @@ type FileOperationAction =
 type FileOperationOutcome =
   | { kind: "renamed"; entry: FileEntrySummary }
   | FileMoveResult
-  | FileRemovalResult;
+  | FileRemovalResult
+  | FileOperationBatchResult;
 
 const parseEntryRef = (value: unknown) => {
   if (!isRecord(value)) {
@@ -440,6 +442,30 @@ const parseOperationProgress = (
   }
   const completedBytes = value.completedBytes ?? null;
   const totalBytes = value.totalBytes ?? null;
+  const rawCurrentItemCompleted = value.currentItemCompleted ?? null;
+  const rawCurrentItemTotal = value.currentItemTotal ?? null;
+  if (
+    (rawCurrentItemCompleted === null) !== (rawCurrentItemTotal === null) ||
+    (rawCurrentItemCompleted !== null &&
+      (typeof rawCurrentItemCompleted !== "number" ||
+        !Number.isSafeInteger(rawCurrentItemCompleted) ||
+        rawCurrentItemCompleted < 0 ||
+        typeof rawCurrentItemTotal !== "number" ||
+        !Number.isSafeInteger(rawCurrentItemTotal) ||
+        rawCurrentItemTotal < 1 ||
+        rawCurrentItemTotal > 1_000_000 ||
+        rawCurrentItemCompleted > rawCurrentItemTotal))
+  ) {
+    throw new Error(
+      "Invalid filesystem response: current-item progress is malformed.",
+    );
+  }
+  const currentItemCompleted =
+    typeof rawCurrentItemCompleted === "number"
+      ? rawCurrentItemCompleted
+      : null;
+  const currentItemTotal =
+    typeof rawCurrentItemTotal === "number" ? rawCurrentItemTotal : null;
   const validByteValue = (candidate: unknown): candidate is string =>
     typeof candidate === "string" && /^(0|[1-9][0-9]*)$/.test(candidate);
   if (completedBytes === null && totalBytes === null) {
@@ -448,6 +474,8 @@ const parseOperationProgress = (
       totalItems,
       completedBytes: null,
       totalBytes: null,
+      currentItemCompleted,
+      currentItemTotal,
     };
   }
   if (
@@ -459,7 +487,14 @@ const parseOperationProgress = (
       "Invalid filesystem response: operation byte progress is malformed.",
     );
   }
-  return { completedItems, totalItems, completedBytes, totalBytes };
+  return {
+    completedItems,
+    totalItems,
+    completedBytes,
+    totalBytes,
+    currentItemCompleted,
+    currentItemTotal,
+  };
 };
 
 const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
@@ -527,6 +562,89 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
   }
   if (value.kind === "renamed") {
     return { kind: "renamed", entry: parseEntry(value.entry) };
+  }
+  if (value.kind === "batch") {
+    if (
+      value.status !== "completed" &&
+      value.status !== "partial" &&
+      value.status !== "cancelled"
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch status is malformed.",
+      );
+    }
+    if (
+      !Array.isArray(value.items) ||
+      value.items.length < 2 ||
+      value.items.length > 1_000
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch items are malformed.",
+      );
+    }
+    const seen = new Set<string>();
+    const items = value.items.map((candidate) => {
+      if (!isRecord(candidate)) {
+        throw new Error(
+          "Invalid filesystem response: batch item is malformed.",
+        );
+      }
+      const source = parseEntryRef(candidate.source);
+      const sourceKey = `${source.locationId}\u0000${source.id}`;
+      if (seen.has(sourceKey)) {
+        throw new Error(
+          "Invalid filesystem response: batch source is duplicated.",
+        );
+      }
+      seen.add(sourceKey);
+      if (candidate.status === "completed") {
+        const outcome = parseOperationOutcome(candidate.outcome);
+        if (outcome.kind === "batch" || outcome.kind === "renamed") {
+          throw new Error(
+            "Invalid filesystem response: batch item outcome is unsupported.",
+          );
+        }
+        return { status: "completed" as const, source, outcome };
+      }
+      if (candidate.status === "failed") {
+        if (!isRecord(candidate.error)) {
+          throw new Error(
+            "Invalid filesystem response: batch item error is malformed.",
+          );
+        }
+        return {
+          status: "failed" as const,
+          source,
+          error: {
+            code: requireString(candidate.error, "code"),
+            message: requireString(candidate.error, "message"),
+          },
+        };
+      }
+      if (candidate.status === "cancelled") {
+        return { status: "cancelled" as const, source };
+      }
+      if (candidate.status === "notStarted") {
+        return { status: "notStarted" as const, source };
+      }
+      throw new Error(
+        "Invalid filesystem response: batch item status is malformed.",
+      );
+    });
+    const hasFailure = items.some((item) => item.status === "failed");
+    const hasUnfinished = items.some(
+      (item) => item.status === "cancelled" || item.status === "notStarted",
+    );
+    if (
+      (value.status === "completed" && (hasFailure || hasUnfinished)) ||
+      (value.status === "partial" && !hasFailure) ||
+      (value.status === "cancelled" && !hasUnfinished)
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch status does not match its items.",
+      );
+    }
+    return { kind: "batch", status: value.status, items };
   }
   if (value.kind === "moved") {
     if (
@@ -1224,7 +1342,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     signal: AbortSignal,
   ): Promise<FileEntrySummary> {
     const outcome = await this.runFileOperation(
-      entry,
+      [entry],
       { kind: "rename", newName },
       {
         signal,
@@ -1249,7 +1367,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     options: FileOperationOptions,
   ): Promise<FileMoveResult> {
     const outcome = await this.runFileOperation(
-      entry,
+      [entry],
       { kind: "move", destination },
       options,
     );
@@ -1261,12 +1379,30 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     return outcome;
   }
 
+  async moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "move", destination },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch move returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
   async trashEntry(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,
   ): Promise<FileRemovalResult> {
     const outcome = await this.runFileOperation(
-      entry,
+      [entry],
       { kind: "trash" },
       options,
     );
@@ -1278,12 +1414,29 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     return outcome;
   }
 
+  async trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "trash" },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch Trash returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
   async deleteEntryPermanently(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,
   ): Promise<FileRemovalResult> {
     const outcome = await this.runFileOperation(
-      entry,
+      [entry],
       { kind: "deletePermanently" },
       options,
     );
@@ -1295,8 +1448,25 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     return outcome;
   }
 
+  async deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "deletePermanently" },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch permanent delete returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
   private async runFileOperation(
-    entry: FileEntrySummary,
+    entries: readonly FileEntrySummary[],
     action: FileOperationAction,
     { signal, onProgress, onPrompt }: FileOperationOptions,
   ): Promise<FileOperationOutcome> {
@@ -1400,9 +1570,29 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         if (payload.event === "completed") {
           resolveCompletion(parseOperationOutcome(payload.outcome));
         } else if (payload.event === "cancelled") {
-          rejectCompletion(abortError());
+          if (payload.outcome === null || payload.outcome === undefined) {
+            rejectCompletion(abortError());
+          } else {
+            const outcome = parseOperationOutcome(payload.outcome);
+            if (outcome.kind !== "batch" || outcome.status !== "cancelled") {
+              throw new Error(
+                "Invalid filesystem response: cancelled batch outcome is inconsistent.",
+              );
+            }
+            resolveCompletion(outcome);
+          }
         } else if (payload.event === "failed") {
-          rejectCompletion(commandError(payload.error));
+          if (payload.outcome === null || payload.outcome === undefined) {
+            rejectCompletion(commandError(payload.error));
+          } else {
+            const outcome = parseOperationOutcome(payload.outcome);
+            if (outcome.kind !== "batch" || outcome.status !== "partial") {
+              throw new Error(
+                "Invalid filesystem response: failed batch outcome is inconsistent.",
+              );
+            }
+            resolveCompletion(outcome);
+          }
         } else {
           throw new Error(
             "Invalid filesystem response: unknown operation event.",
@@ -1423,7 +1613,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     try {
       const started = await invoke<unknown>("start_file_operation", {
         request: {
-          sources: [entry.reference],
+          sources: entries.map((entry) => entry.reference),
           action,
         },
         onEvent: channel,

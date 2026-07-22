@@ -32,7 +32,7 @@
   const handleKeydown = (event: KeyboardEvent) => {
     if (
       isRenameShortcut(event) &&
-      state.selectedEntry?.capabilities.rename &&
+      state.canRenameSelection &&
       state.fileOperations.activeEntryId === null
     ) {
       event.preventDefault();
@@ -82,10 +82,45 @@
     if (isInteractiveControl && !isPreviewText && event.key !== "Escape")
       return;
 
+    const modifier = event.metaKey || event.ctrlKey;
+    const key = event.key.toLocaleLowerCase();
+    if (
+      modifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      key === "x" &&
+      state.canCutSelection &&
+      state.fileOperations.activeEntryId === null &&
+      !isPreviewText
+    ) {
+      event.preventDefault();
+      state.cutSelected();
+      return;
+    }
+    if (
+      modifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      key === "v" &&
+      state.canPasteCutEntries &&
+      state.fileOperations.activeEntryId === null &&
+      !isPreviewText
+    ) {
+      event.preventDefault();
+      void state.pasteCutEntries();
+      return;
+    }
+
+    if (key === "a" && modifier && !isPreviewText && !isPreviewDocument) {
+      event.preventDefault();
+      state.selectAllEntries();
+      return;
+    }
+
     const deletion = deletionShortcut(event);
     if (
       deletion === "trash" &&
-      state.selectedEntry?.capabilities.trash &&
+      state.canTrashSelection &&
       state.fileOperations.activeEntryId === null
     ) {
       event.preventDefault();
@@ -94,7 +129,7 @@
     }
     if (
       deletion === "deletePermanently" &&
-      state.selectedEntry?.capabilities.deletePermanently &&
+      state.canDeleteSelectionPermanently &&
       state.fileOperations.activeEntryId === null
     ) {
       event.preventDefault();
@@ -102,17 +137,19 @@
       return;
     }
 
-    if (event.key === " " && state.selectedEntryId) {
+    if (event.key === " " && state.selectedEntries.length === 1) {
       event.preventDefault();
       void state.openPreview();
     } else if (event.key === "Escape" && state.previewOpen) {
       state.closePreview();
+    } else if (event.key === "Escape" && state.selectedEntries.length > 0) {
+      state.clearSelection();
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
-      state.moveSelection(1);
+      state.moveSelection(1, event.shiftKey);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      state.moveSelection(-1);
+      state.moveSelection(-1, event.shiftKey);
     }
   };
 </script>
@@ -191,6 +228,26 @@
         </div>
       {/if}
 
+      {#if state.cutEntries.length > 0}
+        <div
+          class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <span>
+            {state.cutEntries.length === 1
+              ? `“${state.cutEntries[0].name}” is ready to move.`
+              : `${state.cutEntries.length} items are ready to move.`}
+            Navigate to a destination and paste.
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => state.clearCutEntries()}>Cancel</Button
+          >
+        </div>
+      {/if}
+
       {#if state.fileOperations.errorMessage}
         <div
           class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
@@ -214,10 +271,26 @@
         >
           <span class="font-medium">{state.fileOperations.activeAction}</span>
           <span class="text-muted-foreground">
-            “{state.fileOperations.activeEntryName}” · {state.fileOperations
-              .progress.totalBytes !== null
-              ? `${formatFileSize(state.fileOperations.progress.completedBytes)} of ${formatFileSize(state.fileOperations.progress.totalBytes)}`
-              : `${state.fileOperations.progress.completedItems} of ${state.fileOperations.progress.totalItems} items`}
+            “{state.fileOperations.activeEntryName}” ·
+            {#if state.fileOperations.progress.totalItems > 1}
+              {state.fileOperations.progress.completedItems} of {state
+                .fileOperations.progress.totalItems} items
+            {/if}
+            {#if state.fileOperations.progress.totalItems > 1 && state.fileOperations.activeItemName && (state.fileOperations.progress.totalBytes !== null || state.fileOperations.progress.currentItemTotal !== null)}
+              · “{state.fileOperations.activeItemName}”
+            {/if}
+            {#if state.fileOperations.progress.totalBytes !== null}
+              {state.fileOperations.progress.totalItems > 1
+                ? " · "
+                : ""}{formatFileSize(
+                state.fileOperations.progress.completedBytes,
+              )} of {formatFileSize(state.fileOperations.progress.totalBytes)}
+            {:else if state.fileOperations.progress.currentItemTotal !== null}
+              {state.fileOperations.progress.totalItems > 1 ? " · " : ""}{state
+                .fileOperations.progress.currentItemCompleted} of {state
+                .fileOperations.progress.currentItemTotal} entries in the current
+              item
+            {/if}
           </span>
           {#if state.fileOperations.byteProgressPercent !== null}
             <Progress

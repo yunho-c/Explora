@@ -35,10 +35,13 @@
     {@const chooser = state.fileOperations.moveChooser}
     {#if chooser}
       <Dialog.Header class="border-b px-5 pt-5 pb-4">
-        <Dialog.Title class="truncate">Move “{chooser.entry.name}”</Dialog.Title
+        <Dialog.Title class="truncate"
+          >{chooser.entries.length === 1
+            ? `Move “${chooser.entries[0].name}”`
+            : `Move ${chooser.entries.length} items`}</Dialog.Title
         >
         <Dialog.Description>
-          Choose a folder in {chooser.entry.reference.locationId ===
+          Choose a folder in {chooser.entries[0].reference.locationId ===
           chooser.directory.locationId
             ? "this location"
             : "a compatible location"}. Existing items are never replaced
@@ -153,7 +156,12 @@
                     disabled={!compatible}
                     title={compatible
                       ? `Open ${entry.name}`
-                      : entry.directory?.id === chooser.entry.directory?.id
+                      : chooser.entries.some(
+                            (source) =>
+                              source.directory?.locationId ===
+                                entry.directory?.locationId &&
+                              source.directory?.id === entry.directory?.id,
+                          )
                         ? "A folder cannot be moved into itself"
                         : "This folder cannot accept moved items"}
                     class="flex w-full items-center gap-3 rounded-md px-2.5 py-2 text-left outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"

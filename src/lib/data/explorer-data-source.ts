@@ -2,6 +2,7 @@ import type {
   BreadcrumbSegment,
   DirectoryRef,
   FileEntrySummary,
+  FileOperationBatchResult,
   FileMoveResult,
   FileOperationPrompt,
   FileOperationPromptResponse,
@@ -75,6 +76,8 @@ export interface FileOperationProgress {
   totalItems: number;
   completedBytes: string | null;
   totalBytes: string | null;
+  currentItemCompleted: number | null;
+  currentItemTotal: number | null;
 }
 
 export type RemoveEntryOptions = FileOperationOptions;
@@ -112,14 +115,27 @@ export interface ExplorerDataSource {
     destination: DirectoryRef,
     options: FileOperationOptions,
   ): Promise<FileMoveResult>;
+  moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult>;
   trashEntry(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,
   ): Promise<FileRemovalResult>;
+  trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult>;
   deleteEntryPermanently(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,
   ): Promise<FileRemovalResult>;
+  deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult>;
   getPreview(
     entry: FileEntrySummary,
     options: PreparePreviewOptions,

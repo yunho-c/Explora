@@ -357,6 +357,32 @@ impl LocalFilesystem {
             .map_err(|_| ExplorerError::StateUnavailable)
     }
 
+    pub(crate) fn validate_batch_sources(
+        &self,
+        sources: &[EntryRefDto],
+    ) -> Result<(), ExplorerError> {
+        let mut paths = Vec::with_capacity(sources.len());
+        for source in sources {
+            paths.push(
+                self.registry
+                    .resolve_for_operation(&source.location_id, &source.id)?,
+            );
+        }
+        for (index, path) in paths.iter().enumerate() {
+            if paths
+                .iter()
+                .skip(index + 1)
+                .any(|other| path.starts_with(other.as_path()) || other.starts_with(path.as_path()))
+            {
+                return Err(ExplorerError::InvalidConfiguration(
+                    "A batch action cannot include both a folder and one of its descendants."
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn replace_volumes(
         &self,
         volumes: Vec<VolumeRoot>,
