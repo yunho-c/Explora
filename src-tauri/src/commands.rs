@@ -15,13 +15,18 @@ use crate::{
     filesystem::{
         ContentAvailability, ContentRequestCapabilityDto, ContentRequestEventDto,
         ContentRequestIntent, DirectoryListingEvent, ExplorerError, ExplorerErrorDto,
-        ImagePreviewMode, LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
+        ImagePreviewMode, LocationBackend, LocationSummaryDto, PreviewResultDto,
+        PreviewUnavailableReason,
     },
+    gio_filesystem::GioFilesystem,
     local_filesystem::LocalFilesystem,
     preferences::{
         PreferencesSnapshotDto, PreferencesStore, UserPreferencesDto, UserPreferencesPatchDto,
     },
-    preview::{metadata_result, metadata_result_with_content_request, PreviewManager},
+    preview::{
+        metadata_result, metadata_result_with_content_request, ExternalPreviewSource,
+        PreviewManager,
+    },
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
     synced_folders::{SyncedFolderManager, SyncedFolderSnapshotEventDto},
@@ -30,6 +35,7 @@ use crate::{
 
 pub struct AppState {
     local: Arc<LocalFilesystem>,
+    gio: Arc<GioFilesystem>,
     preferences: Arc<PreferencesStore>,
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
@@ -43,6 +49,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         local: Arc<LocalFilesystem>,
+        gio: Arc<GioFilesystem>,
         preferences: PreferencesStore,
         ssh_targets: SshTargetStore,
         volumes: Arc<VolumeManager>,
@@ -50,6 +57,7 @@ impl AppState {
     ) -> Self {
         Self {
             local,
+            gio,
             preferences: Arc::new(preferences),
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
@@ -91,6 +99,21 @@ impl AppState {
             cancellation.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    fn resolve_location_backend(
+        &self,
+        location_id: &str,
+    ) -> Result<LocationBackend, ExplorerError> {
+        let local = self.local.contains_location(location_id)?;
+        let gio = self.gio.contains_location(location_id)?;
+        let ssh = self.ssh.contains_location(location_id)?;
+        match (local, gio, ssh) {
+            (true, false, false) => Ok(LocationBackend::Local),
+            (false, true, false) => Ok(LocationBackend::Gio),
+            (false, false, true) => Ok(LocationBackend::Ssh),
+            _ => Err(ExplorerError::InvalidReference),
+        }
     }
 }
 
@@ -141,6 +164,7 @@ pub fn list_locations(
     state: State<'_, AppState>,
 ) -> Result<Vec<LocationSummaryDto>, ExplorerErrorDto> {
     let mut locations = state.local.locations().map_err(ExplorerErrorDto::from)?;
+    locations.extend(state.gio.locations().map_err(ExplorerErrorDto::from)?);
     locations.extend(state.ssh.locations());
     Ok(locations)
 }
@@ -356,51 +380,64 @@ pub async fn list_directory(
     location_id: String,
     on_event: Channel<DirectoryListingEvent>,
 ) -> Result<(), ExplorerErrorDto> {
-    let local_location = state
-        .local
-        .contains_location(&location_id)
+    let backend = state
+        .resolve_location_backend(&location_id)
         .map_err(ExplorerErrorDto::from)?;
-    let ssh_location = state
-        .ssh
-        .contains_location(&location_id)
-        .map_err(ExplorerErrorDto::from)?;
-    if local_location == ssh_location {
-        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
-    }
-    let synced_location = local_location
-        && state
-            .local
-            .is_synced_folder(&location_id)
-            .map_err(ExplorerErrorDto::from)?;
+    let synced_location = backend == LocationBackend::Gio
+        || (backend == LocationBackend::Local
+            && state
+                .local
+                .is_synced_folder(&location_id)
+                .map_err(ExplorerErrorDto::from)?);
 
     let cancellation = state
         .begin_listing(&request_id)
         .map_err(ExplorerErrorDto::from)?;
     let listing_request_id = request_id.clone();
 
-    let result = if ssh_location {
-        state
-            .ssh
-            .list_directory(&location_id, &directory_id, &cancellation, |event| {
-                on_event
-                    .send(event)
-                    .map_err(|_| ExplorerError::ChannelClosed)
+    let result = match backend {
+        LocationBackend::Ssh => {
+            state
+                .ssh
+                .list_directory(&location_id, &directory_id, &cancellation, |event| {
+                    on_event
+                        .send(event)
+                        .map_err(|_| ExplorerError::ChannelClosed)
+                })
+                .await
+        }
+        LocationBackend::Gio => {
+            let gio = state.gio.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                gio.list_directory(&directory_id, &location_id, &cancellation, |event| {
+                    on_event
+                        .send(event)
+                        .map_err(|_| ExplorerError::ChannelClosed)
+                })
             })
             .await
-    } else {
-        debug_assert!(local_location);
-        let local = state.local.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            local.list_directory(&directory_id, &location_id, &cancellation, |event| {
-                on_event
-                    .send(event)
-                    .map_err(|_| ExplorerError::ChannelClosed)
+            .unwrap_or_else(|error| {
+                Err(ExplorerError::Unexpected(format!(
+                    "The GIO listing task failed: {error}"
+                )))
             })
-        })
-        .await
-        .map_err(|error| {
-            ExplorerError::Unexpected(format!("The directory listing task failed: {error}"))
-        })?
+        }
+        LocationBackend::Local => {
+            let local = state.local.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                local.list_directory(&directory_id, &location_id, &cancellation, |event| {
+                    on_event
+                        .send(event)
+                        .map_err(|_| ExplorerError::ChannelClosed)
+                })
+            })
+            .await
+            .unwrap_or_else(|error| {
+                Err(ExplorerError::Unexpected(format!(
+                    "The directory listing task failed: {error}"
+                )))
+            })
+        }
     };
 
     state.finish_listing(&listing_request_id);
@@ -437,19 +474,11 @@ pub async fn prepare_preview(
     validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
     validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
 
-    let ssh_location = state
-        .ssh
-        .contains_location(&location_id)
+    let backend = state
+        .resolve_location_backend(&location_id)
         .map_err(ExplorerErrorDto::from)?;
-    let local_location = state
-        .local
-        .contains_location(&location_id)
-        .map_err(ExplorerErrorDto::from)?;
-    if local_location == ssh_location {
-        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
-    }
 
-    if ssh_location {
+    if backend == LocationBackend::Ssh {
         return Ok(metadata_result(
             entry_id,
             None,
@@ -459,12 +488,56 @@ pub async fn prepare_preview(
         ));
     }
 
+    if backend == LocationBackend::Gio {
+        let access = state
+            .gio
+            .resolve_preview_access(&entry_id, &location_id)
+            .map_err(|error| local_preview_error(error, true))?;
+        if let Some(reason) = access.reason {
+            let message = match reason {
+                PreviewUnavailableReason::Directory => {
+                    "Folders provide metadata rather than a content preview."
+                }
+                PreviewUnavailableReason::Symlink => {
+                    "Explora does not follow symbolic links while previewing."
+                }
+                _ => "This cloud entry cannot be previewed.",
+            };
+            return Ok(metadata_result(
+                entry_id,
+                access.size.map(|size| size.to_string()),
+                access.modified_at,
+                reason,
+                message,
+            ));
+        }
+
+        let uri = access.uri;
+        return state
+            .preview
+            .prepare_external(
+                request_id,
+                entry_id,
+                ExternalPreviewSource {
+                    name: access.name,
+                    size: access.size,
+                    modified_at: access.modified_at,
+                },
+                image_mode,
+                move |output, read_limit, cancelled| {
+                    GioFilesystem::materialize_preview(uri, output, read_limit, cancelled)
+                },
+            )
+            .await
+            .map_err(|error| local_preview_error(error, true));
+    }
+
     let synced_location = state
         .local
         .is_synced_folder(&location_id)
         .map_err(ExplorerErrorDto::from)?;
 
-    debug_assert!(local_location);
+    debug_assert_eq!(backend, LocationBackend::Local);
 
     // Resolve and revalidate the opaque entry before deciding whether content
     // access is allowed. Filesystem metadata is sufficient for this decision

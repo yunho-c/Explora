@@ -106,6 +106,9 @@ pub enum LocationRole {
 #[serde(rename_all = "camelCase")]
 pub enum LocationBackend {
     Local,
+    // This transport is constructed only in Linux builds.
+    #[allow(dead_code)]
+    Gio,
     Ssh,
 }
 

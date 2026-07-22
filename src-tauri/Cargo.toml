@@ -50,6 +50,7 @@ objc2-disk-arbitration = "0.3.2"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSFileManager", "NSString", "NSURL", "NSValue"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gio = "0.18.4"
 zbus = { version = "5.12.0", default-features = false, features = ["blocking"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]

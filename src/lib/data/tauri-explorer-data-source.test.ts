@@ -213,6 +213,41 @@ describe("TauriExplorerDataSource", () => {
     ).rejects.toThrow("unknown location kind");
   });
 
+  it("accepts GIO only as a synced-folder transport", async () => {
+    const gioFolder = {
+      ...syncedFolderPayload,
+      id: "synced:gio:opaque",
+      backend: "gio",
+      name: "Google Drive",
+      displayPath: "Google Drive",
+      root: {
+        id: "gio-root-token",
+        locationId: "synced:gio:opaque",
+        name: "Google Drive",
+        displayPath: "Google Drive",
+      },
+      syncedFolder: {
+        provider: "googleDrive",
+        status: "available",
+        source: "system",
+      },
+    };
+    mockIPC((command) => (command === "list_locations" ? [gioFolder] : null));
+
+    await expect(
+      new TauriExplorerDataSource().listLocations(new AbortController().signal),
+    ).resolves.toEqual([gioFolder]);
+
+    mockIPC((command) =>
+      command === "list_locations"
+        ? [{ ...locationPayload, backend: "gio" }]
+        : null,
+    );
+    await expect(
+      new TauriExplorerDataSource().listLocations(new AbortController().signal),
+    ).rejects.toThrow("location backend does not match its kind");
+  });
+
   it("rejects listing entries attributed to a different location", async () => {
     mockIPC((command, payload) => {
       if (command !== "list_directory") return null;

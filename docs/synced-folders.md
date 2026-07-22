@@ -348,9 +348,41 @@ Manually added roots use an explicit local-mirror availability policy, so known
 local files may enter the existing bounded preview pipeline. If a saved root is
 temporarily missing or no longer a real directory, it remains visible as offline
 or errored and can still be removed. Removing it only forgets the Explora
-location; it never touches files. Automatic local-root discovery is still open.
-GIO/GVfs support remains a separate vertical slice with contract tests. The UI
-must describe the limitation honestly rather than showing an unusable mount.
+location; it never touches files. There is no provider-neutral signal that
+distinguishes an ordinary local sync-client folder from any other directory, so
+automatic discovery of those roots remains unsupported without a future
+documented OS source.
+
+The accepted GIO slice enumerates `GVolumeMonitor` only on Linux and registers
+non-native `google-drive://` roots already mounted by GNOME Online Accounts and
+GVfs. It deliberately ignores SMB, SFTP, WebDAV, and other schemes because a
+user-interesting mount is not by itself evidence that the location is a synced
+folder. The monitor is installed from Tauri setup on the GTK/GLib main thread;
+mount add, change, and remove signals refresh an internal snapshot, while the
+existing bounded synced-folder refresh publishes revisioned sidebar state.
+
+GIO URIs and account labels remain Rust-only. The backend issues cancellable,
+no-follow directory enumeration on a blocking worker and maps GIO error domains
+to structured Explora errors without returning provider messages. Quick Preview
+is an explicit read: GIO streams at most the byte limit selected by the existing
+preview pipeline into an owned temporary file, cancellation reaches
+`GCancellable`, and decoding then uses the same five-second timeout, concurrency,
+format, pixel, and resource limits as local preview. The temporary file is
+deleted when preparation finishes.
+
+The initial Linux support matrix is capability-based. GNOME-compatible sessions
+with GLib/GIO 2.56 or newer, a user D-Bus session, GNOME Online Accounts, and the
+GVfs Google backend receive automatic Google Drive mounts. The packaged native
+validation targets are the current Ubuntu LTS GNOME desktop and current Fedora
+Workstation. KDE Plasma and Linux sessions without GVfs retain explicit local
+folder selection; their native picker behavior remains a separate validation
+item. No distribution-specific provider database or FUSE path is consulted.
+
+The target-gated `gio` Rust dependency matches the gtk-rs 0.18 generation already
+present in Tauri's Linux dependency graph. The Rust bindings are MIT-licensed and
+link to the distribution's GLib/GIO runtime; Explora does not bundle a GVfs
+provider backend. GIO may load extension modules installed by the desktop, but
+Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 
 ## Implementation strategy
 
@@ -394,8 +426,10 @@ must describe the limitation honestly rather than showing an unusable mount.
 - Support explicitly added local sync folders through a Rust-owned picker.
 - Add only reliably detected local sync folders when a provider-neutral source
   can prove their identity.
-- Evaluate GIO dependencies, runtime availability, licensing, and packaging.
-- Add a GIO backend before displaying non-file GVfs roots.
+- Use `GVolumeMonitor` lifecycle signals on the GLib main loop and accept only
+  explicitly supported GIO URI schemes.
+- Add a GIO backend with cancellable listing and bounded reads before displaying
+  non-file GVfs roots.
 - Validate GNOME Online Accounts and common non-GNOME fallback behavior.
 
 ### Phase 5: explicit hydration
@@ -466,16 +500,18 @@ must describe the limitation honestly rather than showing an unusable mount.
 
 ### Linux
 
-- [ ] Define the initial supported desktop and distribution matrix.
-- [ ] Discover accessible local synced folders without provider databases.
+- [x] Define the initial supported desktop and distribution matrix.
+- [x] Confirm ordinary local sync-client folders have no provider-neutral
+      discovery source; retain explicit selection instead of path heuristics.
 - [x] Provide an explicit add-folder fallback through a Rust-owned native picker.
 - [x] Persist manual roots with opaque IDs and owner-only, non-UTF-8-safe storage.
 - [x] Keep unavailable manual roots visible, offline, and removable.
 - [x] Keep picker results and dialog capabilities behind Rust; expose paths only
       as non-authoritative display data in normal filesystem summaries.
-- [ ] Evaluate `GVolumeMonitor` and mount lifecycle integration.
-- [ ] Decide whether a GIO backend is accepted for the first stable release.
-- [ ] Implement GIO listing and reads before exposing non-file mounts.
+- [x] Evaluate `GVolumeMonitor` and mount lifecycle integration.
+- [x] Accept a narrow, read-only GIO backend for the first stable release.
+- [x] Implement cancellable GIO listing and bounded preview reads before exposing
+      `google-drive://` mounts.
 - [ ] Test GNOME Online Accounts Google Drive where supported.
 - [ ] Test environments without GVfs or a running GLib main loop.
 - [ ] Verify packaging does not silently load unapproved GIO modules.
@@ -524,10 +560,6 @@ locally mirrored folder does not exercise online-only placeholder behavior.
 
 ## Open decisions
 
-- Which provider-neutral signals, if any, are strong enough for automatic Linux
-  local-root discovery?
-- Is GIO an accepted backend dependency, or should Linux initially support only
-  ordinary local paths?
 - Which packaging models are supported on macOS, and will a sandboxed build need
   security-scoped user selection?
 - Which availability states can each platform report authoritatively without
@@ -568,5 +600,9 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [GNOME API Documentation](https://docs.gtk.org/gio/class.VolumeMonitor.html)
 - GIO mount semantics:
   [GNOME API Documentation](https://docs.gtk.org/gio/iface.Mount.html)
+- GIO native-path and virtual-file semantics:
+  [GNOME API Documentation](https://docs.gtk.org/gio/iface.File.html)
+- GVfs Google Drive scheme and GOA requirement:
+  [GNOME GVfs Documentation](https://wiki.gnome.org/Projects%282f%29gvfs%282f%29schemes.html)
 - Rust-owned native folder selection:
   [Tauri Dialog Plugin](https://v2.tauri.app/plugin/dialog/)

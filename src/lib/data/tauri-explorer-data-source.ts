@@ -68,7 +68,7 @@ const contentAvailabilities = new Set<ContentAvailability>([
   "error",
   "unknown",
 ]);
-const locationBackends = new Set<LocationBackend>(["local", "ssh"]);
+const locationBackends = new Set<LocationBackend>(["local", "gio", "ssh"]);
 const locationKinds = new Set<LocationKind>([
   "local",
   "volume",
@@ -221,8 +221,11 @@ const parseLocation = (value: unknown): LocationSummary => {
       "Invalid filesystem response: location role does not match its kind.",
     );
   }
-  const expectedBackend: LocationBackend = kind === "ssh" ? "ssh" : "local";
-  if (backend !== expectedBackend) {
+  const backendMatchesKind =
+    (kind === "ssh" && backend === "ssh") ||
+    (kind === "syncedFolder" && (backend === "local" || backend === "gio")) ||
+    ((kind === "local" || kind === "volume") && backend === "local");
+  if (!backendMatchesKind) {
     throw new Error(
       "Invalid filesystem response: location backend does not match its kind.",
     );

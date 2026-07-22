@@ -20,6 +20,7 @@ use crate::{
         ExplorerError, LocationSummaryDto, SyncedFolderMetadataDto, SyncedFolderProvider,
         SyncedFolderSource, SyncedFolderStatus,
     },
+    gio_filesystem::GioFilesystem,
     local_filesystem::{LocalFilesystem, SyncedFolderRoot},
     manual_synced_folders::ManualSyncedFolderStore,
     synced_availability::SyncedAvailabilityPolicy,
@@ -89,6 +90,7 @@ struct SyncedFolderState {
 
 pub struct SyncedFolderManager {
     filesystem: Arc<LocalFilesystem>,
+    gio_filesystem: Arc<GioFilesystem>,
     discovery: Arc<dyn SyncedFolderDiscovery>,
     manual: ManualSyncedFolderStore,
     state: Mutex<SyncedFolderState>,
@@ -99,12 +101,14 @@ pub struct SyncedFolderManager {
 impl SyncedFolderManager {
     pub fn start(
         filesystem: Arc<LocalFilesystem>,
+        gio_filesystem: Arc<GioFilesystem>,
         home_dir: PathBuf,
         storage_path: PathBuf,
     ) -> Result<Arc<Self>, ExplorerError> {
         let stopped = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             filesystem,
+            gio_filesystem,
             discovery: Arc::new(SystemSyncedFolderDiscovery::new(home_dir)),
             manual: ManualSyncedFolderStore::new(storage_path, cfg!(target_os = "linux"))?,
             state: Mutex::new(SyncedFolderState {
@@ -220,14 +224,16 @@ impl SyncedFolderManager {
             }
         };
 
+        let mut summaries = self.filesystem.replace_synced_folders(roots.clone())?;
+        summaries.extend(self.gio_filesystem.locations()?);
+
         let mut state = self
             .state
             .lock()
             .map_err(|_| ExplorerError::StateUnavailable)?;
-        if state.roots == roots && state.warning.is_none() {
+        if state.roots == roots && state.summaries == summaries && state.warning.is_none() {
             return Ok(());
         }
-        let summaries = self.filesystem.replace_synced_folders(roots.clone())?;
         state.roots = roots;
         state.summaries = summaries;
         state.warning = None;

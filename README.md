@@ -19,17 +19,17 @@ installed provider retains authentication and synchronization ownership. See
 
 Current synced-folder support is intentionally phased:
 
-| Target       | Root discovery                                                         | Browsing                                                | Content availability and hydration                                                                         |
-| ------------ | ---------------------------------------------------------------------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| macOS        | Initial iCloud Drive and `~/Library/CloudStorage` discovery            | Read-only through opaque local references               | iCloud metadata and explicit Download to Preview; real online-only validation pending; third-party unknown |
-| Windows      | Implemented through registered Storage Provider sync roots             | Read-only through opaque local references               | Cloud Files metadata and explicit Download to Preview; native provider validation pending                  |
-| Linux        | Explicit local-folder selection implemented; native validation pending | Read-only local paths; GIO requires a dedicated backend | Local-mirror files are readable; no provider hydration                                                     |
-| Browser demo | Deterministic iCloud Drive, OneDrive, and Google Drive fixtures        | Implemented for UI development and tests                | Synthetic explicit-download lifecycle and online-only states                                               |
+| Target       | Root discovery                                                  | Browsing                                  | Content availability and hydration                                                                         |
+| ------------ | --------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| macOS        | Initial iCloud Drive and `~/Library/CloudStorage` discovery     | Read-only through opaque local references | iCloud metadata and explicit Download to Preview; real online-only validation pending; third-party unknown |
+| Windows      | Implemented through registered Storage Provider sync roots      | Read-only through opaque local references | Cloud Files metadata and explicit Download to Preview; native provider validation pending                  |
+| Linux        | Explicit local folders plus GNOME/GVfs Google Drive mounts      | Read-only local and GIO transports        | Local mirrors and bounded GIO preview streams; native validation pending                                   |
+| Browser demo | Deterministic iCloud Drive, OneDrive, and Google Drive fixtures | Implemented for UI development and tests  | Synthetic explicit-download lifecycle and online-only states                                               |
 
-Packaged macOS, Windows, and Linux provider validation, automatic Linux
-discovery, third-party File Provider availability on macOS, GIO/GVfs support,
-and real-provider hydration validation remain tracked in the synced-folders
-document.
+Packaged macOS, Windows, and Linux provider validation, automatic discovery of
+ordinary Linux sync-client folders, third-party File Provider availability on
+macOS, and real-provider hydration validation remain tracked in the
+synced-folders document.
 
 The packaged application integrates its tab strip into a guarded custom
 titlebar. macOS keeps native traffic lights, Windows 11 retains the native Snap

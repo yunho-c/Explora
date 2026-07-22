@@ -1,6 +1,7 @@
 mod commands;
 mod content_request;
 mod filesystem;
+mod gio_filesystem;
 mod local_filesystem;
 mod manual_synced_folders;
 mod preferences;
@@ -17,6 +18,7 @@ mod windows_synced_folders;
 
 use commands::AppState;
 use filesystem::LocationRole;
+use gio_filesystem::GioFilesystem;
 use local_filesystem::{LocalFilesystem, LocalRoot};
 use preferences::PreferencesStore;
 use serde::Serialize;
@@ -149,10 +151,12 @@ pub fn run() {
             }
 
             let filesystem = std::sync::Arc::new(LocalFilesystem::new(roots)?);
+            let gio_filesystem = GioFilesystem::start()?;
             let volumes = VolumeManager::start(filesystem.clone())?;
             let app_config_dir = paths.app_config_dir()?;
             let synced_folders = SyncedFolderManager::start(
                 filesystem.clone(),
+                gio_filesystem.clone(),
                 paths.home_dir()?,
                 app_config_dir.join("synced-folders.json"),
             )?;
@@ -161,6 +165,7 @@ pub fn run() {
                 SshTargetStore::new(app_config_dir.join("ssh-targets.json"), paths.home_dir()?)?;
             app.manage(AppState::new(
                 filesystem,
+                gio_filesystem,
                 preferences,
                 ssh_targets,
                 volumes,

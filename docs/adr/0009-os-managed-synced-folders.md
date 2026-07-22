@@ -31,10 +31,12 @@ their authoritative access handles in Rust, and exposes only opaque location and
 entry references to the webview.
 
 Location summaries carry backend transport separately from presentation kind.
-The initial transports are `local` and `ssh`; presentation kinds include local
-favorites, physical volumes, synced folders, and SSH locations. Synced-folder
-metadata contains only a normalized provider category and an OS-reported status.
-Provider names never select backend behavior.
+The transports are `local`, `gio`, and `ssh`; presentation kinds include local
+favorites, physical volumes, synced folders, and SSH locations. `gio` is a
+Linux-only, read-only transport for accepted non-file GIO roots and is valid only
+for synced-folder locations. Synced-folder metadata contains only a normalized
+provider category and an OS-reported status. Provider names never select backend
+behavior.
 
 A `SyncedFolderManager` owns platform discovery, stable identities, complete
 monotonically revisioned snapshots, bounded refresh, and registration/revocation
@@ -69,8 +71,9 @@ Platform adapters use the strongest provider-neutral facility available:
 - macOS discovers accessible user-visible File Provider roots and iCloud Drive,
   preserving path authority in Rust and validating behavior in a packaged app.
 - Windows uses the Storage Provider sync-root registry and Cloud Files metadata.
-- Linux may use ordinary local roots immediately; non-file GIO/GVfs locations
-  require a real GIO backend before they are shown as browseable.
+- Linux uses ordinary local roots and accepts a narrow GIO backend for
+  `google-drive://` mounts surfaced by `GVolumeMonitor`. Other GVfs schemes are
+  not classified as synced folders.
 
 On Linux, the initial fallback lets the user select an ordinary local directory
 through a Rust-owned native folder picker. The picker returns the selected path
@@ -80,6 +83,16 @@ raw OS path data needed to preserve non-UTF-8 names. Display paths in normal
 read-only filesystem summaries remain presentation-only and are never accepted
 back as authority. Removing the location changes only Explora's configuration;
 it never deletes or modifies the selected directory.
+
+The GIO adapter retains every URI behind opaque Rust references. It enumerates
+only Google Drive mounts already authenticated and mounted by the desktop,
+listens for mount lifecycle changes on the GTK/GLib main loop, and revokes
+references when a mount disappears. Listing requests run off the UI thread with
+`GCancellable`. Explicit Quick Preview reads stream only the bounded bytes
+requested by the existing preview pipeline into an owner-only temporary file,
+then reuse the same decoding, image, PDF, timeout, concurrency, and cleanup
+limits as local previews. No URI is converted to a POSIX path or exposed over
+IPC.
 
 ## Security and privacy invariants
 

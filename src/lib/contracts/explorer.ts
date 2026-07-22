@@ -1,4 +1,4 @@
-export type LocationBackend = "local" | "ssh";
+export type LocationBackend = "local" | "gio" | "ssh";
 export type LocationKind = "local" | "volume" | "syncedFolder" | "ssh";
 export type LocationRole =
   | "home"

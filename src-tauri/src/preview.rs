@@ -165,6 +165,12 @@ pub struct PreviewManager {
     workers: Arc<Semaphore>,
 }
 
+pub(crate) struct ExternalPreviewSource {
+    pub name: String,
+    pub size: Option<u64>,
+    pub modified_at: Option<u64>,
+}
+
 impl Default for PreviewManager {
     fn default() -> Self {
         Self {
@@ -191,6 +197,25 @@ impl PreviewManager {
         result
     }
 
+    pub async fn prepare_external<F>(
+        &self,
+        request_id: String,
+        entry_id: String,
+        source: ExternalPreviewSource,
+        image_mode: ImagePreviewMode,
+        materialize: F,
+    ) -> Result<PreviewResultDto, ExplorerError>
+    where
+        F: FnOnce(&mut File, usize, &AtomicBool) -> Result<(), ExplorerError> + Send + 'static,
+    {
+        let cancellation = self.begin_request(&request_id)?;
+        let result = self
+            .prepare_external_inner(entry_id, source, cancellation, image_mode, materialize)
+            .await;
+        self.finish_request(&request_id);
+        result
+    }
+
     async fn prepare_local_inner(
         &self,
         entry_id: String,
@@ -198,6 +223,45 @@ impl PreviewManager {
         cancellation: Arc<PreviewCancellation>,
         image_mode: ImagePreviewMode,
     ) -> Result<PreviewResultDto, ExplorerError> {
+        self.prepare_inner(entry_id, cancellation, move |cancellation| {
+            prepare_local_file(&path, cancellation, image_mode)
+        })
+        .await
+    }
+
+    async fn prepare_external_inner<F>(
+        &self,
+        entry_id: String,
+        source: ExternalPreviewSource,
+        cancellation: Arc<PreviewCancellation>,
+        image_mode: ImagePreviewMode,
+        materialize: F,
+    ) -> Result<PreviewResultDto, ExplorerError>
+    where
+        F: FnOnce(&mut File, usize, &AtomicBool) -> Result<(), ExplorerError> + Send + 'static,
+    {
+        self.prepare_inner(entry_id, cancellation, move |cancellation| {
+            prepare_external_file(
+                &source.name,
+                source.size,
+                source.modified_at,
+                cancellation,
+                image_mode,
+                materialize,
+            )
+        })
+        .await
+    }
+
+    async fn prepare_inner<F>(
+        &self,
+        entry_id: String,
+        cancellation: Arc<PreviewCancellation>,
+        prepare: F,
+    ) -> Result<PreviewResultDto, ExplorerError>
+    where
+        F: FnOnce(&PreviewCancellation) -> Result<PreparedPreview, ExplorerError> + Send + 'static,
+    {
         let permit = tokio::select! {
             permit = self.workers.clone().acquire_owned() => {
                 permit.map_err(|_| ExplorerError::StateUnavailable)?
@@ -208,7 +272,7 @@ impl PreviewManager {
         let task_cancellation = cancellation.clone();
         let task = tauri::async_runtime::spawn_blocking(move || {
             let _permit = permit;
-            prepare_local_file(&path, &task_cancellation, image_mode)
+            prepare(&task_cancellation)
         });
 
         let prepared = tokio::select! {
@@ -384,6 +448,125 @@ enum PreparedContent {
     Pdf {
         bytes: Vec<u8>,
     },
+}
+
+enum ExternalReadPlan {
+    Read(usize),
+    Metadata {
+        reason: PreviewUnavailableReason,
+        message: &'static str,
+    },
+}
+
+fn prepare_external_file<F>(
+    source_name: &str,
+    declared_size: Option<u64>,
+    modified_at: Option<u64>,
+    cancellation: &PreviewCancellation,
+    image_mode: ImagePreviewMode,
+    materialize: F,
+) -> Result<PreparedPreview, ExplorerError>
+where
+    F: FnOnce(&mut File, usize, &AtomicBool) -> Result<(), ExplorerError>,
+{
+    ensure_not_cancelled(cancellation)?;
+    let size = declared_size.map(|size| size.to_string());
+    let read_limit = match external_read_plan(source_name, declared_size, image_mode) {
+        ExternalReadPlan::Read(read_limit) => read_limit,
+        ExternalReadPlan::Metadata { reason, message } => {
+            return Ok(PreparedPreview {
+                size,
+                modified_at,
+                content: PreparedContent::Metadata { reason, message },
+            });
+        }
+    };
+
+    let suffix = safe_preview_suffix(source_name);
+    let mut temporary = tempfile::Builder::new()
+        .prefix("explora-preview-")
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(|error| ExplorerError::Io {
+            message: format!("Explora could not create a temporary preview file: {error}"),
+            kind: error.kind(),
+        })?;
+    materialize(temporary.as_file_mut(), read_limit, &cancellation.cancelled)?;
+    std::io::Write::flush(temporary.as_file_mut()).map_err(|error| ExplorerError::Io {
+        message: format!("Explora could not finish the temporary preview file: {error}"),
+        kind: error.kind(),
+    })?;
+    ensure_not_cancelled(cancellation)?;
+
+    let mut prepared = prepare_local_file(temporary.path(), cancellation, image_mode)?;
+    prepared.size = size;
+    prepared.modified_at = modified_at;
+    Ok(prepared)
+}
+
+fn external_read_plan(
+    source_name: &str,
+    declared_size: Option<u64>,
+    image_mode: ImagePreviewMode,
+) -> ExternalReadPlan {
+    let extension = Path::new(source_name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    if extension.as_deref().is_some_and(is_image_extension) {
+        let limit = match image_mode {
+            ImagePreviewMode::Direct => MAX_DIRECT_IMAGE_FILE_BYTES,
+            ImagePreviewMode::Sanitized => MAX_IMAGE_FILE_BYTES,
+        };
+        return if declared_size.is_some_and(|size| size > limit) {
+            ExternalReadPlan::Metadata {
+                reason: PreviewUnavailableReason::TooLarge,
+                message: "This image is too large to preview safely.",
+            }
+        } else {
+            ExternalReadPlan::Read(
+                usize::try_from(limit)
+                    .unwrap_or(MAX_PREVIEW_RESOURCE_BYTES)
+                    .saturating_add(1),
+            )
+        };
+    }
+    if extension.as_deref() == Some("svg") {
+        return ExternalReadPlan::Metadata {
+            reason: PreviewUnavailableReason::Unsupported,
+            message: "SVG preview requires a separately isolated renderer.",
+        };
+    }
+    if extension.as_deref() == Some("pdf") {
+        return if declared_size.is_some_and(|size| size > MAX_PDF_FILE_BYTES) {
+            ExternalReadPlan::Metadata {
+                reason: PreviewUnavailableReason::TooLarge,
+                message: "PDF is too large to preview.",
+            }
+        } else {
+            ExternalReadPlan::Read(MAX_PREVIEW_RESOURCE_BYTES.saturating_add(1))
+        };
+    }
+    if extension.as_deref().is_some_and(is_known_binary_extension) {
+        return ExternalReadPlan::Metadata {
+            reason: PreviewUnavailableReason::Unsupported,
+            message: "Content preview is not available for this file type yet.",
+        };
+    }
+    ExternalReadPlan::Read(MAX_TEXT_BYTES.saturating_add(4))
+}
+
+fn safe_preview_suffix(source_name: &str) -> String {
+    Path::new(source_name)
+        .extension()
+        .and_then(OsStr::to_str)
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(|extension| format!(".{extension}"))
+        .unwrap_or_default()
 }
 
 fn prepare_local_file(
@@ -1086,6 +1269,80 @@ mod tests {
         };
         assert!(truncated);
         assert_eq!(text.len(), MAX_TEXT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn external_preview_materialization_is_bounded_and_reuses_text_safety() {
+        let manager = PreviewManager::default();
+        let preview = manager
+            .prepare_external(
+                "external-text".to_owned(),
+                "entry".to_owned(),
+                ExternalPreviewSource {
+                    name: "notes.txt".to_owned(),
+                    size: Some((MAX_TEXT_BYTES + 64) as u64),
+                    modified_at: Some(42),
+                },
+                ImagePreviewMode::Direct,
+                |output, read_limit, cancelled| {
+                    assert_eq!(read_limit, MAX_TEXT_BYTES + 4);
+                    assert!(!cancelled.load(Ordering::Relaxed));
+                    output
+                        .write_all(&vec![b'a'; read_limit])
+                        .map_err(|error| ExplorerError::Io {
+                            message: "test materialization failed".to_owned(),
+                            kind: error.kind(),
+                        })
+                },
+            )
+            .await
+            .expect("external preview");
+
+        assert_eq!(preview.size, Some((MAX_TEXT_BYTES + 64).to_string()));
+        assert_eq!(preview.modified_at, Some(42));
+        let PreviewContentDto::Text {
+            text, truncated, ..
+        } = preview.content
+        else {
+            panic!("expected text preview");
+        };
+        assert!(truncated);
+        assert_eq!(text.len(), MAX_TEXT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn oversized_external_images_are_rejected_before_content_is_opened() {
+        let manager = PreviewManager::default();
+        let preview = manager
+            .prepare_external(
+                "external-image".to_owned(),
+                "entry".to_owned(),
+                ExternalPreviewSource {
+                    name: "photo.png".to_owned(),
+                    size: Some(MAX_IMAGE_FILE_BYTES + 1),
+                    modified_at: None,
+                },
+                ImagePreviewMode::Sanitized,
+                |_, _, _| panic!("oversized content must not be opened"),
+            )
+            .await
+            .expect("oversized result");
+
+        assert!(matches!(
+            preview.content,
+            PreviewContentDto::Metadata {
+                reason: PreviewUnavailableReason::TooLarge,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn external_preview_suffixes_cannot_escape_the_owned_temporary_file() {
+        assert_eq!(safe_preview_suffix("brief.PDF"), ".PDF");
+        assert_eq!(safe_preview_suffix("archive.tar.gz"), ".gz");
+        assert_eq!(safe_preview_suffix("malicious.../../secret"), "");
+        assert_eq!(safe_preview_suffix("long.abcdefghijklmnopq"), "");
     }
 
     #[test]
