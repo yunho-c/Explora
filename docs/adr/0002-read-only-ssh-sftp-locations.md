@@ -56,7 +56,9 @@ whose outcome might be uncertain. A manual refresh reloads the active directory
 in place without adding navigation history.
 
 This slice is read-only. It lists metadata and navigates directories but does not
-upload, download, rename, delete, or execute remote commands.
+upload, rename, delete, or execute remote commands. ADR 0009 later adds bounded,
+cancellable downloads solely to create read-only snapshots for native opening;
+it does not add a general download or write workflow.
 
 ## Unsupported configuration
 
@@ -96,5 +98,7 @@ OpenSSH configurations that depend on jump hosts cannot connect yet, though
 their concrete aliases remain visible with a clear error. Connection state is
 session-scoped, and users authenticate again after restarting Explora. Reconnect
 is manual and does not yet include an automatic retry policy. Future write
-operations, transfers, automatic retries, persistent secrets, or jump-host
-support require separate capability, progress, conflict, and threat-model work.
+operations, general transfers, automatic retries, persistent secrets, or
+jump-host support require separate capability, progress, conflict, and
+threat-model work. The constrained native-open snapshot transfer is decided
+separately in ADR 0009.

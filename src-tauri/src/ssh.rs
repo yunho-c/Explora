@@ -24,6 +24,10 @@ use russh_sftp::{
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::Instant,
+};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -437,6 +441,7 @@ impl SshSession {
                 display_path: format!("{}:{entry_path}", self.target.name),
                 directory,
                 detail: None,
+                native_open: if is_directory { "none" } else { "download" },
             });
             if batch.len() == LISTING_BATCH_SIZE {
                 emit(DirectoryListingEvent::Entries {
@@ -454,6 +459,111 @@ impl SshSession {
         }
         emit(DirectoryListingEvent::Complete { skipped_entries: 0 })
     }
+
+    async fn download_for_open<F>(
+        &self,
+        entry_id: &str,
+        destination: &Path,
+        cancelled: &AtomicBool,
+        maximum_bytes: u64,
+        mut progress: F,
+    ) -> Result<RemoteDownloadMetadata, ExplorerError>
+    where
+        F: FnMut(u64, Option<u64>) -> Result<(), ExplorerError>,
+    {
+        ensure_not_cancelled(cancelled)?;
+        let path = self.paths.resolve(entry_id)?;
+        let initial = tokio::select! {
+            metadata = self.sftp.metadata(path.clone()) => metadata.map_err(map_sftp_error)?,
+            () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+        };
+        if !initial.is_regular() {
+            return Err(ExplorerError::Unsupported(
+                "Only remote files can be opened with a native application.".to_owned(),
+            ));
+        }
+        if initial.size.is_some_and(|size| size > maximum_bytes) {
+            return Err(ExplorerError::Unsupported(format!(
+                "Remote files larger than {} GiB cannot be opened yet.",
+                maximum_bytes / 1024 / 1024 / 1024
+            )));
+        }
+
+        let mut remote = tokio::select! {
+            file = self.sftp.open(path) => file.map_err(map_sftp_error)?,
+            () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+        };
+        let mut local = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(destination)
+            .await
+            .map_err(|error| {
+                ExplorerError::io("create a remote-file snapshot", destination, error)
+            })?;
+        let total = initial.size;
+        let mut transferred = 0_u64;
+        let mut buffer = vec![0_u8; 128 * 1024];
+        let mut last_emitted = Instant::now();
+        progress(0, total)?;
+
+        loop {
+            let read = tokio::select! {
+                result = remote.read(&mut buffer) => result.map_err(|_| {
+                    ExplorerError::Offline("The SSH file download was interrupted.".to_owned())
+                })?,
+                () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+            };
+            if read == 0 {
+                break;
+            }
+            transferred = transferred.saturating_add(read as u64);
+            if transferred > maximum_bytes {
+                return Err(ExplorerError::Unsupported(format!(
+                    "Remote files larger than {} GiB cannot be opened yet.",
+                    maximum_bytes / 1024 / 1024 / 1024
+                )));
+            }
+            local.write_all(&buffer[..read]).await.map_err(|error| {
+                ExplorerError::io("write a remote-file snapshot", destination, error)
+            })?;
+            if last_emitted.elapsed() >= std::time::Duration::from_millis(100)
+                || total.is_some_and(|total| transferred >= total)
+            {
+                progress(transferred, total)?;
+                last_emitted = Instant::now();
+            }
+        }
+        ensure_not_cancelled(cancelled)?;
+        local.sync_all().await.map_err(|error| {
+            ExplorerError::io("finish a remote-file snapshot", destination, error)
+        })?;
+        progress(transferred, total)?;
+
+        let final_metadata = remote.metadata().await.map_err(map_sftp_error)?;
+        if initial.size != final_metadata.size
+            || initial.mtime != final_metadata.mtime
+            || initial.size.is_some_and(|size| size != transferred)
+        {
+            return Err(ExplorerError::Conflict(
+                "The remote file changed while it was downloading. Open it again to use the current version."
+                    .to_owned(),
+            ));
+        }
+
+        Ok(RemoteDownloadMetadata {
+            executable: initial
+                .permissions
+                .is_some_and(|permissions| permissions & 0o111 != 0),
+            size: initial.size,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteDownloadMetadata {
+    pub executable: bool,
+    pub size: Option<u64>,
 }
 
 pub struct SshConnectionManager {
@@ -962,6 +1072,80 @@ impl SshConnectionManager {
         }
         result
     }
+
+    fn active_session(&self, location_id: &str) -> Result<Arc<SshSession>, ExplorerError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .values()
+            .find(|session| session.location_id == location_id)
+            .cloned()
+            .ok_or_else(|| ExplorerError::Offline("This SSH target is disconnected.".to_owned()))?;
+        if session.lifecycle.load(Ordering::SeqCst) != SESSION_ACTIVE {
+            return Err(ExplorerError::Offline(
+                "This SSH target is disconnected.".to_owned(),
+            ));
+        }
+        Ok(session)
+    }
+
+    pub fn native_open_name(
+        &self,
+        location_id: &str,
+        entry_id: &str,
+    ) -> Result<String, ExplorerError> {
+        let session = self.active_session(location_id)?;
+        let path = session.paths.resolve(entry_id)?;
+        Ok(remote_name(&path))
+    }
+
+    pub async fn native_open_metadata(
+        &self,
+        location_id: &str,
+        entry_id: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<RemoteDownloadMetadata, ExplorerError> {
+        let session = self.active_session(location_id)?;
+        let path = session.paths.resolve(entry_id)?;
+        let metadata = tokio::select! {
+            metadata = session.sftp.metadata(path) => metadata.map_err(map_sftp_error)?,
+            () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+        };
+        if !metadata.is_regular() {
+            return Err(ExplorerError::Unsupported(
+                "Only remote files can be opened with a native application.".to_owned(),
+            ));
+        }
+        Ok(RemoteDownloadMetadata {
+            executable: metadata
+                .permissions
+                .is_some_and(|permissions| permissions & 0o111 != 0),
+            size: metadata.size,
+        })
+    }
+
+    pub async fn download_for_native_open<F>(
+        &self,
+        location_id: &str,
+        entry_id: &str,
+        destination: &Path,
+        cancelled: &AtomicBool,
+        maximum_bytes: u64,
+        progress: F,
+    ) -> Result<RemoteDownloadMetadata, ExplorerError>
+    where
+        F: FnMut(u64, Option<u64>) -> Result<(), ExplorerError>,
+    {
+        let session = self.active_session(location_id)?;
+        let result = session
+            .download_for_open(entry_id, destination, cancelled, maximum_bytes, progress)
+            .await;
+        if matches!(result, Err(ExplorerError::Offline(_))) {
+            session.mark_offline();
+        }
+        result
+    }
 }
 
 fn require_answers(
@@ -1452,7 +1636,11 @@ mod tests {
             .await
             .expect("list real SFTP root");
         let entries = listed_entries(&root_events);
-        assert!(entries.iter().any(|entry| entry.name == "README.md"));
+        let readme = entries
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("remote file entry");
+        assert_eq!(readme.native_open, "download");
         let symlink = entries
             .iter()
             .find(|entry| entry.name == "project-link")
@@ -1504,6 +1692,61 @@ mod tests {
         assert!(listed_entries(&restored_events)
             .iter()
             .any(|entry| entry.name == "notes.txt"));
+
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_open_downloads_a_bounded_remote_snapshot_with_progress() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "native-open", answers);
+        let location = manager
+            .connect(target, "native-open".to_owned(), channel)
+            .await
+            .expect("connect through a real SSH handshake");
+        let entries = listed_entries(
+            &listing_events(&manager, &location.id, &location.root.id)
+                .await
+                .expect("list real SFTP root"),
+        );
+        let readme = entries
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("remote file entry");
+
+        let temporary = tempfile::tempdir().expect("temporary download directory");
+        let destination = temporary.path().join("README.md.partial");
+        let mut progress = Vec::new();
+        let metadata = manager
+            .download_for_native_open(
+                &location.id,
+                &readme.reference.id,
+                &destination,
+                &AtomicBool::new(false),
+                128,
+                |transferred, total| {
+                    progress.push((transferred, total));
+                    Ok(())
+                },
+            )
+            .await
+            .expect("download remote snapshot");
+
+        assert_eq!(metadata.size, Some(128));
+        assert!(!metadata.executable);
+        assert_eq!(
+            std::fs::read(&destination).expect("downloaded bytes").len(),
+            128
+        );
+        assert_eq!(progress.first(), Some(&(0, Some(128))));
+        assert_eq!(progress.last(), Some(&(128, Some(128))));
 
         manager.disconnect("test-target").await.expect("disconnect");
         server.shutdown().await;

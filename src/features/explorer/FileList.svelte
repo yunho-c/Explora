@@ -122,6 +122,13 @@
   <ContextMenu.Content>
     <ContextMenu.Item
       disabled={!state.selectedEntry}
+      onclick={() => {
+        if (state.selectedEntry)
+          void state.openEntry(state.selectedEntry.reference.id);
+      }}>Open</ContextMenu.Item
+    >
+    <ContextMenu.Item
+      disabled={!state.selectedEntry}
       onclick={() => void state.openPreview()}>Quick Preview</ContextMenu.Item
     >
     <ContextMenu.Separator />
