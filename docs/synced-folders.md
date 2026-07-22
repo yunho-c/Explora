@@ -195,6 +195,22 @@ fallback must include a path or provider identifier, hash it in Rust with a
 namespaced application identifier before exposing it. Display names, account
 names, and paths are presentation data and cannot be round-tripped as authority.
 
+Local synced-folder summaries use the sanitized location name as their display
+root. Descendant display paths are relative to that name, so physical provider
+roots such as account-specific File Provider directories never cross IPC merely
+to render a breadcrumb, tooltip, or accessibility description. Root reuse is
+validated against the Rust path registry; it never compares or accepts the
+presentation string as path authority.
+
+Local synced-folder listings run in blocking workers because provider namespace
+calls can be synchronous. Explora waits at most 30 seconds and allows at most
+four concurrent workers. Cancellation wakes the IPC command immediately, while
+the worker retains its concurrency permit until the provider call actually
+returns. This bounds abandoned native work without falsely claiming that a
+provider-owned call was cancelled. A cancellation flag is rechecked immediately
+after opening the namespace and before any event is emitted, preventing a late
+worker from publishing into a newer navigation lifetime.
+
 Discovery and errors must not log:
 
 - Account email addresses or tenant names.
@@ -295,6 +311,12 @@ API has yet been identified for third-party placeholder availability, so those
 entries remain `unknown`. iCloud Drive uses a separate adapter because its
 user-visible root and documented ubiquity APIs have different semantics.
 
+Namespace accessibility and provider status are separate. macOS supplies no
+provider-neutral root connection status for these locations, so system-discovered
+iCloud and third-party roots report provider status `unknown` even while their
+registered local namespace remains browsable. Explora does not turn directory
+presence into a green provider-health claim.
+
 Foundation exposes ubiquitous-item state for iCloud content, including whether
 an item is ubiquitous, whether it is downloading, any download error, and its
 current download status. The macOS adapter reads only those URL resource values;
@@ -310,6 +332,13 @@ special entries remain metadata-only and are not followed or opened. Preview
 revalidates the opaque entry reference and current availability before content
 access; only a file reported as a current local copy enters the bounded preview
 reader.
+
+Explicit content-request authorization remains policy-specific. The documented
+iCloud ubiquitous-item request is allowed when item metadata requires it even
+though root provider status is unknown; the operating-system request and later
+item revalidation are authoritative. Windows Cloud Files hydration remains
+disabled when its separately queryable provider status is unknown. Neither
+decision depends on a displayed provider name.
 
 The initial packaged application should be tested both with locally available
 and evicted files. Future Mac App Store sandboxing would change folder-access
@@ -516,6 +545,13 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Start iCloud download only from explicit Download to Preview intent.
 - [x] Keep Explora wait cancellation distinct from the OS-owned iCloud request.
 - [x] Keep third-party availability unknown pending a documented provider-neutral API.
+- [x] Keep macOS root provider status unknown without disabling documented
+      iCloud item requests.
+- [x] Add an ignored, privacy-safe native smoke for discovery, opaque
+      registration, and time-bounded provider-namespace opening.
+- [x] Bound provider-owned namespace opens with prompt command cancellation, a
+      30-second deadline, late-event suppression, and four retained worker
+      permits.
 - [ ] Test multiple OneDrive and Google Drive accounts.
 - [ ] Test locally available, online-only, downloading, and failed items.
 - [ ] Test permission denial and future sandbox implications.
@@ -587,6 +623,22 @@ Native integration tests need controllable platform fixtures or test adapters
 for discovery events and placeholder states. At least one real-provider smoke
 scenario per supported platform is required because browser tests and synthetic
 filesystem trees cannot prove File Provider, Cloud Files, or GVfs behavior.
+
+The macOS native smoke can be run without logging provider paths or account
+labels:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml \
+  native_macos_roots_register_and_open_without_provider_authority_crossing_ipc \
+  -- --ignored --nocapture
+```
+
+On macOS 15.6 on 2026-07-22, the release `.app` and DMG packaged successfully.
+The native smoke discovered and registered four installed OS-managed roots; two
+opened through the local backend within the five-second diagnostic deadline and
+two provider namespace opens stalled or failed. Production IPC now bounds those
+calls as described above, but this remains useful provider-behavior evidence—not
+a completed packaged-app UI smoke.
 
 Report discovery, listing, placeholder inspection, hydration, and packaged UI
 evidence separately. A successful browser workflow is not native proof, and a

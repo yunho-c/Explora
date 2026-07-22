@@ -185,7 +185,7 @@ impl LocalFilesystem {
             }
 
             seen_paths.push(root.path.clone());
-            let directory = directory_ref(&registry, &root.path, root.id, Some(root.name))?;
+            let directory = directory_ref(&registry, &root.path, root.id, Some(root.name), None)?;
             locations.push(LocationSummaryDto {
                 id: root.id.to_owned(),
                 name: root.name.to_owned(),
@@ -264,17 +264,27 @@ impl LocalFilesystem {
             if !volume.path.is_dir() {
                 continue;
             }
-            let display_path = volume.path.display().to_string();
-            let directory = if let Some(existing) = previous
-                .get(&volume.id)
-                .filter(|existing| existing.root.display_path == display_path)
-            {
+            let directory = if let Some(existing) = previous.get(&volume.id).filter(|existing| {
+                reference_points_to(
+                    &self.registry,
+                    &existing.id,
+                    &existing.root.id,
+                    &volume.path,
+                )
+            }) {
                 let mut root = existing.root.clone();
                 root.name = volume.name.clone();
+                root.display_path = display_path(&volume.path);
                 root
             } else {
                 self.registry.remove_location(&volume.id)?;
-                directory_ref(&self.registry, &volume.path, &volume.id, Some(&volume.name))?
+                directory_ref(
+                    &self.registry,
+                    &volume.path,
+                    &volume.id,
+                    Some(&volume.name),
+                    None,
+                )?
             };
             self.registry.activate_location(&volume.id)?;
             summaries.push(LocationSummaryDto {
@@ -327,17 +337,27 @@ impl LocalFilesystem {
             {
                 continue;
             }
-            let display_path = folder.path.display().to_string();
-            let directory = if let Some(existing) = previous
-                .get(&folder.id)
-                .filter(|existing| existing.root.display_path == display_path)
-            {
+            let directory = if let Some(existing) = previous.get(&folder.id).filter(|existing| {
+                reference_points_to(
+                    &self.registry,
+                    &existing.id,
+                    &existing.root.id,
+                    &folder.path,
+                )
+            }) {
                 let mut root = existing.root.clone();
                 root.name = folder.name.clone();
+                root.display_path = folder.name.clone();
                 root
             } else {
                 self.registry.remove_location(&folder.id)?;
-                directory_ref(&self.registry, &folder.path, &folder.id, Some(&folder.name))?
+                directory_ref(
+                    &self.registry,
+                    &folder.path,
+                    &folder.id,
+                    Some(&folder.name),
+                    Some((&folder.path, &folder.name)),
+                )?
             };
             self.registry.activate_location(&folder.id)?;
             next_availability.insert(folder.id.clone(), folder.availability);
@@ -440,13 +460,20 @@ impl LocalFilesystem {
         }
         let read_dir = fs::read_dir(&path)
             .map_err(|error| ExplorerError::io("open", path.as_path(), error))?;
+        // A provider-owned namespace open can return after the IPC request has
+        // already been cancelled or timed out. Recheck before registering or
+        // emitting any state so that abandoned workers cannot publish late
+        // events into a newer navigation lifetime.
+        ensure_not_cancelled(cancelled)?;
 
-        let directory = directory_ref(&self.registry, &path, location_id, None)?;
+        let display_root = (location.kind == "syncedFolder")
+            .then_some((root_path.as_path(), location.name.as_str()));
+        let directory = directory_ref(&self.registry, &path, location_id, None, display_root)?;
         let parent = (path != root_path)
             .then(|| path.parent())
             .flatten()
             .filter(|parent| parent.starts_with(&root_path))
-            .map(|parent| directory_ref(&self.registry, parent, location_id, None))
+            .map(|parent| directory_ref(&self.registry, parent, location_id, None, display_root))
             .transpose()?;
         let breadcrumbs = breadcrumbs(
             &self.registry,
@@ -454,6 +481,7 @@ impl LocalFilesystem {
             &root_path,
             location_id,
             &location.name,
+            display_root,
         )?;
 
         emit(DirectoryListingEvent::Started {
@@ -477,7 +505,7 @@ impl LocalFilesystem {
                 }
             };
 
-            match self.describe_entry(entry, location_id, synced_availability) {
+            match self.describe_entry(entry, location_id, synced_availability, display_root) {
                 Ok(entry) => batch.push(entry),
                 Err(_) => {
                     skipped_entries += 1;
@@ -513,6 +541,7 @@ impl LocalFilesystem {
         entry: fs::DirEntry,
         location_id: &str,
         synced_availability: Option<SyncedAvailabilityPolicy>,
+        display_root: Option<(&Path, &str)>,
     ) -> Result<FileEntrySummaryDto, ExplorerError> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -530,7 +559,7 @@ impl LocalFilesystem {
             id: id.clone(),
             location_id: location_id.to_owned(),
             name: name.clone(),
-            display_path: display_path(&path),
+            display_path: presentation_path(&path, display_root),
         });
         let kind = if file_type.is_dir() {
             "directory"
@@ -570,7 +599,7 @@ impl LocalFilesystem {
             content_kind: content_kind(&path, is_navigable),
             size,
             modified_at,
-            display_path: display_path(&path),
+            display_path: presentation_path(&path, display_root),
             directory,
             availability,
             detail: file_type.is_symlink().then_some("Symbolic link"),
@@ -622,6 +651,7 @@ fn directory_ref(
     path: &Path,
     location_id: &str,
     preferred_name: Option<&str>,
+    display_root: Option<(&Path, &str)>,
 ) -> Result<DirectoryRefDto, ExplorerError> {
     Ok(DirectoryRefDto {
         id: registry.register(location_id, path.to_path_buf())?,
@@ -629,7 +659,7 @@ fn directory_ref(
         name: preferred_name
             .map(str::to_owned)
             .unwrap_or_else(|| directory_name(path)),
-        display_path: display_path(path),
+        display_path: presentation_path(path, display_root),
     })
 }
 
@@ -639,6 +669,7 @@ fn breadcrumbs(
     root: &Path,
     location_id: &str,
     root_name: &str,
+    display_root: Option<(&Path, &str)>,
 ) -> Result<Vec<BreadcrumbSegmentDto>, ExplorerError> {
     path.ancestors()
         .take_while(|ancestor| ancestor.starts_with(root))
@@ -651,6 +682,7 @@ fn breadcrumbs(
                 ancestor,
                 location_id,
                 (ancestor == root).then_some(root_name),
+                display_root,
             )?;
             Ok(BreadcrumbSegmentDto {
                 label: directory.name.clone(),
@@ -669,6 +701,33 @@ fn directory_name(path: &Path) -> String {
 
 fn display_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn presentation_path(path: &Path, display_root: Option<(&Path, &str)>) -> String {
+    let Some((root, root_name)) = display_root else {
+        return display_path(path);
+    };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return root_name.to_owned();
+    };
+    if relative.as_os_str().is_empty() {
+        return root_name.to_owned();
+    }
+    Path::new(root_name)
+        .join(relative)
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn reference_points_to(
+    registry: &PathRegistry,
+    location_id: &str,
+    reference_id: &str,
+    expected_path: &Path,
+) -> bool {
+    registry
+        .resolve(location_id, reference_id)
+        .is_ok_and(|registered| registered == expected_path)
 }
 
 fn content_kind(path: &Path, is_directory: bool) -> &'static str {
@@ -994,6 +1053,101 @@ mod tests {
     }
 
     #[test]
+    fn synced_folder_summaries_hide_physical_provider_roots() {
+        let (temp, filesystem, _) = fixture();
+        let provider_root = temp
+            .path()
+            .join("Library/CloudStorage/OneDrive-private@example.com");
+        fs::create_dir_all(provider_root.join("Projects")).expect("provider fixture");
+        File::create(provider_root.join("notes.txt")).expect("provider file");
+        let root = SyncedFolderRoot {
+            id: "synced:private-provider".to_owned(),
+            name: "OneDrive".to_owned(),
+            path: provider_root,
+            detail: "OneDrive · Synced folder".to_owned(),
+            metadata: SyncedFolderMetadataDto {
+                provider: crate::filesystem::SyncedFolderProvider::OneDrive,
+                status: crate::filesystem::SyncedFolderStatus::Available,
+                source: crate::filesystem::SyncedFolderSource::System,
+            },
+            availability: SyncedAvailabilityPolicy::Unknown,
+        };
+
+        let location = filesystem
+            .replace_synced_folders(vec![root.clone()])
+            .expect("synced snapshot")
+            .remove(0);
+        assert_eq!(location.display_path, "OneDrive");
+        assert_eq!(location.root.display_path, "OneDrive");
+
+        let mut entries = Vec::new();
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries: batch, .. } = event {
+                        entries.extend(batch);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("provider listing");
+        let mut display_paths = entries
+            .iter()
+            .map(|entry| entry.display_path.as_str())
+            .collect::<Vec<_>>();
+        display_paths.sort_unstable();
+        assert_eq!(display_paths, ["OneDrive/Projects", "OneDrive/notes.txt"]);
+        let projects = entries
+            .iter()
+            .find(|entry| entry.name == "Projects")
+            .and_then(|entry| entry.directory.clone())
+            .expect("projects directory");
+        assert_eq!(projects.display_path, "OneDrive/Projects");
+
+        let serialized = serde_json::to_string(&(location.clone(), entries))
+            .expect("serialize provider summaries");
+        assert!(!serialized.contains("private@example.com"));
+        assert!(!serialized.contains("CloudStorage"));
+
+        let mut started = None;
+        filesystem
+            .list_directory(
+                &projects.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Started {
+                        directory,
+                        breadcrumbs,
+                        ..
+                    } = event
+                    {
+                        started = Some((directory, breadcrumbs));
+                    }
+                    Ok(())
+                },
+            )
+            .expect("nested provider listing");
+        let serialized = serde_json::to_string(&started).expect("serialize nested listing");
+        assert!(serialized.contains("OneDrive/Projects"));
+        assert!(!serialized.contains("private@example.com"));
+        assert!(!serialized.contains("CloudStorage"));
+
+        let renamed = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                name: "OneDrive 1".to_owned(),
+                ..root
+            }])
+            .expect("renamed snapshot")
+            .remove(0);
+        assert_eq!(renamed.root.id, location.root.id);
+        assert_eq!(renamed.root.display_path, "OneDrive 1");
+    }
+
+    #[test]
     fn preview_access_revalidates_synced_tokens_without_opening_file_content() {
         let (temp, filesystem, _) = fixture();
         let synced_path = temp.path().join("preview-synced-root");
@@ -1131,10 +1285,10 @@ mod tests {
                 id: "synced:icloud:test".to_owned(),
                 name: "iCloud Drive".to_owned(),
                 path: synced_path,
-                detail: "iCloud Drive · Synced folder".to_owned(),
+                detail: "iCloud Drive · Provider status unknown".to_owned(),
                 metadata: SyncedFolderMetadataDto {
                     provider: crate::filesystem::SyncedFolderProvider::ICloud,
-                    status: crate::filesystem::SyncedFolderStatus::Available,
+                    status: crate::filesystem::SyncedFolderStatus::Unknown,
                     source: crate::filesystem::SyncedFolderSource::System,
                 },
                 availability: SyncedAvailabilityPolicy::ICloud,
@@ -1164,6 +1318,10 @@ mod tests {
             .expect("preview access");
 
         assert_eq!(access.availability, ContentAvailability::Unknown);
+        assert_eq!(
+            access.provider_status,
+            Some(crate::filesystem::SyncedFolderStatus::Unknown)
+        );
         assert_eq!(
             access.content_request_policy,
             Some(ContentRequestPolicy::ICloud)

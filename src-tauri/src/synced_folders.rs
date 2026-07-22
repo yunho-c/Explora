@@ -273,7 +273,10 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
             identity: path_identity(&icloud),
             path: icloud,
             provider: SyncedFolderProvider::ICloud,
-            status: SyncedFolderStatus::Available,
+            // macOS exposes the namespace and item availability, but no
+            // provider-neutral root connection status. Directory presence is
+            // not proof that the provider service is responsive.
+            status: SyncedFolderStatus::Unknown,
             availability: SyncedAvailabilityPolicy::ICloud,
         });
     }
@@ -298,7 +301,7 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
                     identity: path_identity(&path),
                     path,
                     provider,
-                    status: SyncedFolderStatus::Available,
+                    status: SyncedFolderStatus::Unknown,
                     availability: SyncedAvailabilityPolicy::Unknown,
                 });
             }
@@ -528,6 +531,12 @@ mod tests {
         );
         assert!(roots.iter().all(|root| !root.name.contains('@')));
         assert!(roots.iter().all(|root| root.id.starts_with("synced:")));
+        assert!(roots
+            .iter()
+            .all(|root| root.metadata.status == SyncedFolderStatus::Unknown));
+        assert!(roots
+            .iter()
+            .all(|root| root.detail.ends_with("Provider status unknown")));
     }
 
     #[cfg(unix)]
@@ -691,5 +700,111 @@ mod tests {
         );
         assert!(!error.contains("CloudStorage"));
         assert!(!error.contains('@'));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires real macOS iCloud Drive or File Provider roots"]
+    fn native_macos_roots_register_and_open_without_provider_authority_crossing_ipc() {
+        use std::{sync::mpsc, time::Duration};
+
+        use crate::{
+            filesystem::{DirectoryListingEvent, LocationRole},
+            local_filesystem::LocalRoot,
+        };
+
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .expect("native smoke requires an accessible macOS home directory");
+        let roots = discover_macos_roots(&home)
+            .unwrap_or_else(|_| panic!("native macOS synced-folder discovery failed"));
+        assert!(
+            !roots.is_empty(),
+            "native smoke requires at least one configured synced-folder root"
+        );
+        let expected_root_count = roots.len();
+        let roots_to_open = roots.clone();
+        let filesystem = LocalFilesystem::new(vec![LocalRoot {
+            id: "native-smoke-home",
+            name: "Home",
+            role: LocationRole::Home,
+            path: home.clone(),
+        }])
+        .unwrap_or_else(|_| panic!("native macOS local filesystem setup failed"));
+        let locations = filesystem
+            .replace_synced_folders(roots)
+            .unwrap_or_else(|_| panic!("native macOS synced-folder registration failed"));
+        assert_eq!(locations.len(), expected_root_count);
+        assert!(locations.iter().all(|location| {
+            location.display_path == location.name && location.root.display_path == location.name
+        }));
+        assert!(locations.iter().all(|location| {
+            location
+                .synced_folder
+                .as_ref()
+                .is_some_and(|metadata| metadata.status == SyncedFolderStatus::Unknown)
+        }));
+
+        let mut opened_roots = 0_usize;
+        for root in roots_to_open {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let home = home.clone();
+            std::thread::spawn(move || {
+                let opened = (|| {
+                    let filesystem = LocalFilesystem::new(vec![LocalRoot {
+                        id: "native-smoke-home",
+                        name: "Home",
+                        role: LocationRole::Home,
+                        path: home,
+                    }])
+                    .ok()?;
+                    let location = filesystem
+                        .replace_synced_folders(vec![root])
+                        .ok()?
+                        .into_iter()
+                        .next()?;
+                    let mut opened = false;
+                    let result = filesystem.list_directory(
+                        &location.root.id,
+                        &location.id,
+                        &AtomicBool::new(false),
+                        |event| {
+                            if matches!(event, DirectoryListingEvent::Started { .. }) {
+                                opened = true;
+                                // Opening the provider namespace is enough for
+                                // this smoke. Enumerating real user entries
+                                // belongs in a controlled fixture or interactive
+                                // packaged-app scenario.
+                                return Err(crate::filesystem::ExplorerError::Cancelled);
+                            }
+                            Ok(())
+                        },
+                    );
+                    Some(
+                        opened
+                            && matches!(result, Err(crate::filesystem::ExplorerError::Cancelled)),
+                    )
+                })()
+                .unwrap_or(false);
+                let _ = sender.send(opened);
+            });
+
+            if receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(false)
+            {
+                opened_roots += 1;
+            }
+        }
+
+        eprintln!(
+            "native macOS synced-folder smoke: discovered={expected_root_count}, opened={opened_roots}, stalled_or_failed={}",
+            expected_root_count - opened_roots
+        );
+        assert!(
+            opened_roots > 0,
+            "no discovered macOS synced-folder root opened through the local backend"
+        );
     }
 }

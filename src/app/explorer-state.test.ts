@@ -266,12 +266,13 @@ class ControllableSyncedFolderDataSource extends DemoExplorerDataSource {
   }
 
   failNextListing(code: ExplorerFilesystemErrorCode): void {
-    this.nextListingError = new ExplorerFilesystemError(
-      code,
+    const message =
       code === "staleReference"
         ? "This filesystem reference is stale."
-        : "This location is no longer available.",
-    );
+        : code === "timedOut"
+          ? "The sync provider took too long to open this folder."
+          : "This location is no longer available.";
+    this.nextListingError = new ExplorerFilesystemError(code, message);
   }
 
   emitSyncedFolders(
@@ -413,6 +414,25 @@ describe("ExplorerState", () => {
       expect(state.activeLocation?.status).toBe("available"),
     );
     expect(state.activeDirectory?.id).toBe(icloud.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
+  it("keeps a synced-folder tab available when its provider listing times out", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const icloud = state.locations.find(({ id }) => id === "synced:icloud")!;
+    await state.selectLocation(icloud.id);
+    const entries = state.entries;
+
+    dataSource.failNextListing("timedOut");
+    await state.refreshDirectory();
+
+    expect(state.activeLocation?.status).toBe("available");
+    expect(state.activeTab?.locationId).toBe(icloud.id);
+    expect(state.entries).toEqual(entries);
+    expect(state.errorMessage).toContain("took too long");
     expect(state.warningMessage).toBeNull();
     state.dispose();
   });

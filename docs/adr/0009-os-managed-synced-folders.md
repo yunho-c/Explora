@@ -59,6 +59,12 @@ current local copy. Completion revalidates the same entry again before reopening
 the existing bounded preview pipeline. The adapters are selected by internal
 access policy, never the displayed provider name.
 
+Content-request status gates are policy-specific. macOS exposes a documented
+iCloud item request but no provider-neutral root connection status, so an
+unknown root status does not suppress that request. Windows exposes authoritative
+Cloud Files provider status, so unknown Windows status does suppress hydration.
+Offline, paused, and error states block either policy.
+
 The current operating-system requests are not represented as safely cancellable.
 Cancelling the Explora task stops waiting and releases its task state, while the
 provider-owned download may continue. Requests time out after a fixed bound and
@@ -69,7 +75,8 @@ until a documented provider-neutral client API is accepted.
 Platform adapters use the strongest provider-neutral facility available:
 
 - macOS discovers accessible user-visible File Provider roots and iCloud Drive,
-  preserving path authority in Rust and validating behavior in a packaged app.
+  preserves path authority in Rust, and reports provider status unknown because
+  namespace presence is not a provider-health signal.
 - Windows uses the Storage Provider sync-root registry and Cloud Files metadata.
   A read-only sync-root information query supplies provider status without a
   provider connection key. Namespace accessibility remains independent from
@@ -117,6 +124,9 @@ observed; affected tabs reset to that root and discard stale navigation history.
 
 - Display paths, folder names, account labels, and provider names are never
   authoritative identifiers.
+- Local synced-folder display paths are rooted at a sanitized location name;
+  physical provider-root and account-directory components remain in the Rust
+  path registry and do not cross IPC as breadcrumb or accessibility text.
 - Stable public IDs are namespaced opaque values derived in Rust; raw provider
   identities and account email addresses do not cross IPC or enter logs.
 - Removing a root revokes every opaque path reference for that location before
@@ -133,6 +143,10 @@ observed; affected tabs reset to that root and discard stale navigation history.
 - A native content request is authorized only for a currently registered regular
   file and is revalidated before completion; removal or replacement cannot be
   reported as a successful download.
+- Local provider listings have a fixed command deadline and concurrency cap.
+  Cancellation returns promptly, but a provider-blocked worker retains its
+  permit and is prevented from emitting late events until the native call
+  returns; Explora does not claim to cancel the operating-system call itself.
 - Unsupported platforms and unavailable providers report honest capability and
   status rather than falling back to provider-name checks.
 

@@ -9,6 +9,7 @@ use std::{
 
 use tauri::{ipc::Channel, AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
+use tokio::sync::{oneshot, Notify, Semaphore};
 
 use crate::{
     content_request::{ContentRequestManager, ContentRequestPolicy},
@@ -33,6 +34,34 @@ use crate::{
     volumes::{VolumeManager, VolumeSnapshotEventDto},
 };
 
+struct ListingControl {
+    cancelled: AtomicBool,
+    notification: Notify,
+}
+
+impl ListingControl {
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notification: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        // There is one command waiter. `notify_one` also retains a permit if
+        // cancellation wins the race before that waiter starts polling.
+        self.notification.notify_one();
+    }
+
+    async fn cancelled(&self) {
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        self.notification.notified().await;
+    }
+}
+
 pub struct AppState {
     local: Arc<LocalFilesystem>,
     gio: Arc<GioFilesystem>,
@@ -43,7 +72,8 @@ pub struct AppState {
     content_requests: Arc<ContentRequestManager>,
     volumes: Arc<VolumeManager>,
     synced_folders: Arc<SyncedFolderManager>,
-    listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    listings: Mutex<HashMap<String, Arc<ListingControl>>>,
+    synced_listing_limiter: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -66,12 +96,13 @@ impl AppState {
             volumes,
             synced_folders,
             listings: Mutex::new(HashMap::new()),
+            synced_listing_limiter: Arc::new(Semaphore::new(MAX_CONCURRENT_SYNCED_LISTINGS)),
         }
     }
 
-    fn begin_listing(&self, request_id: &str) -> Result<Arc<AtomicBool>, ExplorerError> {
+    fn begin_listing(&self, request_id: &str) -> Result<Arc<ListingControl>, ExplorerError> {
         validate_request_id(request_id)?;
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let cancellation = Arc::new(ListingControl::new());
         let mut listings = self
             .listings
             .lock()
@@ -96,7 +127,7 @@ impl AppState {
             .map_err(|_| ExplorerError::StateUnavailable)?
             .get(request_id)
         {
-            cancellation.store(true, Ordering::Relaxed);
+            cancellation.cancel();
         }
         Ok(())
     }
@@ -127,6 +158,30 @@ impl AppState {
 
 const CONTENT_REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CONTENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const SYNCED_LISTING_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CONCURRENT_SYNCED_LISTINGS: usize = 4;
+
+async fn await_bounded_synced_listing(
+    result: oneshot::Receiver<Result<(), ExplorerError>>,
+    control: Arc<ListingControl>,
+    timeout: Duration,
+) -> Result<(), ExplorerError> {
+    tokio::select! {
+        biased;
+        _ = control.cancelled() => Err(ExplorerError::Cancelled),
+        result = result => result.unwrap_or_else(|_| {
+            Err(ExplorerError::Unexpected(
+                "The synced-folder listing task stopped unexpectedly.".to_owned(),
+            ))
+        }),
+        _ = tokio::time::sleep(timeout) => {
+            control.cancel();
+            Err(ExplorerError::TimedOut(
+                "The sync provider took too long to open this folder.".to_owned(),
+            ))
+        },
+    }
+}
 
 fn validate_request_id(request_id: &str) -> Result<(), ExplorerError> {
     if request_id.is_empty() || request_id.len() > 128 {
@@ -397,6 +452,21 @@ pub async fn list_directory(
                 .local
                 .is_synced_folder(&location_id)
                 .map_err(ExplorerErrorDto::from)?);
+    let synced_listing_permit = if backend == LocationBackend::Local && synced_location {
+        Some(
+            state
+                .synced_listing_limiter
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| {
+                    ExplorerErrorDto::from(ExplorerError::Unexpected(
+                        "Too many synced folders are still waiting on their providers.".to_owned(),
+                    ))
+                })?,
+        )
+    } else {
+        None
+    };
 
     let cancellation = state
         .begin_listing(&request_id)
@@ -407,21 +477,32 @@ pub async fn list_directory(
         LocationBackend::Ssh => {
             state
                 .ssh
-                .list_directory(&location_id, &directory_id, &cancellation, |event| {
-                    on_event
-                        .send(event)
-                        .map_err(|_| ExplorerError::ChannelClosed)
-                })
+                .list_directory(
+                    &location_id,
+                    &directory_id,
+                    &cancellation.cancelled,
+                    |event| {
+                        on_event
+                            .send(event)
+                            .map_err(|_| ExplorerError::ChannelClosed)
+                    },
+                )
                 .await
         }
         LocationBackend::Gio => {
             let gio = state.gio.clone();
+            let worker_cancellation = cancellation.clone();
             tauri::async_runtime::spawn_blocking(move || {
-                gio.list_directory(&directory_id, &location_id, &cancellation, |event| {
-                    on_event
-                        .send(event)
-                        .map_err(|_| ExplorerError::ChannelClosed)
-                })
+                gio.list_directory(
+                    &directory_id,
+                    &location_id,
+                    &worker_cancellation.cancelled,
+                    |event| {
+                        on_event
+                            .send(event)
+                            .map_err(|_| ExplorerError::ChannelClosed)
+                    },
+                )
             })
             .await
             .unwrap_or_else(|error| {
@@ -432,19 +513,39 @@ pub async fn list_directory(
         }
         LocationBackend::Local => {
             let local = state.local.clone();
+            let worker_cancellation = cancellation.clone();
+            let (result_sender, result_receiver) = oneshot::channel();
             tauri::async_runtime::spawn_blocking(move || {
-                local.list_directory(&directory_id, &location_id, &cancellation, |event| {
-                    on_event
-                        .send(event)
-                        .map_err(|_| ExplorerError::ChannelClosed)
+                // A provider-blocked worker retains this permit even after the
+                // command returns a timeout, bounding abandoned native calls.
+                let _permit = synced_listing_permit;
+                let result = local.list_directory(
+                    &directory_id,
+                    &location_id,
+                    &worker_cancellation.cancelled,
+                    |event| {
+                        on_event
+                            .send(event)
+                            .map_err(|_| ExplorerError::ChannelClosed)
+                    },
+                );
+                let _ = result_sender.send(result);
+            });
+
+            if synced_location {
+                await_bounded_synced_listing(
+                    result_receiver,
+                    cancellation.clone(),
+                    SYNCED_LISTING_TIMEOUT,
+                )
+                .await
+            } else {
+                result_receiver.await.unwrap_or_else(|_| {
+                    Err(ExplorerError::Unexpected(
+                        "The directory listing task stopped unexpectedly.".to_owned(),
+                    ))
                 })
-            })
-            .await
-            .unwrap_or_else(|error| {
-                Err(ExplorerError::Unexpected(format!(
-                    "The directory listing task failed: {error}"
-                )))
-            })
+            }
         }
     };
 
@@ -557,14 +658,20 @@ pub async fn prepare_preview(
     if access.availability != ContentAvailability::Local {
         let request_content = access
             .content_request_policy
-            .filter(|_| access.provider_status == Some(SyncedFolderStatus::Available))
+            .filter(|policy| {
+                content_request_provider_status_error(*policy, access.provider_status).is_none()
+            })
             .map(content_request_capability);
         return Ok(metadata_result_with_content_request(
             entry_id,
             access.size,
             access.modified_at,
             PreviewUnavailableReason::DownloadRequired,
-            synced_preview_message(access.availability, access.provider_status),
+            synced_preview_message(
+                access.availability,
+                access.provider_status,
+                access.content_request_policy,
+            ),
             request_content,
         ));
     }
@@ -637,6 +744,7 @@ fn local_preview_error(error: ExplorerError, synced_location: bool) -> ExplorerE
 fn synced_preview_message(
     availability: ContentAvailability,
     provider_status: Option<SyncedFolderStatus>,
+    content_request_policy: Option<ContentRequestPolicy>,
 ) -> &'static str {
     match provider_status {
         Some(SyncedFolderStatus::Offline) => {
@@ -648,10 +756,12 @@ fn synced_preview_message(
         Some(SyncedFolderStatus::Error) => {
             return "The sync provider reported an error. This file is not available locally."
         }
-        Some(SyncedFolderStatus::Unknown) => {
+        Some(SyncedFolderStatus::Unknown)
+            if content_request_policy != Some(ContentRequestPolicy::ICloud) =>
+        {
             return "Explora cannot verify the sync provider's status or access this file locally."
         }
-        Some(SyncedFolderStatus::Available) | None => {}
+        Some(SyncedFolderStatus::Available | SyncedFolderStatus::Unknown) | None => {}
     }
     match availability {
         ContentAvailability::OnlineOnly => {
@@ -677,6 +787,7 @@ fn synced_preview_message(
 }
 
 fn content_request_provider_status_error(
+    policy: ContentRequestPolicy,
     status: Option<SyncedFolderStatus>,
 ) -> Option<ExplorerError> {
     match status {
@@ -690,9 +801,17 @@ fn content_request_provider_status_error(
         Some(SyncedFolderStatus::Error) => Some(ExplorerError::Unexpected(
             "The sync provider reported an error.".to_owned(),
         )),
-        Some(SyncedFolderStatus::Unknown) | None => Some(ExplorerError::Unsupported(
-            "Explora cannot verify that this sync provider is available.".to_owned(),
-        )),
+        Some(SyncedFolderStatus::Unknown) | None => match policy {
+            // macOS has a documented item request but no provider-neutral root
+            // status. The request itself is the authoritative operation and
+            // returns a structured error if iCloud cannot accept it.
+            ContentRequestPolicy::ICloud => None,
+            // Windows does expose authoritative CFAPI provider status, so an
+            // unknown result must not start placeholder hydration.
+            ContentRequestPolicy::WindowsCloudFiles => Some(ExplorerError::Unsupported(
+                "Explora cannot verify that this sync provider is available.".to_owned(),
+            )),
+        },
     }
 }
 
@@ -749,14 +868,14 @@ pub async fn request_content(
         );
     }
 
-    if let Some(error) = content_request_provider_status_error(initial.provider_status) {
-        return Err(ExplorerErrorDto::from(error));
-    }
     let policy = initial.content_request_policy.ok_or_else(|| {
         ExplorerErrorDto::from(ExplorerError::Unsupported(
             "This synced folder does not support explicit content requests.".to_owned(),
         ))
     })?;
+    if let Some(error) = content_request_provider_status_error(policy, initial.provider_status) {
+        return Err(ExplorerErrorDto::from(error));
+    }
 
     // Register cancellation before publishing Started so a fast UI stop
     // cannot race ahead of the task registry.
@@ -798,8 +917,13 @@ pub async fn request_content(
             .local
             .resolve_preview_access(&entry_id, &location_id)
             .map_err(|error| local_preview_error(error, true))?;
+        if current.content_request_policy != Some(policy) {
+            return Err(ExplorerErrorDto::from(ExplorerError::StaleReference));
+        }
         if current.availability != ContentAvailability::Local {
-            if let Some(error) = content_request_provider_status_error(current.provider_status) {
+            if let Some(error) =
+                content_request_provider_status_error(policy, current.provider_status)
+            {
                 return Err(local_preview_error(error, true));
             }
         }
@@ -929,6 +1053,44 @@ fn validate_reference_id(value: &str) -> Result<(), ExplorerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_synced_listing_returns_promptly_on_cancellation() {
+        let (sender, receiver) = oneshot::channel();
+        let control = Arc::new(ListingControl::new());
+        control.cancel();
+
+        let result = await_bounded_synced_listing(receiver, control, Duration::from_secs(1)).await;
+
+        assert!(matches!(result, Err(ExplorerError::Cancelled)));
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn bounded_synced_listing_times_out_and_cancels_late_worker_events() {
+        let (_sender, receiver) = oneshot::channel();
+        let control = Arc::new(ListingControl::new());
+
+        let result =
+            await_bounded_synced_listing(receiver, control.clone(), Duration::from_millis(1)).await;
+
+        assert!(matches!(result, Err(ExplorerError::TimedOut(_))));
+        assert!(control.cancelled.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn bounded_synced_listing_preserves_completed_results() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(Ok(())).expect("listing result receiver");
+
+        assert!(await_bounded_synced_listing(
+            receiver,
+            Arc::new(ListingControl::new()),
+            Duration::from_secs(1),
+        )
+        .await
+        .is_ok());
+    }
 
     #[test]
     fn request_ids_are_bounded() {
@@ -1087,35 +1249,69 @@ mod tests {
     fn synced_preview_messages_distinguish_authoritative_availability() {
         let available = Some(SyncedFolderStatus::Available);
         assert!(
-            synced_preview_message(ContentAvailability::OnlineOnly, available)
+            synced_preview_message(ContentAvailability::OnlineOnly, available, None)
                 .contains("online-only")
         );
         assert!(
-            synced_preview_message(ContentAvailability::Downloading, available)
+            synced_preview_message(ContentAvailability::Downloading, available, None)
                 .contains("downloading")
         );
         assert!(
-            synced_preview_message(ContentAvailability::Syncing, available).contains("not current")
+            synced_preview_message(ContentAvailability::Syncing, available, None)
+                .contains("not current")
         );
         assert!(
-            synced_preview_message(ContentAvailability::Error, available)
+            synced_preview_message(ContentAvailability::Error, available, None)
                 .contains("download error")
         );
         assert!(
-            synced_preview_message(ContentAvailability::Unknown, available)
+            synced_preview_message(ContentAvailability::Unknown, available, None)
                 .contains("cannot verify")
         );
         assert!(synced_preview_message(
             ContentAvailability::OnlineOnly,
-            Some(SyncedFolderStatus::Offline)
+            Some(SyncedFolderStatus::Offline),
+            Some(ContentRequestPolicy::ICloud)
         )
         .contains("provider is offline"));
+        assert!(synced_preview_message(
+            ContentAvailability::OnlineOnly,
+            Some(SyncedFolderStatus::Unknown),
+            Some(ContentRequestPolicy::ICloud)
+        )
+        .contains("online-only"));
+        assert!(synced_preview_message(
+            ContentAvailability::OnlineOnly,
+            Some(SyncedFolderStatus::Unknown),
+            Some(ContentRequestPolicy::WindowsCloudFiles)
+        )
+        .contains("cannot verify"));
         assert!(matches!(
-            content_request_provider_status_error(Some(SyncedFolderStatus::Offline)),
+            content_request_provider_status_error(
+                ContentRequestPolicy::ICloud,
+                Some(SyncedFolderStatus::Offline)
+            ),
             Some(ExplorerError::Offline(_))
         ));
+        assert!(content_request_provider_status_error(
+            ContentRequestPolicy::WindowsCloudFiles,
+            Some(SyncedFolderStatus::Available)
+        )
+        .is_none());
+        assert!(content_request_provider_status_error(
+            ContentRequestPolicy::ICloud,
+            Some(SyncedFolderStatus::Unknown)
+        )
+        .is_none());
+        assert!(matches!(
+            content_request_provider_status_error(
+                ContentRequestPolicy::WindowsCloudFiles,
+                Some(SyncedFolderStatus::Unknown)
+            ),
+            Some(ExplorerError::Unsupported(_))
+        ));
         assert!(
-            content_request_provider_status_error(Some(SyncedFolderStatus::Available)).is_none()
+            content_request_provider_status_error(ContentRequestPolicy::ICloud, None).is_none()
         );
     }
 }
