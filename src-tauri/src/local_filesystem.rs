@@ -17,6 +17,9 @@ use crate::filesystem::{
     EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole, LocationSummaryDto,
     LISTING_BATCH_SIZE,
 };
+use crate::platform_trash::PlatformTrash;
+
+const MAX_PERMANENT_DELETE_ENTRIES: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct LocalRoot {
@@ -199,11 +202,48 @@ impl PathRegistry {
         }
         Ok(())
     }
+
+    fn invalidate_subtree(
+        &self,
+        location_id: &str,
+        removed_path: &Path,
+    ) -> Result<Vec<String>, ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let removed_ids = inner
+            .paths_by_id
+            .iter()
+            .filter_map(|(id, path)| {
+                (inner.locations_by_id.get(id).map(String::as_str) == Some(location_id)
+                    && path.starts_with(removed_path))
+                .then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for id in &removed_ids {
+            if let Some(path) = inner.paths_by_id.remove(id) {
+                inner.ids_by_path.remove(&(location_id.to_owned(), path));
+            }
+            inner.locations_by_id.remove(id);
+            inner.identities_by_id.remove(id);
+        }
+        Ok(removed_ids)
+    }
 }
 
 pub struct LocalFilesystem {
     registry: PathRegistry,
     locations: RwLock<Vec<LocationSummaryDto>>,
+    trash_available: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedLocalEntry {
+    pub reference: EntryRefDto,
+    pub name: String,
+    pub invalidated_entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +256,20 @@ pub struct VolumeRoot {
 
 impl LocalFilesystem {
     pub fn new(roots: Vec<LocalRoot>) -> Result<Self, ExplorerError> {
+        Self::new_with_trash_support(
+            roots,
+            cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_trash_support(
+        roots: Vec<LocalRoot>,
+        trash_available: bool,
+    ) -> Result<Self, ExplorerError> {
         let registry = PathRegistry::default();
         let mut locations = Vec::new();
         let mut seen_paths = Vec::<PathBuf>::new();
@@ -249,6 +303,7 @@ impl LocalFilesystem {
         Ok(Self {
             registry,
             locations: RwLock::new(locations),
+            trash_available,
         })
     }
 
@@ -337,23 +392,7 @@ impl LocalFilesystem {
         ensure_not_cancelled(cancelled)?;
         validate_entry_name(new_name)?;
 
-        let location = self
-            .locations
-            .read()
-            .map_err(|_| ExplorerError::StateUnavailable)?
-            .iter()
-            .find(|location| location.id == entry.location_id)
-            .cloned()
-            .ok_or(ExplorerError::InvalidReference)?;
-        let root_path = self
-            .registry
-            .resolve(&entry.location_id, &location.root.id)?;
-        let source_path = self
-            .registry
-            .resolve_for_operation(&entry.location_id, &entry.id)?;
-        if source_path == root_path || !source_path.starts_with(&root_path) {
-            return Err(ExplorerError::InvalidReference);
-        }
+        let (source_path, _) = self.resolve_mutation_source(entry)?;
         let parent = source_path
             .parent()
             .ok_or(ExplorerError::InvalidReference)?;
@@ -387,6 +426,89 @@ impl LocalFilesystem {
         self.registry
             .rebase_subtree(&entry.location_id, &source_path, &destination_path)?;
         self.describe_path(destination_path, &entry.location_id)
+    }
+
+    pub fn trash_entry(
+        &self,
+        entry: &EntryRefDto,
+        cancelled: &AtomicBool,
+        platform_trash: &dyn PlatformTrash,
+    ) -> Result<RemovedLocalEntry, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        if !self.trash_available || !platform_trash.is_available() {
+            return Err(ExplorerError::Unsupported(
+                "The operating system Trash is not available for this item.".to_owned(),
+            ));
+        }
+        let (source_path, name) = self.resolve_mutation_source(entry)?;
+        ensure_not_cancelled(cancelled)?;
+        platform_trash.move_to_trash(&source_path)?;
+        let invalidated_entry_ids = self
+            .registry
+            .invalidate_subtree(&entry.location_id, &source_path)?;
+        Ok(RemovedLocalEntry {
+            reference: entry.clone(),
+            name,
+            invalidated_entry_ids,
+        })
+    }
+
+    pub fn permanently_delete_entry(
+        &self,
+        entry: &EntryRefDto,
+        cancelled: &AtomicBool,
+    ) -> Result<RemovedLocalEntry, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        let (source_path, name) = self.resolve_mutation_source(entry)?;
+        let metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExplorerError::SourceChanged
+            } else {
+                ExplorerError::io("inspect", &source_path, error)
+            }
+        })?;
+        ensure_not_cancelled(cancelled)?;
+        if metadata.file_type().is_dir() {
+            let removal_plan = plan_directory_removal(&source_path, cancelled)?;
+            // Once the first entry is removed, cancellation would produce a
+            // misleading terminal state and a partially deleted tree. The plan
+            // is cancellable; execution is an explicit irreversible section.
+            for planned in removal_plan {
+                match planned.kind {
+                    PlannedRemovalKind::FileOrSymlink => fs::remove_file(&planned.path),
+                    PlannedRemovalKind::Directory => fs::remove_dir(&planned.path),
+                }
+                .map_err(|error| ExplorerError::io("delete", &planned.path, error))?;
+            }
+        } else {
+            // symlink_metadata keeps symlink targets out of this branch.
+            fs::remove_file(&source_path)
+                .map_err(|error| ExplorerError::io("delete", &source_path, error))?;
+        }
+        let invalidated_entry_ids = self
+            .registry
+            .invalidate_subtree(&entry.location_id, &source_path)?;
+        Ok(RemovedLocalEntry {
+            reference: entry.clone(),
+            name,
+            invalidated_entry_ids,
+        })
+    }
+
+    pub fn describe_operation_target(
+        &self,
+        entry: &EntryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let (_, name) = self.resolve_mutation_source(entry)?;
+        let location_name = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == entry.location_id)
+            .map(|location| location.name.clone())
+            .ok_or(ExplorerError::InvalidReference)?;
+        Ok((name, location_name))
     }
 
     pub fn list_directory<F>(
@@ -544,9 +666,96 @@ impl LocalFilesystem {
             display_path: display_path(&path),
             directory,
             detail: file_type.is_symlink().then_some("Symbolic link"),
-            capabilities: EntryCapabilitiesDto::LOCAL_RENAME_ONLY,
+            capabilities: EntryCapabilitiesDto::local(self.trash_available),
         })
     }
+
+    fn resolve_mutation_source(
+        &self,
+        entry: &EntryRefDto,
+    ) -> Result<(PathBuf, String), ExplorerError> {
+        let location = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == entry.location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self
+            .registry
+            .resolve(&entry.location_id, &location.root.id)?;
+        let source_path = self
+            .registry
+            .resolve_for_operation(&entry.location_id, &entry.id)?;
+        if source_path == root_path || !source_path.starts_with(&root_path) {
+            return Err(ExplorerError::InvalidReference);
+        }
+        let name = source_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or(ExplorerError::InvalidReference)?;
+        Ok((source_path, name))
+    }
+}
+
+enum PlannedRemovalKind {
+    FileOrSymlink,
+    Directory,
+}
+
+struct PlannedRemoval {
+    path: PathBuf,
+    kind: PlannedRemovalKind,
+}
+
+enum RemovalWalkItem {
+    Visit(PathBuf),
+    FinishDirectory(PathBuf),
+}
+
+fn plan_directory_removal(
+    root: &Path,
+    cancelled: &AtomicBool,
+) -> Result<Vec<PlannedRemoval>, ExplorerError> {
+    let mut pending = vec![RemovalWalkItem::Visit(root.to_path_buf())];
+    let mut plan = Vec::new();
+    while let Some(item) = pending.pop() {
+        ensure_not_cancelled(cancelled)?;
+        if plan.len().saturating_add(pending.len()) >= MAX_PERMANENT_DELETE_ENTRIES {
+            return Err(ExplorerError::Unsupported(
+                "This folder contains too many items to delete safely in one operation.".to_owned(),
+            ));
+        }
+        match item {
+            RemovalWalkItem::FinishDirectory(path) => plan.push(PlannedRemoval {
+                path,
+                kind: PlannedRemovalKind::Directory,
+            }),
+            RemovalWalkItem::Visit(path) => {
+                let metadata = fs::symlink_metadata(&path)
+                    .map_err(|error| ExplorerError::io("inspect", &path, error))?;
+                if metadata.file_type().is_dir() {
+                    pending.push(RemovalWalkItem::FinishDirectory(path.clone()));
+                    let entries = fs::read_dir(&path)
+                        .map_err(|error| ExplorerError::io("open", &path, error))?;
+                    for entry in entries {
+                        let entry = entry.map_err(|error| ExplorerError::Io {
+                            message: "Explora could not enumerate an item for deletion.".to_owned(),
+                            kind: error.kind(),
+                        })?;
+                        pending.push(RemovalWalkItem::Visit(entry.path()));
+                    }
+                } else {
+                    plan.push(PlannedRemoval {
+                        path,
+                        kind: PlannedRemovalKind::FileOrSymlink,
+                    });
+                }
+            }
+        }
+    }
+    Ok(plan)
 }
 
 fn validate_entry_name(name: &str) -> Result<(), ExplorerError> {
@@ -730,13 +939,33 @@ fn content_kind(path: &Path, is_directory: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs::File, io::Write};
+    use std::{
+        fs::File,
+        io::Write,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
     use crate::filesystem::{ExplorerErrorCode, ExplorerErrorDto};
 
     use super::*;
+
+    struct MoveAsideTrash {
+        destination: PathBuf,
+    }
+
+    impl PlatformTrash for MoveAsideTrash {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn move_to_trash(&self, path: &Path) -> Result<(), ExplorerError> {
+            let name = path.file_name().ok_or(ExplorerError::InvalidReference)?;
+            fs::rename(path, self.destination.join(name))
+                .map_err(|error| ExplorerError::io("trash", path, error))
+        }
+    }
 
     fn fixture() -> (TempDir, LocalFilesystem, DirectoryRefDto) {
         let temp = TempDir::new().expect("temporary directory");
@@ -801,6 +1030,8 @@ mod tests {
         assert_eq!(file.content_kind, "document");
         assert!(file.capabilities.rename);
         assert!(!file.capabilities.move_entry);
+        assert!(file.capabilities.trash);
+        assert!(file.capabilities.delete_permanently);
         assert!(!file.reference.id.contains("notes.md"));
         assert_eq!(started.0.id, root.id);
         assert!(started.1.is_none());
@@ -929,6 +1160,150 @@ mod tests {
         ));
         assert!(temp.path().join("notes.md").exists());
         assert!(!temp.path().join("new.md").exists());
+    }
+
+    #[test]
+    fn trash_moves_the_entry_and_invalidates_registered_descendants() {
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("folder/child.txt"), b"child").expect("nested fixture");
+        let folder = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "folder")
+            .expect("folder entry");
+        let child = listed_entries(
+            &filesystem,
+            folder.directory.as_ref().expect("folder directory"),
+        )
+        .into_iter()
+        .find(|entry| entry.name == "child.txt")
+        .expect("child entry");
+        let destination = temp.path().join("native-trash");
+        fs::create_dir(&destination).expect("trash fixture");
+
+        let removed = filesystem
+            .trash_entry(
+                &folder.reference,
+                &AtomicBool::new(false),
+                &MoveAsideTrash {
+                    destination: destination.clone(),
+                },
+            )
+            .expect("trash folder");
+
+        assert_eq!(removed.reference, folder.reference);
+        assert_eq!(removed.name, "folder");
+        assert!(destination.join("folder/child.txt").is_file());
+        assert!(matches!(
+            filesystem.resolve_preview_path(&child.reference.id, &child.reference.location_id),
+            Err(ExplorerError::InvalidReference)
+        ));
+    }
+
+    #[test]
+    fn unavailable_trash_is_explicit_and_preserves_the_source() {
+        let temp = TempDir::new().expect("temporary directory");
+        fs::write(temp.path().join("notes.md"), b"hello").expect("fixture file");
+        let filesystem = LocalFilesystem::new_with_trash_support(
+            vec![LocalRoot {
+                id: "home",
+                name: "Home",
+                role: LocationRole::Home,
+                path: temp.path().to_path_buf(),
+            }],
+            false,
+        )
+        .expect("local filesystem");
+        let root = filesystem.locations().expect("locations")[0].root.clone();
+        let entry = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("notes entry");
+
+        assert!(!entry.capabilities.trash);
+        assert!(entry.capabilities.delete_permanently);
+        assert!(matches!(
+            filesystem.trash_entry(
+                &entry.reference,
+                &AtomicBool::new(false),
+                &MoveAsideTrash {
+                    destination: temp.path().join("unused")
+                }
+            ),
+            Err(ExplorerError::Unsupported(_))
+        ));
+        assert!(temp.path().join("notes.md").is_file());
+    }
+
+    #[test]
+    fn permanent_delete_removes_a_directory_tree_after_revalidation() {
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("folder/child.txt"), b"child").expect("nested fixture");
+        let folder = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "folder")
+            .expect("folder entry");
+
+        filesystem
+            .permanently_delete_entry(&folder.reference, &AtomicBool::new(false))
+            .expect("delete folder");
+
+        assert!(!temp.path().join("folder").exists());
+        assert!(matches!(
+            filesystem.resolve_preview_path(&folder.reference.id, &folder.reference.location_id),
+            Err(ExplorerError::InvalidReference)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permanent_delete_removes_a_symlink_without_following_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("target.txt"), b"target").expect("target fixture");
+        symlink(temp.path().join("target.txt"), temp.path().join("link.txt"))
+            .expect("symlink fixture");
+        let link = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "link.txt")
+            .expect("link entry");
+
+        filesystem
+            .permanently_delete_entry(&link.reference, &AtomicBool::new(false))
+            .expect("delete link");
+
+        assert!(!temp.path().join("link.txt").exists());
+        assert_eq!(
+            fs::read(temp.path().join("target.txt")).expect("target preserved"),
+            b"target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_permanent_delete_does_not_follow_child_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, filesystem, root) = fixture();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).expect("external fixture");
+        fs::write(external.join("preserved.txt"), b"preserved").expect("external file");
+        symlink(&external, temp.path().join("folder/external-link"))
+            .expect("child symlink fixture");
+        let folder = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "folder")
+            .expect("folder entry");
+
+        filesystem
+            .permanently_delete_entry(&folder.reference, &AtomicBool::new(false))
+            .expect("delete folder");
+
+        assert!(!temp.path().join("folder").exists());
+        assert_eq!(
+            fs::read(external.join("preserved.txt")).expect("external target preserved"),
+            b"preserved"
+        );
     }
 
     #[test]

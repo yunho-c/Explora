@@ -141,6 +141,25 @@ export interface FileEntrySummary {
   capabilities: EntryCapabilities;
 }
 
+export interface FileOperationConfirmation {
+  id: string;
+  kind: "permanentDelete";
+  title: string;
+  message: string;
+  targetName: string;
+  locationName: string;
+  confirmLabel: string;
+}
+
+export type FileOperationPromptResponse = "confirm" | "cancel";
+
+export interface FileRemovalResult {
+  kind: "trashed" | "deletedPermanently";
+  entry: EntryRef;
+  name: string;
+  invalidatedEntryIds: readonly string[];
+}
+
 export interface ExplorerTab {
   id: string;
   title: string;

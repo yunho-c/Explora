@@ -3,6 +3,7 @@ import type {
   DirectoryRef,
   ExplorerTab,
   FileEntrySummary,
+  FileRemovalResult,
   ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
@@ -15,6 +16,7 @@ import type {
   ViewMode,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
+import { SvelteSet } from "svelte/reactivity";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
@@ -25,6 +27,7 @@ import {
   type LayoutPreferencesPatch,
 } from "$lib/contracts/preferences";
 import { compareFileSizes } from "$lib/file-metadata";
+import { FileOperationStore } from "../features/file-operations/file-operation-store.svelte";
 
 const nameCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -67,6 +70,7 @@ export interface PendingSshPrompt {
 }
 
 export class ExplorerState {
+  readonly fileOperations: FileOperationStore;
   locations = $state<LocationSummary[]>([]);
   sshTargets = $state<SshTargetSummary[]>([]);
   tabs = $state<ExplorerTab[]>([]);
@@ -119,7 +123,9 @@ export class ExplorerState {
   constructor(
     private readonly dataSource: ExplorerDataSource,
     private readonly preferencesDataSource: PreferencesDataSource = new MemoryPreferencesDataSource(),
-  ) {}
+  ) {
+    this.fileOperations = new FileOperationStore(dataSource);
+  }
 
   get activeTab(): ExplorerTab | undefined {
     return this.tabs.find(({ id }) => id === this.activeTabId);
@@ -920,6 +926,106 @@ export class ExplorerState {
       if (this.renameController === controller) {
         this.renameController = null;
         this.renameSaving = false;
+      }
+    }
+  }
+
+  async moveSelectedToTrash(entryId = this.selectedEntryId): Promise<void> {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    const sourceParent = this.activeDirectory;
+    if (!entry?.capabilities.trash || !sourceParent) return;
+    this.cancelRename();
+    await this.fileOperations.moveToTrash(entry, (result) =>
+      this.reconcileRemovedEntry(result, sourceParent),
+    );
+  }
+
+  async deleteSelectedPermanently(
+    entryId = this.selectedEntryId,
+  ): Promise<void> {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    const sourceParent = this.activeDirectory;
+    if (!entry?.capabilities.deletePermanently || !sourceParent) return;
+    this.cancelRename();
+    await this.fileOperations.deletePermanently(entry, (result) =>
+      this.reconcileRemovedEntry(result, sourceParent),
+    );
+  }
+
+  private async reconcileRemovedEntry(
+    result: FileRemovalResult,
+    sourceParent: DirectoryRef,
+  ): Promise<void> {
+    const invalidated = new SvelteSet(result.invalidatedEntryIds);
+    const orderedEntries = this.visibleEntries;
+    const removedIndex = orderedEntries.findIndex(({ reference }) =>
+      invalidated.has(reference.id),
+    );
+    const remainingOrdered = orderedEntries.filter(
+      ({ reference }) => !invalidated.has(reference.id),
+    );
+    const activeDirectoryWasRemoved = Boolean(
+      this.activeTab && invalidated.has(this.activeTab.directory.id),
+    );
+
+    this.entries = this.entries.filter(
+      ({ reference }) => !invalidated.has(reference.id),
+    );
+    if (this.selectedEntryId && invalidated.has(this.selectedEntryId)) {
+      this.selectedEntryId =
+        remainingOrdered[
+          Math.min(Math.max(removedIndex, 0), remainingOrdered.length - 1)
+        ]?.reference.id ?? null;
+    }
+    if (this.preview?.entryId && invalidated.has(this.preview.entryId)) {
+      this.closePreview();
+    }
+
+    this.tabs = this.tabs.map((tab) => {
+      const history = tab.history.filter(
+        (directory) => !invalidated.has(directory.id),
+      );
+      if (invalidated.has(tab.directory.id)) {
+        const fallbackHistory = [
+          ...history.filter((directory) => directory.id !== sourceParent.id),
+          sourceParent,
+        ];
+        return {
+          ...tab,
+          directory: sourceParent,
+          history: fallbackHistory,
+          historyIndex: fallbackHistory.length - 1,
+          title: sourceParent.name,
+        };
+      }
+      const historyIndex = history.findIndex(
+        (directory) => directory.id === tab.directory.id,
+      );
+      return {
+        ...tab,
+        history,
+        historyIndex: historyIndex >= 0 ? historyIndex : history.length - 1,
+      };
+    });
+
+    this.breadcrumbs = this.breadcrumbs.filter(
+      ({ directory }) => !invalidated.has(directory.id),
+    );
+    if (this.parentDirectory && invalidated.has(this.parentDirectory.id)) {
+      this.parentDirectory = null;
+    }
+    if (activeDirectoryWasRemoved) {
+      const tab = this.activeTab;
+      if (tab) {
+        await this.loadDirectory(sourceParent, (directory) => {
+          tab.directory = directory;
+          tab.history[tab.historyIndex] = directory;
+          tab.title = directory.name;
+        });
       }
     }
   }

@@ -113,6 +113,63 @@ describe("ExplorerShell", () => {
     expect(screen.getByText("Projects")).toBeInTheDocument();
   });
 
+  it("moves the selected item to Trash without a confirmation dialog", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the Rust-shaped permanent-delete decision and honors cancel", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+      altKey: mac,
+      shiftKey: !mac,
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Delete “explora-notes.md” permanently?",
+      }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("In Home")).toBeInTheDocument();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    await fireEvent.click(cancel);
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
+  });
+
   it("uses distinct semantic icons for default favorite folders", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

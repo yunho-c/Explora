@@ -1,7 +1,12 @@
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { DirectoryRef, FileEntrySummary } from "$lib/contracts/explorer";
+import type {
+  DirectoryRef,
+  FileEntrySummary,
+  FileOperationConfirmation,
+  FileOperationPromptResponse,
+} from "$lib/contracts/explorer";
 
 import { TauriExplorerDataSource } from "./tauri-explorer-data-source";
 
@@ -36,8 +41,8 @@ const entryPayload = {
   capabilities: {
     rename: true,
     moveEntry: false,
-    trash: false,
-    deletePermanently: false,
+    trash: true,
+    deletePermanently: true,
   },
 };
 
@@ -53,8 +58,8 @@ const previewEntry: FileEntrySummary = {
   capabilities: {
     rename: true,
     move: false,
-    trash: false,
-    deletePermanently: false,
+    trash: true,
+    deletePermanently: true,
   },
 };
 
@@ -98,6 +103,7 @@ const sendChannelMessages = (
   channel: unknown,
   messages: readonly unknown[],
   end = true,
+  startIndex = 0,
 ) => {
   const toJson =
     typeof channel === "object" && channel !== null
@@ -119,10 +125,13 @@ const sendChannelMessages = (
   ).__TAURI_INTERNALS__;
   const callbackId = Number(match[1]);
   messages.forEach((message, index) => {
-    internals.runCallback(callbackId, { index, message });
+    internals.runCallback(callbackId, { index: startIndex + index, message });
   });
   if (end) {
-    internals.runCallback(callbackId, { index: messages.length, end: true });
+    internals.runCallback(callbackId, {
+      index: startIndex + messages.length,
+      end: true,
+    });
   }
 };
 
@@ -202,16 +211,36 @@ describe("TauriExplorerDataSource", () => {
         action: { kind: "rename", newName: "renamed.md" },
       });
       sendChannelMessages(payload.onEvent, [
-        { event: "queued", operationId: "operation-1", sequence: 0 },
-        { event: "running", operationId: "operation-1", sequence: 1 },
+        {
+          event: "queued",
+          operationId: "operation-1",
+          sequence: 0,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "running",
+          operationId: "operation-1",
+          sequence: 1,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+        },
         {
           event: "completed",
           operationId: "operation-1",
           sequence: 2,
-          entry: {
-            ...entryPayload,
-            name: "renamed.md",
-            displayPath: "/Users/test/renamed.md",
+          action: "rename",
+          completedItems: 1,
+          totalItems: 1,
+          outcome: {
+            kind: "renamed",
+            entry: {
+              ...entryPayload,
+              name: "renamed.md",
+              displayPath: "/Users/test/renamed.md",
+            },
           },
         },
       ]);
@@ -239,8 +268,22 @@ describe("TauriExplorerDataSource", () => {
         throw new Error("Expected operation command arguments.");
       }
       sendChannelMessages(Reflect.get(payload, "onEvent"), [
-        { event: "queued", operationId: "operation-1", sequence: 1 },
-        { event: "running", operationId: "operation-1", sequence: 1 },
+        {
+          event: "queued",
+          operationId: "operation-1",
+          sequence: 1,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "running",
+          operationId: "operation-1",
+          sequence: 1,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+        },
       ]);
       return "operation-1";
     });
@@ -252,6 +295,251 @@ describe("TauriExplorerDataSource", () => {
         new AbortController().signal,
       ),
     ).rejects.toThrow("operation sequence is stale");
+  });
+
+  it("moves an entry to native Trash without requesting confirmation", async () => {
+    const onConfirmation = vi.fn();
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      expect(Reflect.get(payload, "request")).toEqual({
+        sources: [entryPayload.reference],
+        action: { kind: "trash" },
+      });
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "queued",
+          operationId: "operation-trash",
+          sequence: 0,
+          action: "trash",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "running",
+          operationId: "operation-trash",
+          sequence: 1,
+          action: "trash",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "completed",
+          operationId: "operation-trash",
+          sequence: 2,
+          action: "trash",
+          completedItems: 1,
+          totalItems: 1,
+          outcome: {
+            kind: "trashed",
+            entry: entryPayload.reference,
+            name: "notes.md",
+            invalidatedEntryIds: ["entry-token"],
+          },
+        },
+      ]);
+      return "operation-trash";
+    });
+
+    const result = await new TauriExplorerDataSource().trashEntry(
+      previewEntry,
+      {
+        signal: new AbortController().signal,
+        onConfirmation,
+      },
+    );
+
+    expect(result).toEqual({
+      kind: "trashed",
+      entry: entryPayload.reference,
+      name: "notes.md",
+      invalidatedEntryIds: ["entry-token"],
+    });
+    expect(onConfirmation).not.toHaveBeenCalled();
+  });
+
+  it("answers a Rust-authoritative permanent-delete confirmation once", async () => {
+    let operationChannel: unknown;
+    mockIPC((command, payload) => {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      if (command === "start_file_operation") {
+        expect(Reflect.get(payload, "request")).toEqual({
+          sources: [entryPayload.reference],
+          action: { kind: "deletePermanently" },
+        });
+        operationChannel = Reflect.get(payload, "onEvent");
+        sendChannelMessages(
+          operationChannel,
+          [
+            {
+              event: "queued",
+              operationId: "operation-delete",
+              sequence: 0,
+              action: "deletePermanently",
+              completedItems: 0,
+              totalItems: 1,
+            },
+            {
+              event: "running",
+              operationId: "operation-delete",
+              sequence: 1,
+              action: "deletePermanently",
+              completedItems: 0,
+              totalItems: 1,
+            },
+            {
+              event: "awaitingConfirmation",
+              operationId: "operation-delete",
+              sequence: 2,
+              action: "deletePermanently",
+              completedItems: 0,
+              totalItems: 1,
+              prompt: {
+                id: "prompt-delete",
+                kind: "permanentDelete",
+                title: "Delete “notes.md” permanently?",
+                message: "This cannot be recovered from Trash.",
+                targetName: "notes.md",
+                locationName: "Home",
+                confirmLabel: "Delete Permanently",
+              },
+            },
+          ],
+          false,
+        );
+        return "operation-delete";
+      }
+      if (command === "respond_file_operation") {
+        expect(payload).toEqual({
+          operationId: "operation-delete",
+          promptId: "prompt-delete",
+          response: "confirm",
+        });
+        sendChannelMessages(
+          operationChannel,
+          [
+            {
+              event: "completed",
+              operationId: "operation-delete",
+              sequence: 3,
+              action: "deletePermanently",
+              completedItems: 1,
+              totalItems: 1,
+              outcome: {
+                kind: "deletedPermanently",
+                entry: entryPayload.reference,
+                name: "notes.md",
+                invalidatedEntryIds: ["entry-token"],
+              },
+            },
+          ],
+          true,
+          3,
+        );
+        return null;
+      }
+      return null;
+    });
+    let confirmation:
+      | [
+          FileOperationConfirmation,
+          (response: FileOperationPromptResponse) => Promise<void>,
+        ]
+      | undefined;
+    const deletion = new TauriExplorerDataSource().deleteEntryPermanently(
+      previewEntry,
+      {
+        signal: new AbortController().signal,
+        onConfirmation: (...args) => {
+          confirmation = args;
+        },
+      },
+    );
+    await vi.waitFor(() => expect(confirmation).toBeDefined());
+    expect(confirmation?.[0]).toMatchObject({
+      id: "prompt-delete",
+      targetName: "notes.md",
+      locationName: "Home",
+    });
+    await confirmation?.[1]("confirm");
+
+    await expect(deletion).resolves.toMatchObject({
+      kind: "deletedPermanently",
+      name: "notes.md",
+    });
+  });
+
+  it("keeps a completed irreversible result authoritative after late cancellation", async () => {
+    const controller = new AbortController();
+    const cancel = vi.fn();
+    mockIPC((command, payload) => {
+      if (command === "cancel_file_operation") {
+        cancel(payload);
+        return null;
+      }
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      const channel = Reflect.get(payload, "onEvent");
+      sendChannelMessages(
+        channel,
+        [
+          {
+            event: "queued",
+            operationId: "operation-trash",
+            sequence: 0,
+            action: "trash",
+            completedItems: 0,
+            totalItems: 1,
+          },
+          {
+            event: "running",
+            operationId: "operation-trash",
+            sequence: 1,
+            action: "trash",
+            completedItems: 0,
+            totalItems: 1,
+          },
+        ],
+        false,
+      );
+      controller.abort();
+      sendChannelMessages(
+        channel,
+        [
+          {
+            event: "completed",
+            operationId: "operation-trash",
+            sequence: 2,
+            action: "trash",
+            completedItems: 1,
+            totalItems: 1,
+            outcome: {
+              kind: "trashed",
+              entry: entryPayload.reference,
+              name: "notes.md",
+              invalidatedEntryIds: ["entry-token"],
+            },
+          },
+        ],
+        true,
+        2,
+      );
+      return "operation-trash";
+    });
+
+    await expect(
+      new TauriExplorerDataSource().trashEntry(previewEntry, {
+        signal: controller.signal,
+        onConfirmation: vi.fn(),
+      }),
+    ).resolves.toMatchObject({ kind: "trashed" });
+    expect(cancel).toHaveBeenCalledWith({ operationId: "operation-trash" });
   });
 
   it("rejects malformed IPC data before it reaches explorer state", async () => {

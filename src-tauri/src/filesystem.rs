@@ -130,19 +130,21 @@ pub struct EntryCapabilitiesDto {
 }
 
 impl EntryCapabilitiesDto {
-    pub const LOCAL_RENAME_ONLY: Self = Self {
-        rename: true,
-        move_entry: false,
-        trash: false,
-        delete_permanently: false,
-    };
-
     pub const READ_ONLY: Self = Self {
         rename: false,
         move_entry: false,
         trash: false,
         delete_permanently: false,
     };
+
+    pub const fn local(trash_available: bool) -> Self {
+        Self {
+            rename: true,
+            move_entry: false,
+            trash: trash_available,
+            delete_permanently: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

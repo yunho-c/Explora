@@ -1,6 +1,6 @@
 # Filesystem actions
 
-- Status: Proposed
+- Status: Accepted; phased implementation in progress
 - Scope: Rename, move, trash, and permanent deletion for local and SSH/SFTP
   locations
 
@@ -70,19 +70,29 @@ following are deferred:
 
 ## Current implementation
 
-Explora currently provides read-only local and SSH/SFTP navigation. This supplies
-several useful foundations:
+Phases 1 and 2 are complete, and Phase 3 is implemented pending packaged
+cross-platform validation:
 
 - Local and remote paths are represented by opaque, location-scoped tokens.
 - Directory listings already use typed incremental events and cancellation.
-- Rust owns local filesystem access, SSH sessions, host trust, previews, and
-  structured errors.
+- A Rust-owned operation coordinator emits queued, running, confirmation, and
+  typed terminal events with monotonic sequences and single-item progress.
+- Local entries advertise rename, native trash, and permanent-delete
+  capabilities; SSH/SFTP remains read-only.
+- Rename preserves opaque identity and rebases registered descendants.
+- Successful trash and permanent deletion invalidate registered descendants;
+  frontend selection, previews, tabs, and histories reconcile those references.
+- Native trash is implemented through a narrow, injectable platform adapter.
+  Permanent deletion requires a single-use, Rust-authoritative confirmation.
 - The frontend validates IPC responses through a replaceable data-source
   boundary.
-- The list and grid context menus already expose disabled Rename and Move to
-  Trash items.
+- List and grid views expose capability-gated context and platform-keyboard
+  actions with an accessible blocking dialog only for permanent deletion.
 - Disposable SSH/SFTP tests cover real authentication, trust, listing,
   cancellation, disconnect, and reconnect behavior.
+
+Packaged native trash must still be exercised on macOS, Linux, and Windows before
+Phase 3 is considered complete across all supported targets.
 
 The mutation work cannot be safely implemented as a few additional blocking
 commands. The current design lacks:

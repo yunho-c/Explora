@@ -7,12 +7,14 @@
   import { Input } from "$lib/components/ui/input";
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
+  import { deletionShortcut, isRenameShortcut } from "$lib/platform-shortcuts";
 
   import ExplorerSidebar from "./ExplorerSidebar.svelte";
   import ExplorerTabs from "./ExplorerTabs.svelte";
   import ExplorerToolbar from "./ExplorerToolbar.svelte";
   import FileGrid from "./FileGrid.svelte";
   import FileList from "./FileList.svelte";
+  import FileOperationConfirmationDialog from "./FileOperationConfirmationDialog.svelte";
   import QuickPreview from "./QuickPreview.svelte";
   import SshPromptDialog from "./SshPromptDialog.svelte";
   import SshTargetDialog from "./SshTargetDialog.svelte";
@@ -26,7 +28,11 @@
   } = $props();
 
   const handleKeydown = (event: KeyboardEvent) => {
-    if (event.key === "F2" && state.selectedEntry?.capabilities.rename) {
+    if (
+      isRenameShortcut(event) &&
+      state.selectedEntry?.capabilities.rename &&
+      state.fileOperations.activeEntryId === null
+    ) {
       event.preventDefault();
       state.startRename();
       return;
@@ -74,6 +80,21 @@
     if (isInteractiveControl && !isPreviewText && event.key !== "Escape")
       return;
 
+    const deletion = deletionShortcut(event);
+    if (deletion === "trash" && state.selectedEntry?.capabilities.trash) {
+      event.preventDefault();
+      void state.moveSelectedToTrash();
+      return;
+    }
+    if (
+      deletion === "deletePermanently" &&
+      state.selectedEntry?.capabilities.deletePermanently
+    ) {
+      event.preventDefault();
+      void state.deleteSelectedPermanently();
+      return;
+    }
+
     if (event.key === " " && state.selectedEntryId) {
       event.preventDefault();
       void state.openPreview();
@@ -107,7 +128,7 @@
     <ExplorerToolbar {state} />
 
     <div class="relative min-h-0 flex-1 overflow-auto">
-      {#if state.loading}
+      {#if state.loading || state.fileOperations.activeEntryId}
         <Progress class="absolute inset-x-0 top-0 z-10 h-0.5" />
       {/if}
 
@@ -163,6 +184,21 @@
         </div>
       {/if}
 
+      {#if state.fileOperations.errorMessage}
+        <div
+          class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+          role="alert"
+        >
+          <span>{state.fileOperations.errorMessage}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            class="text-destructive hover:text-destructive"
+            onclick={() => state.fileOperations.clearError()}>Dismiss</Button
+          >
+        </div>
+      {/if}
+
       {#if !state.errorMessage && !state.loading && state.visibleEntries.length === 0}
         <div class="grid min-h-72 place-items-center p-8 text-center">
           <div>
@@ -199,6 +235,7 @@
   </main>
 
   <QuickPreview {state} />
+  <FileOperationConfirmationDialog {state} />
   <SshTargetDialog {state} />
   <SshPromptDialog {state} />
 </div>

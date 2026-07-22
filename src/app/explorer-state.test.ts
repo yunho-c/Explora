@@ -215,6 +215,79 @@ describe("ExplorerState", () => {
     expect(state.renamingEntryId).toBeNull();
   });
 
+  it("moves a local entry to Trash and advances selection without prompting", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+    await state.openPreview();
+
+    await state.moveSelectedToTrash();
+
+    expect(
+      state.entries.some(
+        ({ reference }) => reference.id === entry!.reference.id,
+      ),
+    ).toBe(false);
+    expect(state.selectedEntryId).not.toBe(entry!.reference.id);
+    expect(state.previewOpen).toBe(false);
+    expect(state.fileOperations.pendingConfirmation).toBeNull();
+    expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("cancels permanent deletion without changing the source", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    const deletion = state.deleteSelectedPermanently();
+    await vi.waitFor(() =>
+      expect(
+        state.fileOperations.pendingConfirmation?.confirmation,
+      ).toMatchObject({
+        targetName: "explora-notes.md",
+        locationName: "Home",
+      }),
+    );
+    await state.fileOperations.answerConfirmation("cancel");
+    await deletion;
+
+    expect(
+      state.entries.some(
+        ({ reference }) => reference.id === entry!.reference.id,
+      ),
+    ).toBe(true);
+    expect(state.fileOperations.pendingConfirmation).toBeNull();
+    expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("repairs open tabs and histories after confirmed permanent deletion", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(projects?.directory).toBeDefined();
+    const homeTabId = state.activeTabId;
+    await state.openTab();
+    const projectsTabId = state.activeTabId;
+    await state.openDirectory(projects!.directory!);
+    await state.activateTab(homeTabId);
+    state.selectEntry(projects!.reference.id);
+
+    const deletion = state.deleteSelectedPermanently();
+    await vi.waitFor(() =>
+      expect(state.fileOperations.pendingConfirmation).not.toBeNull(),
+    );
+    await state.fileOperations.answerConfirmation("confirm");
+    await deletion;
+
+    expect(state.entries.some(({ name }) => name === "Projects")).toBe(false);
+    const repairedTab = state.tabs.find(({ id }) => id === projectsTabId);
+    expect(repairedTab?.directory.name).toBe("Home");
+    expect(
+      repairedTab?.history.some(({ id }) => id === projects!.reference.id),
+    ).toBe(false);
+  });
+
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
 

@@ -2,6 +2,7 @@ mod commands;
 mod file_operations;
 mod filesystem;
 mod local_filesystem;
+mod platform_trash;
 mod preferences;
 mod preview;
 mod ssh;
@@ -171,6 +172,7 @@ pub fn run() {
             commands::list_directory,
             commands::cancel_listing,
             commands::start_file_operation,
+            commands::respond_file_operation,
             commands::cancel_file_operation,
             commands::prepare_preview,
             commands::cancel_preview,

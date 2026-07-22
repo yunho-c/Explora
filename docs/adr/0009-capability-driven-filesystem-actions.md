@@ -80,6 +80,39 @@ The coordinator serializes mutations in this slice. A later move/transfer phase
 may replace the global execution guard with subtree-aware guards without changing
 the operation or IPC contract.
 
+## Second vertical slice
+
+The next implementation enables single-entry local trash and confirmed permanent
+deletion:
+
+- Local entries advertise native-trash capability only on supported desktop
+  targets and advertise permanent deletion separately. The UI never relabels one
+  action as the other.
+- `trash` 5.2.6 is locked as the platform adapter dependency. It is MIT-licensed,
+  actively maintained, uses native macOS and Windows facilities, implements the
+  FreeDesktop Trash specification on Linux, and deletes a symlink entry without
+  following its target.
+- The dependency remains behind an injectable `PlatformTrash` trait. It receives
+  only a Rust-resolved path and no generic path or trash command is exposed to the
+  webview. Its errors are mapped to stable, path-redacted Explora errors.
+- The crate documents serialized mount-table access on Linux. Explora's concurrent
+  Linux volume discovery reads `/proc/mounts` through `sysinfo` rather than calling
+  the conflicting non-thread-safe libc iterator.
+- Permanent deletion enters `awaitingConfirmation` with a random, single-use
+  prompt ID. Rust supplies the target and location presentation; a mismatched,
+  repeated, cancelled, or timed-out response cannot authorize deletion.
+- Directory deletion builds a bounded post-order plan with `symlink_metadata` and
+  never follows links. Planning is cancellable. Once removal begins, the
+  operation is deliberately irreversible and reports its actual terminal result
+  instead of falsely reporting late cancellation.
+- Successful removal returns the invalidated opaque IDs so selection, previews,
+  tabs, breadcrumbs, and histories can be reconciled without treating display
+  paths as authoritative.
+
+The adapter is covered through an injected fake in contract tests so automated
+tests do not pollute a developer's real Trash. Packaged native validation is
+required separately on macOS, Linux, and Windows.
+
 ## Security review
 
 - Mutation commands accept no local path, remote path, shell text, or generic
@@ -94,9 +127,9 @@ the operation or IPC contract.
 - Destination existence produces a conflict and never an implicit overwrite.
 - The case-only intermediate path is random, owned by the operation, and restored
   to the original path if finalization fails.
-- Later trash, permanent-delete, transfer, and SFTP phases require focused review
-  of their platform dependencies, confirmations, partial-resource lifecycle, and
-  uncertain-outcome behavior before their capabilities are enabled.
+- Transfer and SFTP phases still require focused review of their platform
+  dependencies, partial-resource lifecycle, and uncertain-outcome behavior before
+  their capabilities are enabled.
 
 ## Consequences
 
@@ -106,7 +139,7 @@ the operation or IPC contract.
   to bypass Rust authorization or execution-time validation.
 - Registered tabs and histories can remain valid through same-backend directory
   relocation.
-- Initial remote and non-rename actions remain visibly unavailable rather than
-  silently degrading.
+- Remote and move actions remain visibly unavailable rather than silently
+  degrading.
 - Each subsequent phase must add backend contract coverage and native validation
   before enabling its capability.

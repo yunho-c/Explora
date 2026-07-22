@@ -6,6 +6,8 @@ import type {
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
+  FileOperationConfirmation,
+  FileRemovalResult,
   ImagePreviewMode,
   LocationKind,
   LocationRole,
@@ -29,6 +31,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RemoveEntryOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
@@ -381,6 +384,112 @@ const parseEntry = (value: unknown): FileEntrySummary => {
   };
 };
 
+type FileOperationAction =
+  | { kind: "rename"; newName: string }
+  | { kind: "trash" }
+  | { kind: "deletePermanently" };
+
+type FileOperationOutcome =
+  { kind: "renamed"; entry: FileEntrySummary } | FileRemovalResult;
+
+const parseEntryRef = (value: unknown) => {
+  if (!isRecord(value)) {
+    throw new Error(
+      "Invalid filesystem response: entry reference is malformed.",
+    );
+  }
+  return {
+    id: requireString(value, "id"),
+    locationId: requireString(value, "locationId"),
+  };
+};
+
+const parseOperationProgress = (value: Record<string, unknown>) => {
+  const completedItems = value.completedItems;
+  const totalItems = value.totalItems;
+  if (
+    typeof completedItems !== "number" ||
+    !Number.isSafeInteger(completedItems) ||
+    completedItems < 0 ||
+    typeof totalItems !== "number" ||
+    !Number.isSafeInteger(totalItems) ||
+    totalItems !== 1 ||
+    completedItems > totalItems
+  ) {
+    throw new Error(
+      "Invalid filesystem response: operation progress is malformed.",
+    );
+  }
+};
+
+const parseOperationConfirmation = (
+  value: unknown,
+): FileOperationConfirmation => {
+  if (!isRecord(value) || value.kind !== "permanentDelete") {
+    throw new Error(
+      "Invalid filesystem response: operation confirmation is malformed.",
+    );
+  }
+  return {
+    id: requireString(value, "id"),
+    kind: "permanentDelete",
+    title: requireString(value, "title"),
+    message: requireString(value, "message"),
+    targetName: requireString(value, "targetName"),
+    locationName: requireString(value, "locationName"),
+    confirmLabel: requireString(value, "confirmLabel"),
+  };
+};
+
+const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
+  if (!isRecord(value)) {
+    throw new Error(
+      "Invalid filesystem response: operation outcome is malformed.",
+    );
+  }
+  if (value.kind === "renamed") {
+    return { kind: "renamed", entry: parseEntry(value.entry) };
+  }
+  if (value.kind !== "trashed" && value.kind !== "deletedPermanently") {
+    throw new Error(
+      "Invalid filesystem response: operation outcome is unknown.",
+    );
+  }
+  if (!Array.isArray(value.invalidatedEntryIds)) {
+    throw new Error(
+      "Invalid filesystem response: invalidated entry references are malformed.",
+    );
+  }
+  const invalidatedEntryIds = value.invalidatedEntryIds.map((id: unknown) => {
+    if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+      throw new Error(
+        "Invalid filesystem response: invalidated entry references are malformed.",
+      );
+    }
+    return id;
+  });
+  if (
+    invalidatedEntryIds.length === 0 ||
+    invalidatedEntryIds.length > 100_000
+  ) {
+    throw new Error(
+      "Invalid filesystem response: invalidated entry references are malformed.",
+    );
+  }
+  const entry = parseEntryRef(value.entry);
+  if (!invalidatedEntryIds.includes(entry.id)) {
+    throw new Error(
+      "Invalid filesystem response: removed entry was not invalidated.",
+    );
+  }
+  return {
+    kind: value.kind,
+    entry,
+    name: requireString(value, "name"),
+    invalidatedEntryIds: [...new Set(invalidatedEntryIds)],
+  };
+};
+
 interface PreparedPreviewPayload {
   entryId: string;
   size: string | null;
@@ -639,15 +748,14 @@ const abortError = () => {
 };
 
 const commandError = (error: unknown): Error => {
+  if (error instanceof Error) return error;
   if (isRecord(error) && typeof error.message === "string") {
     const result = new Error(error.message);
     result.name =
       error.code === "cancelled" ? "AbortError" : "ExplorerFilesystemError";
     return result;
   }
-  return error instanceof Error
-    ? error
-    : new Error("Explora could not complete the filesystem request.");
+  return new Error("Explora could not complete the filesystem request.");
 };
 
 const requestId = () =>
@@ -969,21 +1077,84 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     newName: string,
     signal: AbortSignal,
   ): Promise<FileEntrySummary> {
+    const outcome = await this.runFileOperation(
+      entry,
+      { kind: "rename", newName },
+      {
+        signal,
+        onConfirmation: () => {
+          throw new Error(
+            "Invalid filesystem response: rename requested confirmation.",
+          );
+        },
+      },
+    );
+    if (outcome.kind !== "renamed") {
+      throw new Error(
+        "Invalid filesystem response: rename returned the wrong outcome.",
+      );
+    }
+    return outcome.entry;
+  }
+
+  async trashEntry(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    const outcome = await this.runFileOperation(
+      entry,
+      { kind: "trash" },
+      options,
+    );
+    if (outcome.kind !== "trashed") {
+      throw new Error(
+        "Invalid filesystem response: Trash returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async deleteEntryPermanently(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    const outcome = await this.runFileOperation(
+      entry,
+      { kind: "deletePermanently" },
+      options,
+    );
+    if (outcome.kind !== "deletedPermanently") {
+      throw new Error(
+        "Invalid filesystem response: permanent delete returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  private async runFileOperation(
+    entry: FileEntrySummary,
+    action: FileOperationAction,
+    { signal, onConfirmation }: RemoveEntryOptions,
+  ): Promise<FileOperationOutcome> {
     if (signal.aborted) throw abortError();
 
     const channel = new Channel<unknown>();
     let operationId: string | null = null;
+    let cancelRequested = false;
+    let cancellationSentFor: string | null = null;
     let observedOperationId: string | null = null;
     let lastSequence = -1;
     let settled = false;
-    let resolveCompletion: (entry: FileEntrySummary) => void = () => {};
+    let resolveCompletion: (outcome: FileOperationOutcome) => void = () => {};
     let rejectCompletion: (error: Error) => void = () => {};
-    const completion = new Promise<FileEntrySummary>((resolve, reject) => {
+    const completion = new Promise<FileOperationOutcome>((resolve, reject) => {
       resolveCompletion = resolve;
       rejectCompletion = reject;
     });
     const cancel = () => {
-      if (!operationId) return;
+      cancelRequested = true;
+      if (!operationId || cancellationSentFor === operationId) return;
+      cancellationSentFor = operationId;
       void invoke("cancel_file_operation", { operationId }).catch(() => {
         // Cancellation is best-effort; terminal operation events stay authoritative.
       });
@@ -1017,11 +1188,41 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
           );
         }
         lastSequence = payload.sequence;
+        if (payload.action !== action.kind) {
+          throw new Error(
+            "Invalid filesystem response: operation action changed.",
+          );
+        }
+        parseOperationProgress(payload);
 
         if (payload.event === "queued" || payload.event === "running") return;
+        if (payload.event === "awaitingConfirmation") {
+          const confirmation = parseOperationConfirmation(payload.prompt);
+          let responded = false;
+          onConfirmation(confirmation, async (response) => {
+            if (responded) {
+              throw new Error(
+                "This filesystem confirmation was already answered.",
+              );
+            }
+            responded = true;
+            try {
+              await invoke("respond_file_operation", {
+                operationId: eventOperationId,
+                promptId: confirmation.id,
+                response,
+              });
+            } catch (error) {
+              responded = false;
+              throw commandError(error);
+            }
+          });
+          return;
+        }
+
         settled = true;
         if (payload.event === "completed") {
-          resolveCompletion(parseEntry(payload.entry));
+          resolveCompletion(parseOperationOutcome(payload.outcome));
         } else if (payload.event === "cancelled") {
           rejectCompletion(abortError());
         } else if (payload.event === "failed") {
@@ -1047,7 +1248,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       const started = await invoke<unknown>("start_file_operation", {
         request: {
           sources: [entry.reference],
-          action: { kind: "rename", newName },
+          action,
         },
         onEvent: channel,
       });
@@ -1057,18 +1258,15 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         );
       }
       operationId = started;
+      if (cancelRequested) cancel();
       if (observedOperationId !== null && observedOperationId !== operationId) {
         throw new Error(
           "Invalid filesystem response: operation ID does not match.",
         );
       }
-      if (signal.aborted) {
-        cancel();
-        throw abortError();
-      }
       return await completion;
     } catch (error) {
-      if (signal.aborted) throw abortError();
+      if (operationId === null && signal.aborted) throw abortError();
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);

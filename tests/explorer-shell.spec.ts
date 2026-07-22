@@ -56,6 +56,41 @@ test("renames a selected local entry inline", async ({ page }) => {
   await expect(editor).toBeHidden();
 });
 
+test("trashes locally and confirms permanent deletion with platform shortcuts", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const isMac = await page.evaluate(() =>
+    /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent),
+  );
+
+  await page.getByText("explora-notes.md").click();
+  await page.keyboard.press(isMac ? "Meta+Backspace" : "Delete");
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+  await expect(page.getByRole("dialog")).toBeHidden();
+
+  await page.reload();
+  await page.getByText("explora-notes.md").click();
+  const permanentShortcut = isMac ? "Meta+Alt+Backspace" : "Shift+Delete";
+  await page.keyboard.press(permanentShortcut);
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("heading", {
+      name: "Delete “explora-notes.md” permanently?",
+    }),
+  ).toBeVisible();
+  await expect(dialog.getByText("In Home")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+
+  await page.keyboard.press(permanentShortcut);
+  await dialog.getByRole("button", { name: "Delete Permanently" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+});
+
 test("previews a multipage PDF with custom canvas controls", async ({
   page,
 }) => {

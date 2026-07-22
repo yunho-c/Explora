@@ -2,6 +2,9 @@ import type {
   ContentKind,
   DirectoryRef,
   FileEntrySummary,
+  FileOperationConfirmation,
+  FileOperationPromptResponse,
+  FileRemovalResult,
   LocationSummary,
   ManualSshTargetInput,
   PreviewContent,
@@ -15,6 +18,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RemoveEntryOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 
@@ -184,6 +188,8 @@ const locations: readonly LocationSummary[] = [
   },
 ];
 
+const remoteDemoLocationIds = new Set(["staging-box", "render-node"]);
+
 const makeEntry = (
   locationId: string,
   name: string,
@@ -192,31 +198,34 @@ const makeEntry = (
   size: number | null,
   modifiedAt: string,
   detail?: string,
-): FileEntrySummary => ({
-  reference: { id: `${locationId}:${name}`, locationId },
-  name,
-  kind,
-  contentKind,
-  size: size?.toString() ?? null,
-  modifiedAt: Date.parse(modifiedAt),
-  displayPath: `${roots[locationId].displayPath}/${name}`,
-  directory:
-    kind === "directory"
-      ? {
-          id: `${locationId}:${name}`,
-          locationId,
-          name,
-          displayPath: `${roots[locationId].displayPath}/${name}`,
-        }
-      : null,
-  detail,
-  capabilities: {
-    rename: !locationId.startsWith("ssh:"),
-    move: false,
-    trash: false,
-    deletePermanently: false,
-  },
-});
+): FileEntrySummary => {
+  const mutable = !remoteDemoLocationIds.has(locationId);
+  return {
+    reference: { id: `${locationId}:${name}`, locationId },
+    name,
+    kind,
+    contentKind,
+    size: size?.toString() ?? null,
+    modifiedAt: Date.parse(modifiedAt),
+    displayPath: `${roots[locationId].displayPath}/${name}`,
+    directory:
+      kind === "directory"
+        ? {
+            id: `${locationId}:${name}`,
+            locationId,
+            name,
+            displayPath: `${roots[locationId].displayPath}/${name}`,
+          }
+        : null,
+    detail,
+    capabilities: {
+      rename: mutable,
+      move: false,
+      trash: mutable,
+      deletePermanently: mutable,
+    },
+  };
+};
 
 const entriesByLocation: Readonly<Record<string, readonly FileEntrySummary[]>> =
   {
@@ -501,6 +510,7 @@ const wait = (duration: number, signal: AbortSignal) =>
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
   private readonly renamedEntries = new Map<string, FileEntrySummary>();
+  private readonly removedEntryIds = new Set<string>();
   private sshTargets: SshTargetSummary[] = [
     {
       id: "demo:staging-box",
@@ -690,7 +700,9 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       (this.dynamicRoots.has(directory.locationId) || isKnownChild
         ? []
         : undefined)
-    )?.map((entry) => this.renamedEntries.get(entry.reference.id) ?? entry);
+    )
+      ?.filter((entry) => !this.removedEntryIds.has(entry.reference.id))
+      .map((entry) => this.renamedEntries.get(entry.reference.id) ?? entry);
 
     if (!entries || !root) {
       throw new Error(`Unknown demo directory: ${directory.id}`);
@@ -746,7 +758,8 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
           (candidate) => candidate.reference.id === entry.reference.id,
         ),
       )
-      ?.map(
+      ?.filter((candidate) => !this.removedEntryIds.has(candidate.reference.id))
+      .map(
         (candidate) =>
           this.renamedEntries.get(candidate.reference.id) ?? candidate,
       );
@@ -772,6 +785,96 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     };
     this.renamedEntries.set(entry.reference.id, renamed);
     return renamed;
+  }
+
+  async trashEntry(
+    entry: FileEntrySummary,
+    { signal }: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    await wait(40, signal);
+    if (!entry.capabilities.trash) {
+      throw new Error("This item cannot be moved to Trash.");
+    }
+    return this.removeDemoEntry(entry, "trashed");
+  }
+
+  async deleteEntryPermanently(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    if (!entry.capabilities.deletePermanently) {
+      throw new Error("This item cannot be deleted permanently.");
+    }
+    const response = await this.awaitDeleteConfirmation(entry, options);
+    if (response === "cancel") throw abortError();
+    await wait(40, options.signal);
+    return this.removeDemoEntry(entry, "deletedPermanently");
+  }
+
+  private removeDemoEntry(
+    entry: FileEntrySummary,
+    kind: FileRemovalResult["kind"],
+  ): FileRemovalResult {
+    const invalidatedEntryIds = Object.values(entriesByLocation)
+      .flat()
+      .filter(
+        (candidate) =>
+          candidate.reference.id === entry.reference.id ||
+          candidate.displayPath.startsWith(`${entry.displayPath}/`),
+      )
+      .map((candidate) => candidate.reference.id);
+    if (!invalidatedEntryIds.includes(entry.reference.id)) {
+      invalidatedEntryIds.unshift(entry.reference.id);
+    }
+    for (const id of invalidatedEntryIds) {
+      this.removedEntryIds.add(id);
+      this.renamedEntries.delete(id);
+    }
+    return {
+      kind,
+      entry: entry.reference,
+      name: entry.name,
+      invalidatedEntryIds,
+    };
+  }
+
+  private awaitDeleteConfirmation(
+    entry: FileEntrySummary,
+    { signal, onConfirmation }: RemoveEntryOptions,
+  ): Promise<FileOperationPromptResponse> {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      let answered = false;
+      const abort = () => {
+        if (answered) return;
+        answered = true;
+        reject(abortError());
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      const confirmation: FileOperationConfirmation = {
+        id: `demo-delete-${entry.reference.id}`,
+        kind: "permanentDelete",
+        title: `Delete “${entry.name}” permanently?`,
+        message:
+          "This item will be removed immediately and cannot be recovered from Trash.",
+        targetName: entry.name,
+        locationName:
+          locations.find(({ id }) => id === entry.reference.locationId)?.name ??
+          "Local files",
+        confirmLabel: "Delete Permanently",
+      };
+      onConfirmation(confirmation, async (response) => {
+        if (answered) {
+          throw new Error("This filesystem confirmation was already answered.");
+        }
+        answered = true;
+        signal.removeEventListener("abort", abort);
+        resolve(response);
+      });
+    });
   }
 
   async getPreview(
