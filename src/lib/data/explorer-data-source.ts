@@ -63,10 +63,16 @@ export interface WatchVolumesOptions {
 
 export interface FileOperationOptions {
   signal: AbortSignal;
+  onProgress?: (progress: FileOperationProgress) => void;
   onPrompt: (
     prompt: FileOperationPrompt,
     respond: (response: FileOperationPromptResponse) => Promise<void>,
   ) => void;
+}
+
+export interface FileOperationProgress {
+  completedItems: number;
+  totalItems: number;
 }
 
 export type RemoveEntryOptions = FileOperationOptions;

@@ -553,6 +553,7 @@ describe("TauriExplorerDataSource", () => {
 
   it("answers a Rust-authoritative permanent-delete confirmation once", async () => {
     let operationChannel: unknown;
+    const onProgress = vi.fn();
     mockIPC((command, payload) => {
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
         throw new Error("Expected operation command arguments.");
@@ -614,12 +615,36 @@ describe("TauriExplorerDataSource", () => {
           operationChannel,
           [
             {
-              event: "completed",
+              event: "running",
               operationId: "operation-delete",
               sequence: 3,
               action: "deletePermanently",
+              completedItems: 0,
+              totalItems: 3,
+            },
+            {
+              event: "running",
+              operationId: "operation-delete",
+              sequence: 4,
+              action: "deletePermanently",
               completedItems: 1,
-              totalItems: 1,
+              totalItems: 3,
+            },
+            {
+              event: "running",
+              operationId: "operation-delete",
+              sequence: 5,
+              action: "deletePermanently",
+              completedItems: 2,
+              totalItems: 3,
+            },
+            {
+              event: "completed",
+              operationId: "operation-delete",
+              sequence: 6,
+              action: "deletePermanently",
+              completedItems: 3,
+              totalItems: 3,
               outcome: {
                 kind: "deletedPermanently",
                 entry: entryPayload.reference,
@@ -645,6 +670,7 @@ describe("TauriExplorerDataSource", () => {
       previewEntry,
       {
         signal: new AbortController().signal,
+        onProgress,
         onPrompt: (...args) => {
           confirmation = args;
         },
@@ -661,6 +687,58 @@ describe("TauriExplorerDataSource", () => {
     await expect(deletion).resolves.toMatchObject({
       kind: "deletedPermanently",
       name: "notes.md",
+    });
+    expect(onProgress).toHaveBeenLastCalledWith({
+      completedItems: 3,
+      totalItems: 3,
+    });
+    expect(onProgress).toHaveBeenCalledWith({
+      completedItems: 2,
+      totalItems: 3,
+    });
+  });
+
+  it("preserves uncertain remote outcomes as structured errors", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "queued",
+          operationId: "operation-uncertain",
+          sequence: 0,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "failed",
+          operationId: "operation-uncertain",
+          sequence: 1,
+          action: "rename",
+          completedItems: 0,
+          totalItems: 1,
+          error: {
+            code: "outcomeUncertain",
+            message: "Reconnect and refresh before trying again.",
+          },
+        },
+      ]);
+      return "operation-uncertain";
+    });
+
+    await expect(
+      new TauriExplorerDataSource().renameEntry(
+        previewEntry,
+        "renamed.md",
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({
+      name: "ExplorerFilesystemError",
+      code: "outcomeUncertain",
+      message: "Reconnect and refresh before trying again.",
     });
   });
 

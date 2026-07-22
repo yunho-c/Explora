@@ -20,6 +20,7 @@ use crate::{
         LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, RemovedLocalEntry,
     },
     platform_trash::{PlatformTrash, SystemPlatformTrash},
+    ssh::{MovedRemoteEntry, RemoteMoveConflictPolicy, RemovedRemoteEntry, SshConnectionManager},
 };
 
 const MAX_OPERATION_SOURCES: usize = 1;
@@ -267,6 +268,33 @@ impl ActiveOperation {
         }
     }
 
+    async fn await_prompt_async(
+        &self,
+        receiver: mpsc::Receiver<FileOperationPromptResponseDto>,
+    ) -> Result<FileOperationPromptResponseDto, ExplorerError> {
+        let started = Instant::now();
+        loop {
+            if let Err(error) = self.ensure_not_cancelled() {
+                self.clear_prompt();
+                return Err(error);
+            }
+            if started.elapsed() >= PROMPT_TIMEOUT {
+                self.clear_prompt();
+                return Err(ExplorerError::Cancelled);
+            }
+            match receiver.try_recv() {
+                Ok(response) => return Ok(response),
+                Err(mpsc::TryRecvError::Empty) => {
+                    tokio::time::sleep(PROMPT_POLL_INTERVAL).await;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.clear_prompt();
+                    return Err(ExplorerError::StateUnavailable);
+                }
+            }
+        }
+    }
+
     fn respond(
         &self,
         prompt_id: &str,
@@ -306,6 +334,8 @@ struct OperationEventEmitter {
     operation_id: String,
     action: FileOperationKindDto,
     sequence: u64,
+    completed_items: u64,
+    total_items: u64,
     channel: Channel<FileOperationEventDto>,
 }
 
@@ -323,8 +353,8 @@ impl OperationEventEmitter {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 0,
-                total_items: 1,
+                completed_items: self.completed_items,
+                total_items: self.total_items,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
     }
@@ -339,8 +369,8 @@ impl OperationEventEmitter {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 0,
-                total_items: 1,
+                completed_items: self.completed_items,
+                total_items: self.total_items,
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
@@ -353,11 +383,20 @@ impl OperationEventEmitter {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 0,
-                total_items: 1,
+                completed_items: self.completed_items,
+                total_items: self.total_items,
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
+    }
+
+    fn progress(&mut self, completed_items: u64, total_items: u64) -> Result<(), ExplorerError> {
+        if total_items == 0 || completed_items > total_items {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        self.completed_items = completed_items;
+        self.total_items = total_items;
+        self.running()
     }
 
     fn terminal(&mut self, result: Result<FileOperationOutcomeDto, ExplorerError>) {
@@ -367,23 +406,23 @@ impl OperationEventEmitter {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 1,
-                total_items: 1,
+                completed_items: self.total_items,
+                total_items: self.total_items,
                 outcome,
             },
             Err(ExplorerError::Cancelled) => FileOperationEventDto::Cancelled {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 0,
-                total_items: 1,
+                completed_items: self.completed_items,
+                total_items: self.total_items,
             },
             Err(error) => FileOperationEventDto::Failed {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
-                completed_items: 0,
-                total_items: 1,
+                completed_items: self.completed_items,
+                total_items: self.total_items,
                 error: ExplorerErrorDto::from(error),
             },
         };
@@ -414,9 +453,25 @@ impl FileOperationCoordinator {
         }
     }
 
+    #[cfg(test)]
     pub fn start(
         self: &Arc<Self>,
         local: Arc<LocalFilesystem>,
+        request: FileOperationRequestDto,
+        on_event: Channel<FileOperationEventDto>,
+    ) -> Result<String, ExplorerError> {
+        self.start_with_backends(
+            local,
+            Arc::new(SshConnectionManager::default()),
+            request,
+            on_event,
+        )
+    }
+
+    pub fn start_with_backends(
+        self: &Arc<Self>,
+        local: Arc<LocalFilesystem>,
+        ssh: Arc<SshConnectionManager>,
         request: FileOperationRequestDto,
         on_event: Channel<FileOperationEventDto>,
     ) -> Result<String, ExplorerError> {
@@ -444,18 +499,39 @@ impl FileOperationCoordinator {
 
         let coordinator = self.clone();
         let task_operation_id = operation_id.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let mut events = OperationEventEmitter {
-                operation_id: task_operation_id.clone(),
-                action,
-                sequence: 1,
-                channel: on_event,
-            };
-            let result = coordinator.run_local(&local, &request, &active, &mut events);
-            active.clear_prompt();
-            events.terminal(result);
-            coordinator.finish(&task_operation_id);
-        });
+        if request.sources[0].location_id.starts_with("ssh:") {
+            tauri::async_runtime::spawn(async move {
+                let mut events = OperationEventEmitter {
+                    operation_id: task_operation_id.clone(),
+                    action,
+                    sequence: 1,
+                    completed_items: 0,
+                    total_items: 1,
+                    channel: on_event,
+                };
+                let result = coordinator
+                    .run_remote(&ssh, &request, &active, &mut events)
+                    .await;
+                active.clear_prompt();
+                events.terminal(result);
+                coordinator.finish(&task_operation_id);
+            });
+        } else {
+            tauri::async_runtime::spawn_blocking(move || {
+                let mut events = OperationEventEmitter {
+                    operation_id: task_operation_id.clone(),
+                    action,
+                    sequence: 1,
+                    completed_items: 0,
+                    total_items: 1,
+                    channel: on_event,
+                };
+                let result = coordinator.run_local(&local, &request, &active, &mut events);
+                active.clear_prompt();
+                events.terminal(result);
+                coordinator.finish(&task_operation_id);
+            });
+        }
 
         Ok(operation_id)
     }
@@ -611,6 +687,130 @@ impl FileOperationCoordinator {
         }
     }
 
+    async fn run_remote(
+        &self,
+        ssh: &SshConnectionManager,
+        request: &FileOperationRequestDto,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        active.ensure_not_cancelled()?;
+        events.running()?;
+
+        let source = &request.sources[0];
+        match &request.action {
+            FileOperationActionDto::Rename { new_name } => ssh
+                .rename_entry(source, new_name, &active.cancelled)
+                .await
+                .map(|entry| FileOperationOutcomeDto::Renamed {
+                    entry: Box::new(entry),
+                }),
+            FileOperationActionDto::Move { destination } => {
+                match ssh
+                    .move_entry(
+                        source,
+                        destination,
+                        RemoteMoveConflictPolicy::Fail,
+                        &active.cancelled,
+                    )
+                    .await
+                {
+                    Ok(moved) => Ok(moved_remote_outcome(moved)),
+                    Err(ExplorerError::Conflict) => {
+                        let (target_name, destination_name) =
+                            ssh.describe_move_conflict(source, destination).await?;
+                        let prompt_id = Uuid::new_v4().to_string();
+                        let decisions = vec![
+                            FileOperationPromptResponseDto::KeepBoth,
+                            FileOperationPromptResponseDto::Skip,
+                            FileOperationPromptResponseDto::Cancel,
+                        ];
+                        let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                        events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                            id: prompt_id,
+                            title: format!("“{target_name}” already exists"),
+                            message: format!(
+                                "Choose how to handle the existing remote item in “{destination_name}”. Nothing will be replaced."
+                            ),
+                            target_name: target_name.clone(),
+                            destination_name,
+                            decisions,
+                        })?;
+                        match active.await_prompt_async(response).await? {
+                            FileOperationPromptResponseDto::KeepBoth => {
+                                events.running()?;
+                                active.ensure_not_cancelled()?;
+                                ssh.move_entry(
+                                    source,
+                                    destination,
+                                    RemoteMoveConflictPolicy::KeepBoth,
+                                    &active.cancelled,
+                                )
+                                .await
+                                .map(moved_remote_outcome)
+                            }
+                            FileOperationPromptResponseDto::Skip => {
+                                events.running()?;
+                                Ok(FileOperationOutcomeDto::MoveSkipped {
+                                    entry: source.clone(),
+                                    name: target_name,
+                                })
+                            }
+                            FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                            FileOperationPromptResponseDto::Confirm => {
+                                Err(ExplorerError::InvalidConfiguration(
+                                    "That response is not valid for a move conflict.".to_owned(),
+                                ))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            FileOperationActionDto::Trash {} => Err(ExplorerError::Unsupported(
+                "Remote items cannot be moved to the local operating-system Trash.".to_owned(),
+            )),
+            FileOperationActionDto::DeletePermanently {} => {
+                let (target_name, location_name) = ssh.describe_operation_target(source).await?;
+                let prompt_id = Uuid::new_v4().to_string();
+                let response = active.begin_prompt(
+                    prompt_id.clone(),
+                    vec![
+                        FileOperationPromptResponseDto::Confirm,
+                        FileOperationPromptResponseDto::Cancel,
+                    ],
+                )?;
+                events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+                    id: prompt_id,
+                    title: format!("Delete “{target_name}” permanently?"),
+                    message: format!(
+                        "This remote item on {location_name} will be removed immediately. It cannot be recovered from Trash."
+                    ),
+                    target_name,
+                    location_name,
+                    confirm_label: "Delete Permanently",
+                })?;
+                match active.await_prompt_async(response).await? {
+                    FileOperationPromptResponseDto::Confirm => {}
+                    FileOperationPromptResponseDto::Cancel => return Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::KeepBoth
+                    | FileOperationPromptResponseDto::Skip => {
+                        return Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for permanent deletion.".to_owned(),
+                        ));
+                    }
+                }
+                events.running()?;
+                active.ensure_not_cancelled()?;
+                ssh.permanently_delete_entry(source, &active.cancelled, |completed, total| {
+                    events.progress(completed, total)
+                })
+                .await
+                .map(deleted_remote_outcome)
+            }
+        }
+    }
+
     fn with_execution_guard<T>(
         &self,
         execute: impl FnOnce() -> Result<T, ExplorerError>,
@@ -643,11 +843,6 @@ fn validate_request(request: &FileOperationRequestDto) -> Result<(), ExplorerErr
     {
         return Err(ExplorerError::InvalidReference);
     }
-    if source.location_id.starts_with("ssh:") {
-        return Err(ExplorerError::Unsupported(
-            "Remote filesystem actions are not available yet.".to_owned(),
-        ));
-    }
     if let FileOperationActionDto::Move { destination } = &request.action {
         if destination.id.is_empty()
             || destination.id.len() > 256
@@ -663,6 +858,15 @@ fn validate_request(request: &FileOperationRequestDto) -> Result<(), ExplorerErr
 }
 
 fn moved_outcome(entry: MovedLocalEntry) -> FileOperationOutcomeDto {
+    FileOperationOutcomeDto::Moved {
+        entry: Box::new(entry.entry),
+        source_parent: entry.source_parent,
+        destination: entry.destination,
+        rebased_entry_ids: entry.rebased_entry_ids,
+    }
+}
+
+fn moved_remote_outcome(entry: MovedRemoteEntry) -> FileOperationOutcomeDto {
     FileOperationOutcomeDto::Moved {
         entry: Box::new(entry.entry),
         source_parent: entry.source_parent,
@@ -687,6 +891,14 @@ fn deleted_outcome(entry: RemovedLocalEntry) -> FileOperationOutcomeDto {
     }
 }
 
+fn deleted_remote_outcome(entry: RemovedRemoteEntry) -> FileOperationOutcomeDto {
+    FileOperationOutcomeDto::DeletedPermanently {
+        entry: entry.reference,
+        name: entry.name,
+        invalidated_entry_ids: entry.invalidated_entry_ids,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -701,8 +913,11 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        filesystem::{DirectoryListingEvent, LocationRole},
+        filesystem::{DirectoryListingEvent, LocationRole, LocationSummaryDto},
         local_filesystem::LocalRoot,
+        ssh::{SshConnectionEventDto, SshPromptResponseDto},
+        ssh_targets::ResolvedSshTarget,
+        ssh_test_server::{TestAuthMode, TestSshServer},
     };
 
     use super::*;
@@ -770,6 +985,76 @@ mod tests {
                 .push(serde_json::from_str(&json).expect("valid event JSON"));
             Ok(())
         })
+    }
+
+    async fn connect_remote_fixture(
+        server: &TestSshServer,
+        manager: Arc<SshConnectionManager>,
+    ) -> LocationSummaryDto {
+        let request_id = "operation-remote-connect".to_owned();
+        let response_manager = manager.clone();
+        let response_request_id = request_id.clone();
+        let channel = Channel::<SshConnectionEventDto>::new(move |body| {
+            let InvokeResponseBody::Json(json) = body else {
+                panic!("SSH events must be JSON");
+            };
+            let event: Value = serde_json::from_str(&json).expect("valid SSH event");
+            if event["event"] == "hostKeyPrompt" {
+                response_manager
+                    .respond(
+                        &response_request_id,
+                        event["promptId"].as_str().expect("prompt id"),
+                        SshPromptResponseDto::Accept,
+                    )
+                    .expect("accept disposable host key");
+            }
+            Ok(())
+        });
+        manager
+            .connect(
+                ResolvedSshTarget {
+                    id: "operation-test-target".to_owned(),
+                    name: "Operation test server".to_owned(),
+                    host: server.host().to_owned(),
+                    port: server.port(),
+                    username: server.username().to_owned(),
+                    initial_path: "/".to_owned(),
+                    identity_files: vec![server.identity_file().to_owned()],
+                    identities_only: true,
+                    known_hosts_path: server.known_hosts_path(),
+                },
+                request_id,
+                channel,
+            )
+            .await
+            .expect("connect operation SFTP fixture")
+    }
+
+    async fn remote_root_entries(
+        manager: &SshConnectionManager,
+        location: &LocationSummaryDto,
+    ) -> Vec<FileEntrySummaryDto> {
+        let entries = Arc::new(StdMutex::new(Vec::new()));
+        let captured_entries = entries.clone();
+        manager
+            .list_directory(
+                &location.id,
+                &location.root.id,
+                &AtomicBool::new(false),
+                move |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        captured_entries
+                            .lock()
+                            .map_err(|_| ExplorerError::StateUnavailable)?
+                            .extend(entries);
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .expect("list operation SFTP fixture");
+        let result = entries.lock().expect("remote entries").clone();
+        result
     }
 
     fn destination_fixture(temp: &TempDir, local: &LocalFilesystem, name: &str) -> DirectoryRefDto {
@@ -1154,6 +1439,62 @@ mod tests {
             )
             .expect("cancel move prompt");
         wait_for_event(&move_events, "cancelled").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_confirms_and_deletes_a_remote_entry_with_authoritative_host_context() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let location = connect_remote_fixture(&server, ssh.clone()).await;
+        let remote_entry = remote_root_entries(&ssh, &location)
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("remote file");
+        let (_temp, local, _) = fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![remote_entry.reference],
+                    action: FileOperationActionDto::DeletePermanently {},
+                },
+                channel(events.clone()),
+            )
+            .expect("start remote delete");
+        wait_for_event(&events, "awaitingConfirmation").await;
+        let prompt = events.lock().expect("events")[2]["prompt"].clone();
+        assert!(prompt["message"]
+            .as_str()
+            .expect("message")
+            .contains("remote item"));
+        assert!(prompt["locationName"]
+            .as_str()
+            .expect("location")
+            .contains(server.host()));
+        coordinator
+            .respond(
+                &operation_id,
+                prompt["id"].as_str().expect("prompt id"),
+                FileOperationPromptResponseDto::Confirm,
+            )
+            .expect("confirm remote delete");
+        wait_for_event(&events, "completed").await;
+
+        {
+            let events = events.lock().expect("events");
+            let terminal = events.last().expect("terminal event");
+            assert_eq!(terminal["outcome"]["kind"], "deletedPermanently");
+            assert_eq!(terminal["completedItems"], 1);
+        }
+        assert!(!server.path_exists("/README.md").await);
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
     }
 
     #[tokio::test]

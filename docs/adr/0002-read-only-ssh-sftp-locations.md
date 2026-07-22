@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-07-18
 
+> This ADR records the initial read-only SSH slice. ADR 0009 extends connected
+> SFTP locations with capability-gated rename, same-location move, and permanent
+> deletion while preserving the trust and opaque-reference boundaries below.
+
 ## Context
 
 Explora treats remote computers as first-class file locations rather than as a

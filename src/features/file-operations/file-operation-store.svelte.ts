@@ -11,6 +11,7 @@ import type {
 import type {
   ExplorerDataSource,
   FileOperationOptions,
+  FileOperationProgress,
 } from "$lib/data/explorer-data-source";
 
 interface PendingPrompt {
@@ -36,6 +37,9 @@ const isAbortError = (error: unknown) =>
 
 export class FileOperationStore {
   activeEntryId = $state<string | null>(null);
+  activeEntryName = $state<string | null>(null);
+  activeAction = $state<string | null>(null);
+  progress = $state<FileOperationProgress | null>(null);
   pendingPrompt = $state<PendingPrompt | null>(null);
   moveChooser = $state<MoveChooserState | null>(null);
   errorMessage = $state<string | null>(null);
@@ -159,6 +163,7 @@ export class FileOperationStore {
     this.closeMoveChooser();
     await this.runOperation(
       entry,
+      "Moving",
       (options) => this.dataSource.moveEntry(entry, directory, options),
       onCompleted,
     );
@@ -170,6 +175,7 @@ export class FileOperationStore {
   ): Promise<void> {
     await this.runOperation(
       entry,
+      "Moving to Trash",
       (options) => this.dataSource.trashEntry(entry, options),
       onRemoved,
     );
@@ -181,6 +187,7 @@ export class FileOperationStore {
   ): Promise<void> {
     await this.runOperation(
       entry,
+      "Deleting permanently",
       (options) => this.dataSource.deleteEntryPermanently(entry, options),
       onRemoved,
     );
@@ -214,6 +221,9 @@ export class FileOperationStore {
     this.controller?.abort();
     this.controller = null;
     this.activeEntryId = null;
+    this.activeEntryName = null;
+    this.activeAction = null;
+    this.progress = null;
     this.pendingPrompt = null;
   }
 
@@ -233,6 +243,7 @@ export class FileOperationStore {
 
   private async runOperation<T>(
     entry: FileEntrySummary,
+    activeAction: string,
     start: (options: FileOperationOptions) => Promise<T>,
     onCompleted: (result: T) => void | Promise<void>,
   ): Promise<void> {
@@ -240,10 +251,16 @@ export class FileOperationStore {
     const controller = new AbortController();
     this.controller = controller;
     this.activeEntryId = entry.reference.id;
+    this.activeEntryName = entry.name;
+    this.activeAction = activeAction;
+    this.progress = { completedItems: 0, totalItems: 1 };
     this.errorMessage = null;
     try {
       const result = await start({
         signal: controller.signal,
+        onProgress: (progress) => {
+          if (this.controller === controller) this.progress = progress;
+        },
         onPrompt: (prompt, respond) => {
           if (this.controller !== controller) return;
           this.pendingPrompt = { prompt, responding: false, respond };
@@ -262,6 +279,9 @@ export class FileOperationStore {
       if (this.controller === controller) {
         this.controller = null;
         this.activeEntryId = null;
+        this.activeEntryName = null;
+        this.activeAction = null;
+        this.progress = null;
         this.pendingPrompt = null;
       }
     }

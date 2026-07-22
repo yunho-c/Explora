@@ -320,7 +320,7 @@ pub fn start_file_operation(
 ) -> Result<String, ExplorerErrorDto> {
     state
         .operations
-        .start(state.local.clone(), request, on_event)
+        .start_with_backends(state.local.clone(), state.ssh.clone(), request, on_event)
         .map_err(ExplorerErrorDto::from)
 }
 

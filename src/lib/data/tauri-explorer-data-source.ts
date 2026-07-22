@@ -30,6 +30,7 @@ import type {
   ConnectSshOptions,
   ExplorerDataSource,
   FileOperationOptions,
+  FileOperationProgress,
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
@@ -418,7 +419,9 @@ const parseEntryRef = (value: unknown) => {
   };
 };
 
-const parseOperationProgress = (value: Record<string, unknown>) => {
+const parseOperationProgress = (
+  value: Record<string, unknown>,
+): FileOperationProgress => {
   const completedItems = value.completedItems;
   const totalItems = value.totalItems;
   if (
@@ -427,13 +430,15 @@ const parseOperationProgress = (value: Record<string, unknown>) => {
     completedItems < 0 ||
     typeof totalItems !== "number" ||
     !Number.isSafeInteger(totalItems) ||
-    totalItems !== 1 ||
+    totalItems < 1 ||
+    totalItems > 100_000 ||
     completedItems > totalItems
   ) {
     throw new Error(
       "Invalid filesystem response: operation progress is malformed.",
     );
   }
+  return { completedItems, totalItems };
 };
 
 const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
@@ -838,13 +843,24 @@ const abortError = () => {
   return error;
 };
 
+export class ExplorerFilesystemError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+    this.name = "ExplorerFilesystemError";
+  }
+}
+
 const commandError = (error: unknown): Error => {
   if (error instanceof Error) return error;
   if (isRecord(error) && typeof error.message === "string") {
-    const result = new Error(error.message);
-    result.name =
-      error.code === "cancelled" ? "AbortError" : "ExplorerFilesystemError";
-    return result;
+    if (error.code === "cancelled") return abortError();
+    return new ExplorerFilesystemError(
+      error.message,
+      typeof error.code === "string" ? error.code : "unexpected",
+    );
   }
   return new Error("Explora could not complete the filesystem request.");
 };
@@ -1243,7 +1259,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
   private async runFileOperation(
     entry: FileEntrySummary,
     action: FileOperationAction,
-    { signal, onPrompt }: FileOperationOptions,
+    { signal, onProgress, onPrompt }: FileOperationOptions,
   ): Promise<FileOperationOutcome> {
     if (signal.aborted) throw abortError();
 
@@ -1302,7 +1318,8 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
             "Invalid filesystem response: operation action changed.",
           );
         }
-        parseOperationProgress(payload);
+        const progress = parseOperationProgress(payload);
+        onProgress?.(progress);
 
         if (payload.event === "queued" || payload.event === "running") return;
         if (

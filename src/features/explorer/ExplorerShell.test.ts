@@ -65,6 +65,21 @@ describe("ExplorerShell", () => {
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
   });
 
+  it("announces item-based progress for a recursive filesystem action", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+
+    state.fileOperations.activeEntryId = "demo-directory";
+    state.fileOperations.activeEntryName = "Projects";
+    state.fileOperations.activeAction = "Deleting permanently";
+    state.fileOperations.progress = { completedItems: 2, totalItems: 7 };
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Deleting permanently “Projects” · 2 of 7 items",
+    );
+  });
+
   it("provides an accessible inline rename workflow from the keyboard", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

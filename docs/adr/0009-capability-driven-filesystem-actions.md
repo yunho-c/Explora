@@ -144,6 +144,37 @@ Cross-location and cross-volume moves remain Phase 6 transfer operations. They
 must allocate new identities, copy to an owned partial target, verify and
 finalize it, and only then remove the source.
 
+## Fourth vertical slice
+
+The fourth implementation enables single-entry SFTP mutation within one active
+remote location:
+
+- Connected, non-root SFTP entries advertise rename, move, and permanent-delete
+  capabilities. Remote Trash remains false because no recoverable server-side
+  trash contract exists.
+- The backend revalidates each opaque reference against a bounded metadata
+  fingerprint immediately before mutation. Directory relocation rebases every
+  registered descendant while preserving its opaque identity; deletion
+  invalidates the removed subtree.
+- Rename and same-location move use the SFTP relocation request and never invoke
+  a remote shell. Existing destinations remain conflicts. Keep Both generates a
+  bounded backend-valid candidate and repeats the no-replace attempt.
+- Recursive deletion constructs a bounded post-order plan with SFTP `lstat` and
+  directory enumeration. It deletes symlink entries without traversing their
+  targets and reports item-based progress.
+- Permanent deletion always suspends for a random, single-use prompt whose host
+  and target text comes from the active Rust session.
+- A disconnect or timeout after dispatch is not retried. Before any confirmed
+  deletion it returns `outcomeUncertain`; after earlier removals it returns
+  `partialCompletion`, marks the session offline when connectivity is lost, and
+  directs the user to reconnect and refresh.
+- The disposable SFTP server is mutable and covers relocation, conflicts,
+  permissions, symlinks, recursive partial completion, latency, timeout, and
+  disconnect uncertainty over the real protocol.
+
+Cross-location and cross-backend moves remain Phase 6 transfer operations and
+cannot use the relocation path.
+
 ## Security review
 
 - Mutation commands accept no local path, remote path, shell text, or generic
@@ -160,9 +191,9 @@ finalize it, and only then remove the source.
   creates the destination after preflight validation.
 - The case-only intermediate path is random, owned by the operation, and restored
   to the original path if finalization fails.
-- Transfer and SFTP phases still require focused review of their platform
-  dependencies, partial-resource lifecycle, and uncertain-outcome behavior before
-  their capabilities are enabled.
+- The transfer phase still requires focused review of partial-resource lifecycle,
+  verification, and cross-backend uncertain-outcome behavior before its
+  capabilities are enabled.
 
 ## Consequences
 
@@ -172,7 +203,7 @@ finalize it, and only then remove the source.
   to bypass Rust authorization or execution-time validation.
 - Registered tabs and histories can remain valid through same-backend directory
   relocation.
-- Remote mutations and transfer-based moves remain visibly unavailable rather
-  than silently degrading.
+- Remote Trash and transfer-based moves remain visibly unavailable rather than
+  silently degrading.
 - Each subsequent phase must add backend contract coverage and native validation
   before enabling its capability.

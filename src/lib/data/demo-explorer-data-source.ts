@@ -30,7 +30,7 @@ const localDirectoryCapabilities = {
   atomicReplace: false,
 } as const;
 
-const readOnlyDirectoryCapabilities = {
+const unavailableDirectoryCapabilities = {
   acceptMove: false,
   atomicReplace: false,
 } as const;
@@ -97,14 +97,14 @@ const roots: Readonly<Record<string, DirectoryRef>> = {
     locationId: "staging-box",
     name: "staging-box",
     displayPath: "staging-box:~/projects",
-    capabilities: readOnlyDirectoryCapabilities,
+    capabilities: localDirectoryCapabilities,
   },
   "render-node": {
     id: "render-node",
     locationId: "render-node",
     name: "render-node",
     displayPath: "render-node:~",
-    capabilities: readOnlyDirectoryCapabilities,
+    capabilities: unavailableDirectoryCapabilities,
   },
 };
 
@@ -222,7 +222,7 @@ const makeEntry = (
   modifiedAt: string,
   detail?: string,
 ): FileEntrySummary => {
-  const mutable = !remoteDemoLocationIds.has(locationId);
+  const remote = remoteDemoLocationIds.has(locationId);
   return {
     reference: { id: `${locationId}:${name}`, locationId },
     name,
@@ -238,17 +238,15 @@ const makeEntry = (
             locationId,
             name,
             displayPath: `${roots[locationId].displayPath}/${name}`,
-            capabilities: mutable
-              ? localDirectoryCapabilities
-              : readOnlyDirectoryCapabilities,
+            capabilities: localDirectoryCapabilities,
           }
         : null,
     detail,
     capabilities: {
-      rename: mutable,
-      move: mutable,
-      trash: mutable,
-      deletePermanently: mutable,
+      rename: true,
+      move: true,
+      trash: !remote,
+      deletePermanently: true,
     },
   };
 };
@@ -670,7 +668,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         locationId,
         name: target.name,
         displayPath: `${target.name}:~`,
-        capabilities: readOnlyDirectoryCapabilities,
+        capabilities: localDirectoryCapabilities,
       };
       location = {
         id: locationId,
@@ -1004,16 +1002,23 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         reject(abortError());
       };
       signal.addEventListener("abort", abort, { once: true });
+      const location =
+        locations.find(({ id }) => id === entry.reference.locationId) ??
+        this.dynamicLocations.get(entry.reference.locationId);
+      const remote = location?.kind === "ssh";
       const confirmation: FileOperationConfirmation = {
         id: `demo-delete-${entry.reference.id}`,
         kind: "permanentDelete",
         title: `Delete “${entry.name}” permanently?`,
-        message:
-          "This item will be removed immediately and cannot be recovered from Trash.",
+        message: remote
+          ? `This remote item on ${location.name} will be removed immediately. It cannot be recovered from Trash.`
+          : "This item will be removed immediately and cannot be recovered from Trash.",
         targetName: entry.name,
-        locationName:
-          locations.find(({ id }) => id === entry.reference.locationId)?.name ??
-          "Local files",
+        locationName: location
+          ? remote
+            ? `${location.name} (${location.detail})`
+            : location.name
+          : "Local files",
         confirmLabel: "Delete Permanently",
       };
       onPrompt(confirmation, async (response) => {

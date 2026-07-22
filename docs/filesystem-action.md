@@ -70,16 +70,17 @@ following are deferred:
 
 ## Current implementation
 
-Phases 1 through 4 are implemented for the local backend. Native Trash and move
-still require packaged validation on every supported platform:
+Phases 1 through 5 are implemented for single entries. Native Trash and local
+move still require packaged validation on every supported platform:
 
 - Local and remote paths are represented by opaque, location-scoped tokens.
 - Directory listings already use typed incremental events and cancellation.
 - A Rust-owned operation coordinator emits queued, running, confirmation, and
-  typed terminal events with monotonic sequences and single-item progress.
+  typed terminal events with monotonic sequences and item-based progress.
 - Local entries advertise rename, move, native trash, and permanent-delete
   capabilities; directories separately advertise whether they accept moves.
-  SSH/SFTP remains read-only.
+  Connected SFTP entries advertise rename, move, and permanent deletion but not
+  Trash.
 - Rename preserves opaque identity and rebases registered descendants.
 - Successful trash and permanent deletion invalidate registered descendants;
   frontend selection, previews, tabs, and histories reconcile those references.
@@ -88,6 +89,15 @@ still require packaged validation on every supported platform:
 - Same-location local moves use an operating-system no-replace primitive, reject
   symlink and descendant destinations, preserve registered identities, and offer
   Keep Both, Skip, or Cancel when a destination exists.
+- SFTP rename and same-location move use protocol relocation without shell
+  commands, preserve opaque identities, never replace a pre-existing target,
+  and share the same Keep Both, Skip, or Cancel conflict flow.
+- Remote permanent deletion requires a Rust-authoritative host-and-target
+  confirmation. Recursive plans are bounded, item-progressed, post-order, and
+  never follow symlinks.
+- A connection loss or timeout after a remote mutation is dispatched becomes an
+  `outcomeUncertain` error and takes the session offline without retry. Failure
+  after some recursive removals becomes `partialCompletion`.
 - The accessible destination chooser consumes opaque directory references and
   capability data. Cross-location destinations remain visibly unavailable until
   transfer-based moves are implemented.
@@ -97,15 +107,16 @@ still require packaged validation on every supported platform:
   actions with accessible blocking dialogs for permanent deletion and move
   conflicts.
 - Disposable SSH/SFTP tests cover real authentication, trust, listing,
-  cancellation, disconnect, and reconnect behavior.
+  relocation conflicts, permission failures, symlink-safe recursive deletion,
+  partial completion, cancellation, disconnect, timeout, and reconnect behavior.
 
 Packaged native trash and same-filesystem move must still be exercised on macOS,
 Linux, and Windows before those phases are considered complete across all
 supported targets.
 
-The remaining work is the backend-neutral mutation contract for SFTP,
-transfer-based moves with verified finalization, multi-selection and collision
-planning, undo, and the corresponding cross-platform/native validation.
+The remaining work is transfer-based moves with verified finalization,
+multi-selection and collision planning, undo, and the corresponding
+cross-platform/native validation.
 
 ## Architecture
 
@@ -528,6 +539,17 @@ than an in-place registry rebase.
 - Add remote confirmation, disconnect, timeout, and uncertain-outcome behavior.
 - Extend disposable SFTP fixtures with conflict, permission, symlink, latency,
   and disconnect cases.
+
+Implemented for single entries within one connected SFTP location. The backend
+revalidates a bounded metadata fingerprint immediately before mutation, uses
+opaque registry rebasing/invalidation, and serializes mutations per session.
+Standard SFTP relocation is treated as no-replace; a destination is preflighted
+and server failures are reconciled against source and destination metadata.
+Recursive deletion is limited to 100,000 entries and 256 levels, emits honest
+item counts, and stops automatic cancellation once irreversible removal begins.
+Disconnects and request timeouts after dispatch are never retried. They mark the
+location offline and report an uncertain or partial result for user-led reconnect
+and refresh. Cross-location remote moves remain Phase 6 transfers.
 
 ### Phase 6: Transfer-based move
 

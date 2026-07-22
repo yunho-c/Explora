@@ -120,6 +120,13 @@ impl DirectoryCapabilitiesDto {
         // strategy is implemented and covered on every supported platform.
         atomic_replace: false,
     };
+
+    pub const SFTP: Self = Self {
+        accept_move: true,
+        // SFTP v3 rename is no-replace, but it does not provide the stronger
+        // replacement contract required to advertise atomic replacement.
+        atomic_replace: false,
+    };
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -152,13 +159,6 @@ pub struct EntryCapabilitiesDto {
 }
 
 impl EntryCapabilitiesDto {
-    pub const READ_ONLY: Self = Self {
-        rename: false,
-        move_entry: false,
-        trash: false,
-        delete_permanently: false,
-    };
-
     pub const fn local(trash_available: bool) -> Self {
         Self {
             rename: true,
@@ -167,6 +167,13 @@ impl EntryCapabilitiesDto {
             delete_permanently: true,
         }
     }
+
+    pub const SFTP: Self = Self {
+        rename: true,
+        move_entry: true,
+        trash: false,
+        delete_permanently: true,
+    };
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -218,6 +225,8 @@ pub enum ExplorerErrorCode {
     NotDirectory,
     Cancelled,
     Offline,
+    OutcomeUncertain,
+    PartialCompletion,
     AuthenticationFailed,
     HostKeyFailure,
     Unsupported,
@@ -258,6 +267,10 @@ pub enum ExplorerError {
     #[error("{0}")]
     Offline(String),
     #[error("{0}")]
+    OutcomeUncertain(String),
+    #[error("{0}")]
+    PartialCompletion(String),
+    #[error("{0}")]
     AuthenticationFailed(String),
     #[error("{0}")]
     HostKeyFailure(String),
@@ -294,6 +307,8 @@ impl From<ExplorerError> for ExplorerErrorDto {
                 _ => ExplorerErrorCode::Unexpected,
             },
             ExplorerError::Offline(_) => ExplorerErrorCode::Offline,
+            ExplorerError::OutcomeUncertain(_) => ExplorerErrorCode::OutcomeUncertain,
+            ExplorerError::PartialCompletion(_) => ExplorerErrorCode::PartialCompletion,
             ExplorerError::AuthenticationFailed(_) => ExplorerErrorCode::AuthenticationFailed,
             ExplorerError::HostKeyFailure(_) => ExplorerErrorCode::HostKeyFailure,
             ExplorerError::Unsupported(_) => ExplorerErrorCode::Unsupported,

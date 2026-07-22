@@ -5,9 +5,9 @@ packaged Tauri application provides local and SSH/SFTP navigation through
 Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
 bounded Quick Preview for local text, source, common raster-image, and PDF files.
-Local files, directories, and symlinks can be renamed through a capability-driven,
-cancellable Rust operation boundary; other mutations remain disabled while their
-safety and platform phases are implemented.
+Local and SSH files, directories, and symlinks can be renamed, moved within one
+backend location, and permanently deleted through a capability-driven,
+cancellable Rust operation boundary. Local entries also use native Trash.
 Saved SSH targets and concrete aliases from
 `~/.ssh/config` appear alongside local favorites. The browser-only Vite
 application retains deterministic local and remote demo assets for UI development
@@ -57,9 +57,10 @@ authoritative. See
 and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ssh-sftp-locations.md)
 for the authorization, trust, and credential-handling model.
 
-The SSH filesystem backend remains deliberately read-only, while the local
-backend currently exposes safe single-entry rename and same-location move,
-native Trash, and explicitly confirmed permanent deletion. SSH authentication
+The local backend exposes safe single-entry rename and same-location move,
+native Trash, and explicitly confirmed permanent deletion. Connected SFTP
+locations expose no-overwrite rename and same-location move plus explicitly
+confirmed permanent deletion; remote Trash remains unavailable. SSH authentication
 supports agents, standard or configured identity files, encrypted-key
 passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
 `known_hosts` files, requires confirmation for unknown keys, and blocks changed
@@ -71,7 +72,7 @@ folder without changing navigation history. Mounted local volumes are discovered
 in the Rust boundary and updated through native platform notifications with a
 bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
 target visibility persist as versioned local preferences. File watching,
-hidden-file controls, transfer-based move, remote mutations, remote content
+hidden-file controls, transfer-based move, remote content
 previews, and additional preview formats remain later vertical slices. See
 [`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
 and
@@ -103,7 +104,8 @@ for the limits, resource lifecycle, and security tradeoff.
 Rust integration tests start disposable loopback SSH/SFTP servers and cover host
 trust, supported authentication methods, secret-safe prompts and errors,
 permission and symlink behavior, missing SFTP, delayed-request cancellation,
-disconnect detection, and reconnect continuity. The disposable SSH-agent test is
+rename and move conflicts, bounded recursive deletion, partial and uncertain
+outcomes, disconnect detection, timeouts, and reconnect continuity. The disposable SSH-agent test is
 Unix-only; the Windows Pageant and named-pipe paths remain platform-gated code
 that require Windows validation.
 

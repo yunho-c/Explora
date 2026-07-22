@@ -205,6 +205,21 @@
         </div>
       {/if}
 
+      {#if state.fileOperations.activeAction && state.fileOperations.activeEntryName && state.fileOperations.progress && state.fileOperations.progress.totalItems > 1}
+        <div
+          class="mx-4 mt-4 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="font-medium">{state.fileOperations.activeAction}</span>
+          <span class="text-muted-foreground">
+            “{state.fileOperations.activeEntryName}” · {state.fileOperations
+              .progress.completedItems} of {state.fileOperations.progress
+              .totalItems} items
+          </span>
+        </div>
+      {/if}
+
       {#if !state.errorMessage && !state.loading && state.visibleEntries.length === 0}
         <div class="grid min-h-72 place-items-center p-8 text-center">
           <div>

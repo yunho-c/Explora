@@ -11,6 +11,10 @@ const SESSION_CONNECTING: u8 = 0;
 const SESSION_ACTIVE: u8 = 1;
 const SESSION_DISCONNECTING: u8 = 2;
 const SESSION_DISCONNECTED: u8 = 3;
+const MAX_REMOTE_NAME_BYTES: usize = 1_024;
+const MAX_REMOTE_DELETE_ENTRIES: usize = 100_000;
+const MAX_REMOTE_DELETE_DEPTH: usize = 256;
+const MAX_KEEP_BOTH_ATTEMPTS: usize = 10_000;
 
 use russh::{
     client::{self, AuthResult, DisconnectReason, Handle, KeyboardInteractiveAuthResponse},
@@ -19,7 +23,7 @@ use russh::{
 };
 use russh_sftp::{
     client::{error::Error as SftpError, SftpSession},
-    protocol::StatusCode,
+    protocol::{FileAttributes, StatusCode},
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -282,6 +286,28 @@ struct RemotePathRegistry {
 struct RemotePathRegistryInner {
     paths_by_id: HashMap<String, String>,
     ids_by_path: HashMap<String, String>,
+    fingerprints_by_id: HashMap<String, RemoteEntryFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteEntryFingerprint {
+    size: Option<u64>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    permissions: Option<u32>,
+    mtime: Option<u32>,
+}
+
+impl From<&FileAttributes> for RemoteEntryFingerprint {
+    fn from(metadata: &FileAttributes) -> Self {
+        Self {
+            size: metadata.size,
+            uid: metadata.uid,
+            gid: metadata.gid,
+            permissions: metadata.permissions,
+            mtime: metadata.mtime,
+        }
+    }
 }
 
 impl RemotePathRegistry {
@@ -308,6 +334,115 @@ impl RemotePathRegistry {
             .cloned()
             .ok_or(ExplorerError::InvalidReference)
     }
+
+    fn register_with_metadata(
+        &self,
+        path: String,
+        metadata: &FileAttributes,
+    ) -> Result<String, ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let id = if let Some(id) = inner.ids_by_path.get(&path) {
+            id.clone()
+        } else {
+            let id = Uuid::new_v4().to_string();
+            inner.paths_by_id.insert(id.clone(), path.clone());
+            inner.ids_by_path.insert(path, id.clone());
+            id
+        };
+        inner
+            .fingerprints_by_id
+            .insert(id.clone(), RemoteEntryFingerprint::from(metadata));
+        Ok(id)
+    }
+
+    fn resolve_for_mutation(
+        &self,
+        id: &str,
+    ) -> Result<(String, RemoteEntryFingerprint), ExplorerError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let path = inner
+            .paths_by_id
+            .get(id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let fingerprint = inner
+            .fingerprints_by_id
+            .get(id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        Ok((path, fingerprint))
+    }
+
+    fn rebase_subtree(&self, old_path: &str, new_path: &str) -> Result<Vec<String>, ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let rebased = inner
+            .paths_by_id
+            .iter()
+            .filter(|(_, path)| remote_is_same_or_descendant(path, old_path))
+            .map(|(id, path)| {
+                let suffix = path.strip_prefix(old_path).unwrap_or_default();
+                (id.clone(), path.clone(), format!("{new_path}{suffix}"))
+            })
+            .collect::<Vec<_>>();
+        let rebased_ids = rebased
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect::<Vec<_>>();
+
+        let stale_destination_ids = inner
+            .ids_by_path
+            .iter()
+            .filter_map(|(path, id)| {
+                (remote_is_same_or_descendant(path, new_path) && !rebased_ids.contains(id))
+                    .then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in stale_destination_ids {
+            if let Some(path) = inner.paths_by_id.remove(&id) {
+                inner.ids_by_path.remove(&path);
+            }
+            inner.fingerprints_by_id.remove(&id);
+        }
+
+        for (id, old_registered_path, new_registered_path) in rebased {
+            inner.ids_by_path.remove(&old_registered_path);
+            inner
+                .paths_by_id
+                .insert(id.clone(), new_registered_path.clone());
+            inner.ids_by_path.insert(new_registered_path, id);
+        }
+        Ok(rebased_ids)
+    }
+
+    fn invalidate_subtree(&self, removed_path: &str) -> Result<Vec<String>, ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let removed_ids = inner
+            .paths_by_id
+            .iter()
+            .filter_map(|(id, path)| {
+                remote_is_same_or_descendant(path, removed_path).then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in &removed_ids {
+            if let Some(path) = inner.paths_by_id.remove(id) {
+                inner.ids_by_path.remove(&path);
+            }
+            inner.fingerprints_by_id.remove(id);
+        }
+        Ok(removed_ids)
+    }
 }
 
 struct SshSession {
@@ -317,8 +452,36 @@ struct SshSession {
     paths: Arc<RemotePathRegistry>,
     handle: AsyncMutex<Handle<HostKeyHandler>>,
     sftp: Arc<SftpSession>,
+    mutation_guard: AsyncMutex<()>,
     lifecycle: Arc<AtomicU8>,
     events: Arc<Channel<SshConnectionEventDto>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteMoveConflictPolicy {
+    Fail,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedRemoteEntry {
+    pub entry: FileEntrySummaryDto,
+    pub source_parent: DirectoryRefDto,
+    pub destination: DirectoryRefDto,
+    pub rebased_entry_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedRemoteEntry {
+    pub reference: EntryRefDto,
+    pub name: String,
+    pub invalidated_entry_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RemoteDeleteItem {
+    path: String,
+    is_directory: bool,
 }
 
 impl SshSession {
@@ -358,12 +521,21 @@ impl SshSession {
         path: &str,
         name: Option<String>,
     ) -> Result<DirectoryRefDto, ExplorerError> {
+        self.directory_ref_with_capabilities(path, name, DirectoryCapabilitiesDto::SFTP)
+    }
+
+    fn directory_ref_with_capabilities(
+        &self,
+        path: &str,
+        name: Option<String>,
+        capabilities: DirectoryCapabilitiesDto,
+    ) -> Result<DirectoryRefDto, ExplorerError> {
         Ok(DirectoryRefDto {
             id: self.paths.register(path.to_owned())?,
             location_id: self.location_id.clone(),
             name: name.unwrap_or_else(|| remote_name(path)),
             display_path: format!("{}:{path}", self.target.name),
-            capabilities: DirectoryCapabilitiesDto::READ_ONLY,
+            capabilities,
         })
     }
 
@@ -378,7 +550,21 @@ impl SshSession {
     {
         ensure_not_cancelled(cancelled)?;
         let path = self.paths.resolve(directory_id)?;
-        let directory = self.directory_ref(&path, None)?;
+        let directory_metadata = tokio::select! {
+            metadata = self.sftp.symlink_metadata(path.clone()) => metadata.map_err(map_sftp_error)?,
+            () = wait_for_cancellation(cancelled) => return Err(ExplorerError::Cancelled),
+        };
+        self.paths
+            .register_with_metadata(path.clone(), &directory_metadata)?;
+        let directory = self.directory_ref_with_capabilities(
+            &path,
+            None,
+            if directory_metadata.is_symlink() {
+                DirectoryCapabilitiesDto::READ_ONLY
+            } else {
+                DirectoryCapabilitiesDto::SFTP
+            },
+        )?;
         let parent = remote_parent(&path)
             .map(|parent| self.directory_ref(&parent, None))
             .transpose()?;
@@ -395,10 +581,15 @@ impl SshSession {
         };
         let mut batch = Vec::with_capacity(LISTING_BATCH_SIZE);
         let mut first_batch = true;
+        let mut skipped_entries = 0;
         for entry in read_dir {
             ensure_not_cancelled(cancelled)?;
             let name = entry.file_name();
-            let entry_path = entry.path();
+            if validate_remote_name(&name).is_err() {
+                skipped_entries += 1;
+                continue;
+            }
+            let entry_path = remote_join(&path, &name);
             let metadata = entry.metadata();
             let is_symlink = metadata.is_symlink();
             let is_directory = if is_symlink {
@@ -422,12 +613,25 @@ impl SshSession {
             } else {
                 "other"
             };
+            let entry_id = self
+                .paths
+                .register_with_metadata(entry_path.clone(), &metadata)?;
             let directory = is_directory
-                .then(|| self.directory_ref(&entry_path, Some(name.clone())))
+                .then(|| {
+                    self.directory_ref_with_capabilities(
+                        &entry_path,
+                        Some(name.clone()),
+                        if is_symlink {
+                            DirectoryCapabilitiesDto::READ_ONLY
+                        } else {
+                            DirectoryCapabilitiesDto::SFTP
+                        },
+                    )
+                })
                 .transpose()?;
             batch.push(FileEntrySummaryDto {
                 reference: EntryRefDto {
-                    id: self.paths.register(entry_path.clone())?,
+                    id: entry_id,
                     location_id: self.location_id.clone(),
                 },
                 name: name.clone(),
@@ -438,7 +642,7 @@ impl SshSession {
                 display_path: format!("{}:{entry_path}", self.target.name),
                 directory,
                 detail: None,
-                capabilities: EntryCapabilitiesDto::READ_ONLY,
+                capabilities: EntryCapabilitiesDto::SFTP,
             });
             if batch.len() == LISTING_BATCH_SIZE {
                 emit(DirectoryListingEvent::Entries {
@@ -454,7 +658,423 @@ impl SshSession {
                 replace: first_batch,
             })?;
         }
-        emit(DirectoryListingEvent::Complete { skipped_entries: 0 })
+        emit(DirectoryListingEvent::Complete { skipped_entries })
+    }
+
+    async fn rename_entry(
+        &self,
+        source: &EntryRefDto,
+        new_name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        validate_remote_name(new_name)?;
+        let _guard = self.mutation_guard.lock().await;
+        ensure_not_cancelled(cancelled)?;
+        let (source_path, _) = self.revalidate_source(source).await?;
+        let parent_path = remote_parent(&source_path).ok_or(ExplorerError::InvalidReference)?;
+        let destination_path = remote_join(&parent_path, new_name);
+        if destination_path == source_path {
+            return self.summary_for_registered_path(&source_path).await;
+        }
+        self.ensure_remote_destination_absent(&destination_path)
+            .await?;
+        ensure_not_cancelled(cancelled)?;
+        self.rename_no_replace(&source_path, &destination_path)
+            .await?;
+        self.paths.rebase_subtree(&source_path, &destination_path)?;
+        self.summary_for_registered_path(&destination_path).await
+    }
+
+    async fn move_entry(
+        &self,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: RemoteMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<MovedRemoteEntry, ExplorerError> {
+        if destination.location_id != self.location_id {
+            return Err(ExplorerError::DestinationUnavailable(
+                "Moving between locations requires a verified transfer.".to_owned(),
+            ));
+        }
+        let _guard = self.mutation_guard.lock().await;
+        ensure_not_cancelled(cancelled)?;
+        let (source_path, source_metadata) = self.revalidate_source(source).await?;
+        let source_parent_path =
+            remote_parent(&source_path).ok_or(ExplorerError::InvalidReference)?;
+        let destination_path = self.revalidate_directory(destination).await?;
+        if source_parent_path == destination_path {
+            let entry = self.summary_for_registered_path(&source_path).await?;
+            return Ok(MovedRemoteEntry {
+                entry,
+                source_parent: self.directory_ref(&source_parent_path, None)?,
+                destination: self.directory_ref(&destination_path, None)?,
+                rebased_entry_ids: vec![source.id.clone()],
+            });
+        }
+        if source_metadata.is_dir() && remote_is_same_or_descendant(&destination_path, &source_path)
+        {
+            return Err(ExplorerError::DestinationUnavailable(
+                "A folder cannot be moved into itself or one of its subfolders.".to_owned(),
+            ));
+        }
+
+        let original_name = remote_name(&source_path);
+        let destination_entry_path = match conflict_policy {
+            RemoteMoveConflictPolicy::Fail => {
+                let path = remote_join(&destination_path, &original_name);
+                self.ensure_remote_destination_absent(&path).await?;
+                ensure_not_cancelled(cancelled)?;
+                self.rename_no_replace(&source_path, &path).await?;
+                path
+            }
+            RemoteMoveConflictPolicy::KeepBoth => {
+                let mut moved_path = None;
+                for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+                    let candidate =
+                        remote_keep_both_name(&original_name, source_metadata.is_dir(), attempt)?;
+                    let path = remote_join(&destination_path, &candidate);
+                    match self.ensure_remote_destination_absent(&path).await {
+                        Ok(()) => {}
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                    ensure_not_cancelled(cancelled)?;
+                    match self.rename_no_replace(&source_path, &path).await {
+                        Ok(()) => {
+                            moved_path = Some(path);
+                            break;
+                        }
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                moved_path.ok_or(ExplorerError::Conflict)?
+            }
+        };
+        let rebased_entry_ids = self
+            .paths
+            .rebase_subtree(&source_path, &destination_entry_path)?;
+        let entry = self
+            .summary_for_registered_path(&destination_entry_path)
+            .await?;
+        Ok(MovedRemoteEntry {
+            entry,
+            source_parent: self.directory_ref(&source_parent_path, None)?,
+            destination: self.directory_ref(&destination_path, None)?,
+            rebased_entry_ids,
+        })
+    }
+
+    async fn describe_move_conflict(
+        &self,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let _guard = self.mutation_guard.lock().await;
+        let (source_path, _) = self.revalidate_source(source).await?;
+        let destination_path = self.revalidate_directory(destination).await?;
+        Ok((remote_name(&source_path), remote_name(&destination_path)))
+    }
+
+    async fn describe_operation_target(
+        &self,
+        source: &EntryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let _guard = self.mutation_guard.lock().await;
+        let (source_path, _) = self.revalidate_source(source).await?;
+        Ok((
+            remote_name(&source_path),
+            format!("{} ({})", self.target.name, endpoint(&self.target)),
+        ))
+    }
+
+    async fn permanently_delete_entry<F>(
+        &self,
+        source: &EntryRefDto,
+        cancelled: &AtomicBool,
+        mut on_progress: F,
+    ) -> Result<RemovedRemoteEntry, ExplorerError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ExplorerError>,
+    {
+        let _guard = self.mutation_guard.lock().await;
+        ensure_not_cancelled(cancelled)?;
+        let (source_path, _) = self.revalidate_source(source).await?;
+        let name = remote_name(&source_path);
+        let plan = self.plan_remote_delete(&source_path, cancelled).await?;
+        let total_items = u64::try_from(plan.len()).map_err(|_| {
+            ExplorerError::InvalidConfiguration(
+                "The remote deletion contains too many entries.".to_owned(),
+            )
+        })?;
+        on_progress(0, total_items)?;
+        ensure_not_cancelled(cancelled)?;
+
+        let mut completed = 0_u64;
+        let mut invalidated_entry_ids = Vec::new();
+        for item in plan {
+            let result = if item.is_directory {
+                self.sftp.remove_dir(item.path.clone()).await
+            } else {
+                self.sftp.remove_file(item.path.clone()).await
+            };
+            if let Err(error) = result {
+                return Err(self.remote_delete_error(error, completed));
+            }
+            completed = completed.saturating_add(1);
+            if let Ok(ids) = self.paths.invalidate_subtree(&item.path) {
+                invalidated_entry_ids.extend(ids);
+            }
+            let _ = on_progress(completed, total_items);
+        }
+
+        invalidated_entry_ids.extend(self.paths.invalidate_subtree(&source_path)?);
+        if !invalidated_entry_ids.iter().any(|id| id == &source.id) {
+            invalidated_entry_ids.push(source.id.clone());
+        }
+        invalidated_entry_ids.sort();
+        invalidated_entry_ids.dedup();
+        Ok(RemovedRemoteEntry {
+            reference: source.clone(),
+            name,
+            invalidated_entry_ids,
+        })
+    }
+
+    async fn revalidate_source(
+        &self,
+        source: &EntryRefDto,
+    ) -> Result<(String, FileAttributes), ExplorerError> {
+        if source.location_id != self.location_id || source.id == self.root.id {
+            return Err(ExplorerError::InvalidReference);
+        }
+        let (path, expected) = self.paths.resolve_for_mutation(&source.id)?;
+        let metadata = match self.sftp.symlink_metadata(path.clone()).await {
+            Ok(metadata) => metadata,
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                return Err(ExplorerError::SourceChanged);
+            }
+            Err(error) => return Err(map_sftp_error(error)),
+        };
+        if RemoteEntryFingerprint::from(&metadata) != expected {
+            return Err(ExplorerError::SourceChanged);
+        }
+        Ok((path, metadata))
+    }
+
+    async fn revalidate_directory(
+        &self,
+        destination: &DirectoryRefDto,
+    ) -> Result<String, ExplorerError> {
+        if destination.location_id != self.location_id {
+            return Err(ExplorerError::InvalidReference);
+        }
+        let (path, expected) = self.paths.resolve_for_mutation(&destination.id)?;
+        let metadata = self
+            .sftp
+            .symlink_metadata(path.clone())
+            .await
+            .map_err(map_sftp_error)?;
+        if RemoteEntryFingerprint::from(&metadata) != expected {
+            return Err(ExplorerError::SourceChanged);
+        }
+        if metadata.is_symlink() || !metadata.is_dir() {
+            return Err(ExplorerError::DestinationUnavailable(
+                "The destination is not an available folder.".to_owned(),
+            ));
+        }
+        Ok(path)
+    }
+
+    async fn ensure_remote_destination_absent(&self, path: &str) -> Result<(), ExplorerError> {
+        match self.sftp.symlink_metadata(path.to_owned()).await {
+            Ok(_) => Err(ExplorerError::Conflict),
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                Ok(())
+            }
+            Err(error) => Err(map_sftp_error(error)),
+        }
+    }
+
+    async fn rename_no_replace(
+        &self,
+        source_path: &str,
+        destination_path: &str,
+    ) -> Result<(), ExplorerError> {
+        match self
+            .sftp
+            .rename(source_path.to_owned(), destination_path.to_owned())
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) if is_sftp_connectivity_error(&error) => {
+                self.mark_offline();
+                Err(ExplorerError::OutcomeUncertain(
+                    "The SSH connection was lost during the remote rename. Reconnect and refresh before trying another action.".to_owned(),
+                ))
+            }
+            Err(error) => {
+                let source_exists = self
+                    .sftp
+                    .symlink_metadata(source_path.to_owned())
+                    .await
+                    .is_ok();
+                let destination_exists = self
+                    .sftp
+                    .symlink_metadata(destination_path.to_owned())
+                    .await
+                    .is_ok();
+                if source_exists && destination_exists {
+                    Err(ExplorerError::Conflict)
+                } else if !source_exists {
+                    Err(ExplorerError::OutcomeUncertain(
+                        "The server did not confirm the remote rename. Refresh the location before trying another action.".to_owned(),
+                    ))
+                } else {
+                    Err(map_sftp_error(error))
+                }
+            }
+        }
+    }
+
+    async fn summary_for_registered_path(
+        &self,
+        path: &str,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        let metadata = self
+            .sftp
+            .symlink_metadata(path.to_owned())
+            .await
+            .map_err(map_sftp_error)?;
+        let is_symlink = metadata.is_symlink();
+        let is_directory = if is_symlink {
+            self.sftp
+                .metadata(path.to_owned())
+                .await
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        } else {
+            metadata.is_dir()
+        };
+        let name = remote_name(path);
+        let id = self
+            .paths
+            .register_with_metadata(path.to_owned(), &metadata)?;
+        Ok(FileEntrySummaryDto {
+            reference: EntryRefDto {
+                id,
+                location_id: self.location_id.clone(),
+            },
+            name: name.clone(),
+            kind: if is_symlink {
+                "symlink"
+            } else if is_directory {
+                "directory"
+            } else if metadata.is_regular() {
+                "file"
+            } else {
+                "other"
+            },
+            content_kind: content_kind(&name, is_directory),
+            size: (!is_directory).then(|| metadata.size.unwrap_or(0).to_string()),
+            modified_at: metadata.mtime.map(|seconds| u64::from(seconds) * 1000),
+            display_path: format!("{}:{path}", self.target.name),
+            directory: is_directory
+                .then(|| {
+                    self.directory_ref_with_capabilities(
+                        path,
+                        Some(name),
+                        if is_symlink {
+                            DirectoryCapabilitiesDto::READ_ONLY
+                        } else {
+                            DirectoryCapabilitiesDto::SFTP
+                        },
+                    )
+                })
+                .transpose()?,
+            detail: None,
+            capabilities: EntryCapabilitiesDto::SFTP,
+        })
+    }
+
+    async fn plan_remote_delete(
+        &self,
+        source_path: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<RemoteDeleteItem>, ExplorerError> {
+        let mut plan = Vec::new();
+        let mut stack = vec![(source_path.to_owned(), 0_usize, false)];
+        while let Some((path, depth, visited)) = stack.pop() {
+            ensure_not_cancelled(cancelled)?;
+            if depth > MAX_REMOTE_DELETE_DEPTH
+                || plan.len() + stack.len() >= MAX_REMOTE_DELETE_ENTRIES
+            {
+                return Err(ExplorerError::InvalidConfiguration(
+                    "The remote directory is too large or deeply nested to delete safely in one operation.".to_owned(),
+                ));
+            }
+            let metadata = self
+                .sftp
+                .symlink_metadata(path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            if metadata.is_dir() && !metadata.is_symlink() {
+                if visited {
+                    plan.push(RemoteDeleteItem {
+                        path,
+                        is_directory: true,
+                    });
+                } else {
+                    stack.push((path.clone(), depth, true));
+                    let entries = self
+                        .sftp
+                        .read_dir(path.clone())
+                        .await
+                        .map_err(map_sftp_error)?;
+                    for entry in entries.collect::<Vec<_>>().into_iter().rev() {
+                        let name = entry.file_name();
+                        validate_remote_name(&name).map_err(|_| {
+                            ExplorerError::Unexpected(
+                                "The SFTP server returned an invalid directory entry name."
+                                    .to_owned(),
+                            )
+                        })?;
+                        stack.push((remote_join(&path, &name), depth.saturating_add(1), false));
+                    }
+                }
+            } else {
+                plan.push(RemoteDeleteItem {
+                    path,
+                    is_directory: false,
+                });
+            }
+        }
+        if plan.is_empty() {
+            return Err(ExplorerError::SourceChanged);
+        }
+        Ok(plan)
+    }
+
+    fn remote_delete_error(&self, error: SftpError, completed: u64) -> ExplorerError {
+        if is_sftp_connectivity_error(&error) {
+            self.mark_offline();
+            if completed == 0 {
+                ExplorerError::OutcomeUncertain(
+                    "The SSH connection was lost during permanent deletion. Reconnect and refresh to inspect the actual state.".to_owned(),
+                )
+            } else {
+                ExplorerError::PartialCompletion(
+                    "The SSH connection was lost after part of the remote deletion completed. Reconnect and refresh; Explora will not retry automatically.".to_owned(),
+                )
+            }
+        } else if completed > 0 {
+            ExplorerError::PartialCompletion(
+                "Part of the remote directory was deleted before the server rejected the operation. Refresh to inspect what remains.".to_owned(),
+            )
+        } else {
+            map_sftp_error(error)
+        }
     }
 }
 
@@ -664,12 +1284,16 @@ impl SshConnectionManager {
                 .or_insert_with(|| Arc::new(RemotePathRegistry::default()))
                 .clone()
         };
+        let root_metadata = sftp
+            .symlink_metadata(initial_path.clone())
+            .await
+            .map_err(map_sftp_error)?;
         let root = DirectoryRefDto {
-            id: paths.register(initial_path.clone())?,
+            id: paths.register_with_metadata(initial_path.clone(), &root_metadata)?,
             location_id: location_id.clone(),
             name: target.name.clone(),
             display_path: format!("{}:{initial_path}", target.name),
-            capabilities: DirectoryCapabilitiesDto::READ_ONLY,
+            capabilities: DirectoryCapabilitiesDto::SFTP,
         };
         let target_id = target.id.clone();
         let session = Arc::new(SshSession {
@@ -679,6 +1303,7 @@ impl SshConnectionManager {
             paths,
             handle: AsyncMutex::new(handle),
             sftp,
+            mutation_guard: AsyncMutex::new(()),
             lifecycle: lifecycle.clone(),
             events: events.clone(),
         });
@@ -965,6 +1590,93 @@ impl SshConnectionManager {
         }
         result
     }
+
+    pub async fn rename_entry(
+        &self,
+        source: &EntryRefDto,
+        new_name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        let session = self.active_session(&source.location_id)?;
+        let result = session.rename_entry(source, new_name, cancelled).await;
+        finish_remote_result(&session, result)
+    }
+
+    pub async fn move_entry(
+        &self,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: RemoteMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<MovedRemoteEntry, ExplorerError> {
+        let session = self.active_session(&source.location_id)?;
+        let result = session
+            .move_entry(source, destination, conflict_policy, cancelled)
+            .await;
+        finish_remote_result(&session, result)
+    }
+
+    pub async fn describe_move_conflict(
+        &self,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let session = self.active_session(&source.location_id)?;
+        let result = session.describe_move_conflict(source, destination).await;
+        finish_remote_result(&session, result)
+    }
+
+    pub async fn describe_operation_target(
+        &self,
+        source: &EntryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let session = self.active_session(&source.location_id)?;
+        let result = session.describe_operation_target(source).await;
+        finish_remote_result(&session, result)
+    }
+
+    pub async fn permanently_delete_entry<F>(
+        &self,
+        source: &EntryRefDto,
+        cancelled: &AtomicBool,
+        on_progress: F,
+    ) -> Result<RemovedRemoteEntry, ExplorerError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ExplorerError>,
+    {
+        let session = self.active_session(&source.location_id)?;
+        let result = session
+            .permanently_delete_entry(source, cancelled, on_progress)
+            .await;
+        finish_remote_result(&session, result)
+    }
+
+    fn active_session(&self, location_id: &str) -> Result<Arc<SshSession>, ExplorerError> {
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .values()
+            .find(|session| session.location_id == location_id)
+            .cloned()
+            .ok_or_else(|| ExplorerError::Offline("This SSH target is disconnected.".to_owned()))?;
+        if session.lifecycle.load(Ordering::SeqCst) != SESSION_ACTIVE {
+            return Err(ExplorerError::Offline(
+                "This SSH target is disconnected.".to_owned(),
+            ));
+        }
+        Ok(session)
+    }
+}
+
+fn finish_remote_result<T>(
+    session: &SshSession,
+    result: Result<T, ExplorerError>,
+) -> Result<T, ExplorerError> {
+    if matches!(result, Err(ExplorerError::Offline(_))) {
+        session.mark_offline();
+    }
+    result
 }
 
 fn require_answers(
@@ -1099,6 +1811,94 @@ fn map_sftp_error(error: SftpError) -> ExplorerError {
         }
         other => ExplorerError::Unexpected(format!("The SFTP request failed: {other}")),
     }
+}
+
+fn is_sftp_connectivity_error(error: &SftpError) -> bool {
+    matches!(
+        error,
+        SftpError::Timeout | SftpError::IO(_) | SftpError::UnexpectedBehavior(_)
+    ) || matches!(
+        error,
+        SftpError::Status(status)
+            if matches!(
+                status.status_code,
+                StatusCode::NoConnection | StatusCode::ConnectionLost
+            )
+    )
+}
+
+fn validate_remote_name(name: &str) -> Result<(), ExplorerError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_REMOTE_NAME_BYTES
+        || name.contains('/')
+        || name.contains('\0')
+    {
+        return Err(ExplorerError::InvalidName(format!(
+            "Enter a remote file name between 1 and {MAX_REMOTE_NAME_BYTES} bytes without ‘/’ or a null character."
+        )));
+    }
+    Ok(())
+}
+
+fn remote_join(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else {
+        format!("{}/{name}", parent.trim_end_matches('/'))
+    }
+}
+
+fn remote_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || (ancestor == "/" && path.starts_with('/'))
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn remote_keep_both_name(
+    original_name: &str,
+    is_directory: bool,
+    attempt: usize,
+) -> Result<String, ExplorerError> {
+    let suffix = if attempt == 1 {
+        " copy".to_owned()
+    } else {
+        format!(" copy {attempt}")
+    };
+    let extension_index = (!is_directory)
+        .then(|| original_name.rfind('.'))
+        .flatten()
+        .filter(|index| *index > 0);
+    let (stem, extension) = extension_index
+        .map(|index| original_name.split_at(index))
+        .unwrap_or((original_name, ""));
+    let extension = truncate_utf8(extension, MAX_REMOTE_NAME_BYTES / 2);
+    let stem_capacity = MAX_REMOTE_NAME_BYTES
+        .saturating_sub(suffix.len())
+        .saturating_sub(extension.len());
+    let stem = truncate_utf8(stem, stem_capacity);
+    let candidate = format!(
+        "{}{}{}",
+        if stem.is_empty() { "item" } else { stem },
+        suffix,
+        extension
+    );
+    validate_remote_name(&candidate)?;
+    Ok(candidate)
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &value[..boundary]
 }
 
 fn remote_parent(path: &str) -> Option<String> {
@@ -1381,6 +2181,75 @@ mod tests {
             second.resolve(&reference),
             Err(ExplorerError::InvalidReference)
         ));
+    }
+
+    #[test]
+    fn remote_path_registry_rebases_and_invalidates_only_complete_subtrees() {
+        let registry = RemotePathRegistry::default();
+        let metadata = FileAttributes {
+            size: Some(12),
+            ..FileAttributes::empty()
+        };
+        let mut directory_metadata = FileAttributes::empty();
+        directory_metadata.set_dir(true);
+        let root = registry
+            .register_with_metadata("/projects".to_owned(), &directory_metadata)
+            .expect("project reference");
+        let child = registry
+            .register_with_metadata("/projects/notes.txt".to_owned(), &metadata)
+            .expect("child reference");
+        let sibling_prefix = registry
+            .register_with_metadata("/projects-old/notes.txt".to_owned(), &metadata)
+            .expect("prefix sibling reference");
+
+        let mut rebased = registry
+            .rebase_subtree("/projects", "/archive/projects")
+            .expect("rebase subtree");
+        rebased.sort();
+        let mut expected = vec![root.clone(), child.clone()];
+        expected.sort();
+        assert_eq!(rebased, expected);
+        assert_eq!(
+            registry.resolve(&child).expect("rebased child"),
+            "/archive/projects/notes.txt"
+        );
+        assert_eq!(
+            registry.resolve(&sibling_prefix).expect("prefix sibling"),
+            "/projects-old/notes.txt"
+        );
+
+        let removed = registry
+            .invalidate_subtree("/archive/projects")
+            .expect("invalidate subtree");
+        assert_eq!(removed.len(), 2);
+        assert!(matches!(
+            registry.resolve(&child),
+            Err(ExplorerError::InvalidReference)
+        ));
+        assert!(registry.resolve(&sibling_prefix).is_ok());
+    }
+
+    #[test]
+    fn remote_names_reject_traversal_and_keep_both_respects_the_byte_bound() {
+        for invalid in ["", ".", "..", "nested/name", "nul\0name"] {
+            assert!(matches!(
+                validate_remote_name(invalid),
+                Err(ExplorerError::InvalidName(_))
+            ));
+        }
+        let oversized = "é".repeat(MAX_REMOTE_NAME_BYTES / 2 + 1);
+        assert!(matches!(
+            validate_remote_name(&oversized),
+            Err(ExplorerError::InvalidName(_))
+        ));
+
+        let original = format!("{}.tar.gz", "文".repeat(MAX_REMOTE_NAME_BYTES));
+        let candidate =
+            remote_keep_both_name(&original, false, 2).expect("bounded UTF-8 keep-both name");
+        assert!(candidate.len() <= MAX_REMOTE_NAME_BYTES);
+        assert!(candidate.ends_with(".gz"));
+        assert!(candidate.contains(" copy 2"));
+        assert!(validate_remote_name(&candidate).is_ok());
     }
 
     #[test]
@@ -1686,6 +2555,295 @@ mod tests {
             .await
             .expect("disconnect");
         challenge_server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_sftp_rename_move_and_conflict_preserve_remote_entries_and_identity() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "mutations", answers);
+        let location = manager
+            .connect(target, "mutations".to_owned(), channel)
+            .await
+            .expect("connect to mutable SFTP fixture");
+        assert_eq!(location.root.capabilities, DirectoryCapabilitiesDto::SFTP);
+
+        let root_events = listing_events(&manager, &location.id, &location.root.id)
+            .await
+            .expect("list remote root");
+        let root_entries = listed_entries(&root_events);
+        let readme = root_entries
+            .iter()
+            .find(|entry| entry.name == "README.md")
+            .expect("README entry")
+            .clone();
+        let projects = root_entries
+            .iter()
+            .find(|entry| entry.name == "projects")
+            .and_then(|entry| entry.directory.clone())
+            .expect("projects directory");
+        assert_eq!(readme.capabilities, EntryCapabilitiesDto::SFTP);
+
+        let renamed = manager
+            .rename_entry(&readme.reference, "notes.txt", &AtomicBool::new(false))
+            .await
+            .expect("rename remote file");
+        assert_eq!(renamed.reference.id, readme.reference.id);
+        assert!(server.path_exists("/notes.txt").await);
+        assert!(!server.path_exists("/README.md").await);
+
+        let project_events = listing_events(&manager, &location.id, &projects.id)
+            .await
+            .expect("list projects");
+        let project_note = listed_entries(&project_events)
+            .into_iter()
+            .find(|entry| entry.name == "notes.txt")
+            .expect("project note");
+        assert!(matches!(
+            manager
+                .move_entry(
+                    &project_note.reference,
+                    &location.root,
+                    RemoteMoveConflictPolicy::Fail,
+                    &AtomicBool::new(false),
+                )
+                .await,
+            Err(ExplorerError::Conflict)
+        ));
+        let moved = manager
+            .move_entry(
+                &project_note.reference,
+                &location.root,
+                RemoteMoveConflictPolicy::KeepBoth,
+                &AtomicBool::new(false),
+            )
+            .await
+            .expect("keep both on remote conflict");
+        assert_eq!(moved.entry.reference.id, project_note.reference.id);
+        assert_eq!(moved.entry.name, "notes copy.txt");
+        assert!(server.path_exists("/notes.txt").await);
+        assert!(server.path_exists("/notes copy.txt").await);
+        assert!(!server.path_exists("/projects/notes.txt").await);
+
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_sftp_recursive_delete_is_bounded_symlink_safe_and_permission_aware() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "delete", answers);
+        let location = manager
+            .connect(target, "delete".to_owned(), channel)
+            .await
+            .expect("connect to mutable SFTP fixture");
+        let root_entries = listed_entries(
+            &listing_events(&manager, &location.id, &location.root.id)
+                .await
+                .expect("list remote root"),
+        );
+        let symlink = root_entries
+            .iter()
+            .find(|entry| entry.name == "project-link")
+            .expect("symlink")
+            .clone();
+        let projects = root_entries
+            .iter()
+            .find(|entry| entry.name == "projects")
+            .expect("projects")
+            .clone();
+        let locked = root_entries
+            .iter()
+            .find(|entry| entry.name == "locked.txt")
+            .expect("locked file")
+            .clone();
+        let partial = root_entries
+            .iter()
+            .find(|entry| entry.name == "partial")
+            .expect("partially removable directory")
+            .clone();
+
+        manager
+            .permanently_delete_entry(&symlink.reference, &AtomicBool::new(false), |_, _| Ok(()))
+            .await
+            .expect("delete symlink entry");
+        assert!(!server.path_exists("/project-link").await);
+        assert!(server.path_exists("/projects/notes.txt").await);
+
+        let progress = Arc::new(Mutex::new(Vec::new()));
+        let captured_progress = progress.clone();
+        let removed = manager
+            .permanently_delete_entry(
+                &projects.reference,
+                &AtomicBool::new(false),
+                move |completed, total| {
+                    captured_progress
+                        .lock()
+                        .map_err(|_| ExplorerError::StateUnavailable)?
+                        .push((completed, total));
+                    Ok(())
+                },
+            )
+            .await
+            .expect("delete remote directory recursively");
+        assert!(removed
+            .invalidated_entry_ids
+            .contains(&projects.reference.id));
+        assert!(!server.path_exists("/projects").await);
+        assert_eq!(
+            progress.lock().expect("progress").last().copied(),
+            Some((3, 3))
+        );
+
+        let error = manager
+            .permanently_delete_entry(&locked.reference, &AtomicBool::new(false), |_, _| Ok(()))
+            .await
+            .expect_err("permission denied delete");
+        assert!(matches!(
+            error,
+            ExplorerError::Io {
+                kind: std::io::ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert!(server.path_exists("/locked.txt").await);
+
+        let partial_error = manager
+            .permanently_delete_entry(&partial.reference, &AtomicBool::new(false), |_, _| Ok(()))
+            .await
+            .expect_err("partial deletion must be reported precisely");
+        assert!(matches!(partial_error, ExplorerError::PartialCompletion(_)));
+        assert!(!server.path_exists("/partial/a.txt").await);
+        assert!(server.path_exists("/partial/locked.txt").await);
+        assert!(server.path_exists("/partial").await);
+
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_during_remote_mutation_reports_uncertain_without_retrying() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(500),
+        )
+        .await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "uncertain", answers);
+        let location = manager
+            .connect(target, "uncertain".to_owned(), channel)
+            .await
+            .expect("connect to delayed SFTP fixture");
+        let readme = listed_entries(
+            &listing_events(&manager, &location.id, &location.root.id)
+                .await
+                .expect("list remote root"),
+        )
+        .into_iter()
+        .find(|entry| entry.name == "README.md")
+        .expect("README entry");
+        manager
+            .active_session(&location.id)
+            .expect("active session")
+            .sftp
+            .set_timeout(1);
+
+        let mutation_manager = manager.clone();
+        let mutation = tokio::spawn(async move {
+            mutation_manager
+                .rename_entry(
+                    &readme.reference,
+                    "renamed-after-drop.md",
+                    &AtomicBool::new(false),
+                )
+                .await
+        });
+        server.wait_for_mutation().await;
+        server.disconnect_clients().await;
+        let error = mutation
+            .await
+            .expect("mutation task")
+            .expect_err("disconnect must make outcome uncertain");
+        assert!(matches!(error, ExplorerError::OutcomeUncertain(_)));
+        assert!(manager.locations().is_empty());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            server.path_exists("/README.md").await
+                || server.path_exists("/renamed-after-drop.md").await
+        );
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_during_remote_mutation_reports_uncertain_and_marks_the_session_offline() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(1_500),
+        )
+        .await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (channel, _) = event_channel(manager.clone(), "timeout", answers);
+        let location = manager
+            .connect(target, "timeout".to_owned(), channel)
+            .await
+            .expect("connect to delayed SFTP fixture");
+        let readme = listed_entries(
+            &listing_events(&manager, &location.id, &location.root.id)
+                .await
+                .expect("list remote root"),
+        )
+        .into_iter()
+        .find(|entry| entry.name == "README.md")
+        .expect("README entry");
+        manager
+            .active_session(&location.id)
+            .expect("active session")
+            .sftp
+            .set_timeout(1);
+
+        let error = manager
+            .rename_entry(
+                &readme.reference,
+                "renamed-after-timeout.md",
+                &AtomicBool::new(false),
+            )
+            .await
+            .expect_err("timeout must make outcome uncertain");
+        assert!(matches!(error, ExplorerError::OutcomeUncertain(_)));
+        assert!(manager.locations().is_empty());
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            server.path_exists("/README.md").await
+                || server.path_exists("/renamed-after-timeout.md").await
+        );
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
