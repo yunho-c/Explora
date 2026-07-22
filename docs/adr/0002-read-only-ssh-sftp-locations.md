@@ -1,6 +1,6 @@
 # ADR 0002: Add SSH targets through a read-only SFTP backend
 
-- Status: Accepted
+- Status: Superseded in part by ADR 0009
 - Date: 2026-07-18
 
 ## Context
@@ -8,8 +8,10 @@
 Explora treats remote computers as first-class file locations rather than as a
 separate SSH client. The first remote slice needs useful OpenSSH compatibility,
 safe host trust, ephemeral authentication, cancellable connection work, and the
-same navigation contract as local folders. It must not expose a shell or turn
-displayed remote paths into authoritative IPC input.
+same navigation contract as local folders. This slice did not expose a shell and
+must not turn displayed remote paths into authoritative IPC input. ADR 0009 later
+adds an explicit, session-scoped terminal channel without changing this SFTP
+filesystem boundary.
 
 ## Decision
 
