@@ -865,6 +865,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         sourceParent,
         destination,
         rebasedEntryIds: [entry.reference.id],
+        invalidatedEntryIds: [],
       };
     }
 
@@ -931,6 +932,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       sourceParent,
       destination,
       rebasedEntryIds: [entry.reference.id],
+      invalidatedEntryIds: [],
     };
   }
 

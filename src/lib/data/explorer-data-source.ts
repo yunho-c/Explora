@@ -73,6 +73,8 @@ export interface FileOperationOptions {
 export interface FileOperationProgress {
   completedItems: number;
   totalItems: number;
+  completedBytes: string | null;
+  totalBytes: string | null;
 }
 
 export type RemoveEntryOptions = FileOperationOptions;

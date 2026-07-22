@@ -1058,17 +1058,24 @@ export class ExplorerState {
     const activeDirectory = this.activeDirectory;
     const activeTab = this.activeTab;
     const rebased = new SvelteSet(result.rebasedEntryIds);
+    const invalidated = new SvelteSet(result.invalidatedEntryIds);
     const sourceIndex = this.visibleEntries.findIndex(
-      ({ reference }) => reference.id === result.entry.reference.id,
+      ({ reference }) =>
+        reference.id === result.entry.reference.id ||
+        invalidated.has(reference.id),
     );
     const sourceRemaining = this.visibleEntries.filter(
-      ({ reference }) => reference.id !== result.entry.reference.id,
+      ({ reference }) =>
+        reference.id !== result.entry.reference.id &&
+        !invalidated.has(reference.id),
     );
     let desiredSelection = this.selectedEntryId;
 
     if (activeDirectory?.id === result.sourceParent.id) {
       this.entries = this.entries.filter(
-        ({ reference }) => reference.id !== result.entry.reference.id,
+        ({ reference }) =>
+          reference.id !== result.entry.reference.id &&
+          !invalidated.has(reference.id),
       );
       desiredSelection =
         sourceRemaining[
@@ -1085,7 +1092,9 @@ export class ExplorerState {
     }
 
     this.replaceKnownDirectoryReference(result.entry);
-    if (this.preview?.entryId === result.entry.reference.id) {
+    if (this.preview && invalidated.has(this.preview.entryId)) {
+      this.closePreview();
+    } else if (this.preview?.entryId === result.entry.reference.id) {
       this.preview = {
         ...this.preview,
         title: result.entry.name,

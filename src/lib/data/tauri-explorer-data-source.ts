@@ -438,7 +438,28 @@ const parseOperationProgress = (
       "Invalid filesystem response: operation progress is malformed.",
     );
   }
-  return { completedItems, totalItems };
+  const completedBytes = value.completedBytes ?? null;
+  const totalBytes = value.totalBytes ?? null;
+  const validByteValue = (candidate: unknown): candidate is string =>
+    typeof candidate === "string" && /^(0|[1-9][0-9]*)$/.test(candidate);
+  if (completedBytes === null && totalBytes === null) {
+    return {
+      completedItems,
+      totalItems,
+      completedBytes: null,
+      totalBytes: null,
+    };
+  }
+  if (
+    !validByteValue(completedBytes) ||
+    !validByteValue(totalBytes) ||
+    BigInt(completedBytes) > BigInt(totalBytes)
+  ) {
+    throw new Error(
+      "Invalid filesystem response: operation byte progress is malformed.",
+    );
+  }
+  return { completedItems, totalItems, completedBytes, totalBytes };
 };
 
 const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
@@ -508,7 +529,10 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
     return { kind: "renamed", entry: parseEntry(value.entry) };
   }
   if (value.kind === "moved") {
-    if (!Array.isArray(value.rebasedEntryIds)) {
+    if (
+      !Array.isArray(value.rebasedEntryIds) ||
+      !Array.isArray(value.invalidatedEntryIds)
+    ) {
       throw new Error(
         "Invalid filesystem response: rebased entry references are malformed.",
       );
@@ -521,11 +545,25 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
       }
       return id;
     });
+    const invalidatedEntryIds = value.invalidatedEntryIds.map((id: unknown) => {
+      if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+        throw new Error(
+          "Invalid filesystem response: invalidated entry references are malformed.",
+        );
+      }
+      return id;
+    });
     const entry = parseEntry(value.entry);
+    const sourceParent = parseDirectoryRef(value.sourceParent);
+    const destination = parseDirectoryRef(value.destination);
+    const transferred = sourceParent.locationId !== entry.reference.locationId;
     if (
-      rebasedEntryIds.length === 0 ||
       rebasedEntryIds.length > 100_000 ||
-      !rebasedEntryIds.includes(entry.reference.id)
+      invalidatedEntryIds.length > 100_000 ||
+      (transferred
+        ? rebasedEntryIds.length !== 0 || invalidatedEntryIds.length === 0
+        : invalidatedEntryIds.length !== 0 ||
+          !rebasedEntryIds.includes(entry.reference.id))
     ) {
       throw new Error(
         "Invalid filesystem response: rebased entry references are malformed.",
@@ -534,9 +572,10 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
     return {
       kind: "moved",
       entry,
-      sourceParent: parseDirectoryRef(value.sourceParent),
-      destination: parseDirectoryRef(value.destination),
+      sourceParent,
+      destination,
       rebasedEntryIds: [...new Set(rebasedEntryIds)],
+      invalidatedEntryIds: [...new Set(invalidatedEntryIds)],
     };
   }
   if (value.kind === "moveSkipped") {

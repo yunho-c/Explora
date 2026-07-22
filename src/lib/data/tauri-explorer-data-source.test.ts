@@ -314,6 +314,7 @@ describe("TauriExplorerDataSource", () => {
             sourceParent: root,
             destination,
             rebasedEntryIds: [entryPayload.reference.id],
+            invalidatedEntryIds: [],
           },
         },
       ]);
@@ -331,6 +332,7 @@ describe("TauriExplorerDataSource", () => {
       sourceParent: root,
       destination,
       rebasedEntryIds: [entryPayload.reference.id],
+      invalidatedEntryIds: [],
     });
   });
 
@@ -423,6 +425,7 @@ describe("TauriExplorerDataSource", () => {
                 sourceParent: root,
                 destination,
                 rebasedEntryIds: [entryPayload.reference.id],
+                invalidatedEntryIds: [],
               },
             },
           ],
@@ -691,10 +694,14 @@ describe("TauriExplorerDataSource", () => {
     expect(onProgress).toHaveBeenLastCalledWith({
       completedItems: 3,
       totalItems: 3,
+      completedBytes: null,
+      totalBytes: null,
     });
     expect(onProgress).toHaveBeenCalledWith({
       completedItems: 2,
       totalItems: 3,
+      completedBytes: null,
+      totalBytes: null,
     });
   });
 

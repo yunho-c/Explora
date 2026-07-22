@@ -73,11 +73,31 @@ describe("ExplorerShell", () => {
     state.fileOperations.activeEntryId = "demo-directory";
     state.fileOperations.activeEntryName = "Projects";
     state.fileOperations.activeAction = "Deleting permanently";
-    state.fileOperations.progress = { completedItems: 2, totalItems: 7 };
+    state.fileOperations.progress = {
+      completedItems: 2,
+      totalItems: 7,
+      completedBytes: null,
+      totalBytes: null,
+    };
 
     expect(await screen.findByRole("status")).toHaveTextContent(
       "Deleting permanently “Projects” · 2 of 7 items",
     );
+
+    state.fileOperations.progress = {
+      completedItems: 0,
+      totalItems: 1,
+      completedBytes: "2000",
+      totalBytes: "10000",
+    };
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Deleting permanently “Projects” · 2 KB of 10 KB",
+      ),
+    );
+    expect(
+      screen.getByRole("progressbar", { name: "File transfer progress" }),
+    ).toHaveAttribute("aria-valuenow", "20");
   });
 
   it("provides an accessible inline rename workflow from the keyboard", async () => {

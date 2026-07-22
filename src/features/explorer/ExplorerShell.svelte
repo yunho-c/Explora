@@ -8,6 +8,7 @@
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
   import { deletionShortcut, isRenameShortcut } from "$lib/platform-shortcuts";
+  import { formatFileSize } from "$lib/file-metadata";
 
   import ExplorerSidebar from "./ExplorerSidebar.svelte";
   import ExplorerTabs from "./ExplorerTabs.svelte";
@@ -205,7 +206,7 @@
         </div>
       {/if}
 
-      {#if state.fileOperations.activeAction && state.fileOperations.activeEntryName && state.fileOperations.progress && state.fileOperations.progress.totalItems > 1}
+      {#if state.fileOperations.activeAction && state.fileOperations.activeEntryName && state.fileOperations.progress && (state.fileOperations.progress.totalItems > 1 || state.fileOperations.progress.totalBytes !== null)}
         <div
           class="mx-4 mt-4 rounded-lg border bg-muted/50 p-3 text-sm"
           role="status"
@@ -214,9 +215,17 @@
           <span class="font-medium">{state.fileOperations.activeAction}</span>
           <span class="text-muted-foreground">
             “{state.fileOperations.activeEntryName}” · {state.fileOperations
-              .progress.completedItems} of {state.fileOperations.progress
-              .totalItems} items
+              .progress.totalBytes !== null
+              ? `${formatFileSize(state.fileOperations.progress.completedBytes)} of ${formatFileSize(state.fileOperations.progress.totalBytes)}`
+              : `${state.fileOperations.progress.completedItems} of ${state.fileOperations.progress.totalItems} items`}
           </span>
+          {#if state.fileOperations.byteProgressPercent !== null}
+            <Progress
+              class="mt-2 h-1"
+              value={state.fileOperations.byteProgressPercent}
+              aria-label="File transfer progress"
+            />
+          {/if}
         </div>
       {/if}
 

@@ -185,6 +185,7 @@ export type FileMoveResult =
       sourceParent: DirectoryRef;
       destination: DirectoryRef;
       rebasedEntryIds: readonly string[];
+      invalidatedEntryIds: readonly string[];
     }
   | {
       kind: "moveSkipped";

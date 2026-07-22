@@ -10,6 +10,7 @@ mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
+mod transfer;
 mod volumes;
 
 use commands::AppState;

@@ -19,6 +19,9 @@ use crate::filesystem::{
 };
 use crate::local_relocate::relocate_no_replace;
 use crate::platform_trash::PlatformTrash;
+use crate::transfer::{
+    copy_local_file_into_owned_partial, verify_local_file_copy, OwnedLocalTransferArtifact,
+};
 
 const MAX_PERMANENT_DELETE_ENTRIES: usize = 1_000_000;
 const MAX_KEEP_BOTH_ATTEMPTS: u32 = 10_000;
@@ -261,6 +264,14 @@ pub struct MovedLocalEntry {
     pub source_parent: DirectoryRefDto,
     pub destination: DirectoryRefDto,
     pub rebased_entry_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferredLocalEntry {
+    pub entry: FileEntrySummaryDto,
+    pub source_parent: DirectoryRefDto,
+    pub destination: DirectoryRefDto,
+    pub invalidated_entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,6 +574,122 @@ impl LocalFilesystem {
             )?,
             rebased_entry_ids,
         })
+    }
+
+    pub fn transfer_file_to_local_location<F>(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: LocalMoveConflictPolicy,
+        cancelled: &AtomicBool,
+        mut on_progress: F,
+    ) -> Result<TransferredLocalEntry, ExplorerError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ExplorerError>,
+    {
+        ensure_not_cancelled(cancelled)?;
+        if destination.location_id == entry.location_id {
+            return Err(ExplorerError::InvalidConfiguration(
+                "A same-location move must use atomic relocation.".to_owned(),
+            ));
+        }
+        let (source_path, _) = self.resolve_mutation_source(entry)?;
+        let source_metadata = fs::symlink_metadata(&source_path)
+            .map_err(|error| ExplorerError::io("inspect", &source_path, error))?;
+        if !source_metadata.file_type().is_file() {
+            return Err(ExplorerError::Unsupported(
+                "Cross-location directory and symlink moves are not available yet.".to_owned(),
+            ));
+        }
+        let destination_path = self.resolve_transfer_destination(destination)?;
+        let original_name = source_path
+            .file_name()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let source_parent_path = source_path
+            .parent()
+            .ok_or(ExplorerError::InvalidReference)?
+            .to_path_buf();
+        let source_parent = directory_ref(
+            &self.registry,
+            &source_parent_path,
+            &entry.location_id,
+            None,
+        )?;
+        let destination_ref = directory_ref(
+            &self.registry,
+            &destination_path,
+            &destination.location_id,
+            None,
+        )?;
+
+        let mut artifact = match conflict_policy {
+            LocalMoveConflictPolicy::Fail => {
+                OwnedLocalTransferArtifact::create(&destination_path, original_name)?
+            }
+            LocalMoveConflictPolicy::KeepBoth => {
+                let mut artifact = None;
+                for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+                    ensure_not_cancelled(cancelled)?;
+                    let candidate = keep_both_name(original_name, false, attempt);
+                    match OwnedLocalTransferArtifact::create(&destination_path, &candidate) {
+                        Ok(created) => {
+                            artifact = Some(created);
+                            break;
+                        }
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                artifact.ok_or(ExplorerError::Conflict)?
+            }
+        };
+        let total_bytes = source_metadata.len();
+        on_progress(0, total_bytes)?;
+        copy_local_file_into_owned_partial(&source_path, &mut artifact, cancelled, |completed| {
+            on_progress(completed, total_bytes)
+        })?;
+        let finalized_path = artifact.finalize()?.to_path_buf();
+        verify_local_file_copy(&source_path, &finalized_path, cancelled)?;
+
+        // Revalidate the source token and cheap mutable metadata immediately
+        // before the irreversible delete. A changed source is preserved.
+        let revalidated_path = self
+            .registry
+            .resolve_for_operation(&entry.location_id, &entry.id)?;
+        let revalidated_metadata = fs::symlink_metadata(&revalidated_path)
+            .map_err(|error| ExplorerError::io("inspect", &revalidated_path, error))?;
+        if revalidated_metadata.len() != source_metadata.len()
+            || revalidated_metadata.modified().ok() != source_metadata.modified().ok()
+        {
+            return Err(ExplorerError::SourceChanged);
+        }
+        let final_path = artifact.preserve();
+        if let Err(error) = fs::remove_file(&source_path) {
+            return Err(ExplorerError::PartialCompletion(format!(
+                "The verified copy was kept, but Explora could not remove the source: {}.",
+                error.kind()
+            )));
+        }
+        let invalidated_entry_ids = self
+            .registry
+            .invalidate_subtree(&entry.location_id, &source_path)?;
+        let entry = self.describe_path(final_path, &destination.location_id)?;
+        Ok(TransferredLocalEntry {
+            entry,
+            source_parent,
+            destination: destination_ref,
+            invalidated_entry_ids,
+        })
+    }
+
+    pub fn describe_transfer_conflict(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let (_, source_name) = self.resolve_mutation_source(entry)?;
+        let destination_path = self.resolve_transfer_destination(destination)?;
+        Ok((source_name, directory_name(&destination_path)))
     }
 
     pub fn describe_move_conflict(
@@ -915,6 +1042,37 @@ impl LocalFilesystem {
         if source_metadata.file_type().is_dir() && destination_path.starts_with(source_path) {
             return Err(ExplorerError::DestinationUnavailable(
                 "A folder cannot be moved into itself or one of its subfolders.".to_owned(),
+            ));
+        }
+        Ok(destination_path)
+    }
+
+    fn resolve_transfer_destination(
+        &self,
+        destination: &DirectoryRefDto,
+    ) -> Result<PathBuf, ExplorerError> {
+        let location = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == destination.location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self
+            .registry
+            .resolve(&destination.location_id, &location.root.id)?;
+        let destination_path = self
+            .registry
+            .resolve_for_operation(&destination.location_id, &destination.id)?;
+        if !destination_path.starts_with(&root_path) {
+            return Err(ExplorerError::InvalidReference);
+        }
+        let metadata = fs::symlink_metadata(&destination_path)
+            .map_err(|error| ExplorerError::io("inspect", &destination_path, error))?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(ExplorerError::DestinationUnavailable(
+                "Choose a folder that can accept moved items.".to_owned(),
             ));
         }
         Ok(destination_path)
@@ -1324,6 +1482,111 @@ mod tests {
         .expect("local filesystem");
         let root = filesystem.locations().expect("locations")[0].root.clone();
         (temp, filesystem, root)
+    }
+
+    fn transfer_fixture() -> (
+        TempDir,
+        LocalFilesystem,
+        DirectoryRefDto,
+        DirectoryRefDto,
+        EntryRefDto,
+    ) {
+        let temp = TempDir::new().expect("temporary directory");
+        let source_dir = temp.path().join("source");
+        let destination_dir = temp.path().join("destination");
+        fs::create_dir(&source_dir).expect("source root");
+        fs::create_dir(&destination_dir).expect("destination root");
+        fs::write(source_dir.join("large.bin"), vec![0x2a; 300_000]).expect("source file");
+        let filesystem = LocalFilesystem::new(vec![
+            LocalRoot {
+                id: "source-root",
+                name: "Source",
+                role: LocationRole::Home,
+                path: source_dir,
+            },
+            LocalRoot {
+                id: "destination-root",
+                name: "Destination",
+                role: LocationRole::Volume,
+                path: destination_dir,
+            },
+        ])
+        .expect("local filesystem");
+        let locations = filesystem.locations().expect("locations");
+        let source_root = locations
+            .iter()
+            .find(|location| location.id == "source-root")
+            .expect("source location")
+            .root
+            .clone();
+        let destination_root = locations
+            .iter()
+            .find(|location| location.id == "destination-root")
+            .expect("destination location")
+            .root
+            .clone();
+        let entry = listed_entries(&filesystem, &source_root)
+            .into_iter()
+            .find(|entry| entry.name == "large.bin")
+            .expect("source entry")
+            .reference;
+        (temp, filesystem, source_root, destination_root, entry)
+    }
+
+    #[test]
+    fn transfers_a_regular_file_between_local_locations_without_overwriting() {
+        let (temp, filesystem, source_root, destination_root, entry) = transfer_fixture();
+        let progress = Mutex::new(Vec::new());
+        let moved = filesystem
+            .transfer_file_to_local_location(
+                &entry,
+                &destination_root,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+                |completed, total| {
+                    progress.lock().expect("progress").push((completed, total));
+                    Ok(())
+                },
+            )
+            .expect("verified transfer");
+
+        assert!(!temp.path().join("source/large.bin").exists());
+        assert_eq!(
+            fs::read(temp.path().join("destination/large.bin")).expect("destination bytes"),
+            vec![0x2a; 300_000]
+        );
+        assert_eq!(
+            moved.entry.reference.location_id,
+            destination_root.location_id
+        );
+        assert!(moved.invalidated_entry_ids.contains(&entry.id));
+        assert_eq!(
+            progress.lock().expect("progress").last().copied(),
+            Some((300_000, 300_000))
+        );
+        assert_eq!(moved.source_parent.id, source_root.id);
+    }
+
+    #[test]
+    fn cancelled_local_transfer_cleans_partial_and_preserves_source() {
+        let (temp, filesystem, _source_root, destination_root, entry) = transfer_fixture();
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            filesystem.transfer_file_to_local_location(
+                &entry,
+                &destination_root,
+                LocalMoveConflictPolicy::Fail,
+                &cancelled,
+                |_, _| Ok(())
+            ),
+            Err(ExplorerError::Cancelled)
+        ));
+        assert!(temp.path().join("source/large.bin").exists());
+        assert!(!temp.path().join("destination/large.bin").exists());
+        assert!(fs::read_dir(temp.path().join("destination"))
+            .expect("destination listing")
+            .next()
+            .is_none());
     }
 
     #[test]

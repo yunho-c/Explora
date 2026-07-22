@@ -61,6 +61,15 @@ export class FileOperationStore {
     );
   }
 
+  get byteProgressPercent(): number | null {
+    const progress = this.progress;
+    if (!progress?.completedBytes || !progress.totalBytes) return null;
+    const completed = BigInt(progress.completedBytes);
+    const total = BigInt(progress.totalBytes);
+    if (total === 0n) return 100;
+    return Number((completed * 10_000n) / total) / 100;
+  }
+
   async openMoveChooser(
     entry: FileEntrySummary,
     sourceParent: DirectoryRef,
@@ -253,7 +262,12 @@ export class FileOperationStore {
     this.activeEntryId = entry.reference.id;
     this.activeEntryName = entry.name;
     this.activeAction = activeAction;
-    this.progress = { completedItems: 0, totalItems: 1 };
+    this.progress = {
+      completedItems: 0,
+      totalItems: 1,
+      completedBytes: null,
+      totalBytes: null,
+    };
     this.errorMessage = null;
     try {
       const result = await start({

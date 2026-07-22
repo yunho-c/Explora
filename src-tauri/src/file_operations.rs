@@ -18,12 +18,14 @@ use crate::{
     },
     local_filesystem::{
         LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, RemovedLocalEntry,
+        TransferredLocalEntry,
     },
     platform_trash::{PlatformTrash, SystemPlatformTrash},
     ssh::{MovedRemoteEntry, RemoteMoveConflictPolicy, RemovedRemoteEntry, SshConnectionManager},
 };
 
 const MAX_OPERATION_SOURCES: usize = 1;
+const BYTE_PROGRESS_EVENT_INTERVAL: u64 = 4 * 1024 * 1024;
 const PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -116,6 +118,7 @@ pub enum FileOperationOutcomeDto {
         source_parent: DirectoryRefDto,
         destination: DirectoryRefDto,
         rebased_entry_ids: Vec<String>,
+        invalidated_entry_ids: Vec<String>,
     },
     MoveSkipped {
         entry: EntryRefDto,
@@ -146,6 +149,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
     },
     Running {
         operation_id: String,
@@ -153,6 +158,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
     },
     AwaitingConfirmation {
         operation_id: String,
@@ -160,6 +167,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
         prompt: FileOperationPromptDto,
     },
     AwaitingConflict {
@@ -168,6 +177,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
         prompt: FileOperationPromptDto,
     },
     Completed {
@@ -176,6 +187,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
         outcome: FileOperationOutcomeDto,
     },
     Cancelled {
@@ -184,6 +197,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
     },
     Failed {
         operation_id: String,
@@ -191,6 +206,8 @@ pub enum FileOperationEventDto {
         action: FileOperationKindDto,
         completed_items: u64,
         total_items: u64,
+        completed_bytes: Option<String>,
+        total_bytes: Option<String>,
         error: ExplorerErrorDto,
     },
 }
@@ -336,6 +353,8 @@ struct OperationEventEmitter {
     sequence: u64,
     completed_items: u64,
     total_items: u64,
+    completed_bytes: Option<u64>,
+    total_bytes: Option<u64>,
     channel: Channel<FileOperationEventDto>,
 }
 
@@ -355,6 +374,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.completed_items,
                 total_items: self.total_items,
+                completed_bytes: self.completed_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
             })
             .map_err(|_| ExplorerError::ChannelClosed)
     }
@@ -371,6 +392,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.completed_items,
                 total_items: self.total_items,
+                completed_bytes: self.completed_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
@@ -385,6 +408,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.completed_items,
                 total_items: self.total_items,
+                completed_bytes: self.completed_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
                 prompt,
             })
             .map_err(|_| ExplorerError::ChannelClosed)
@@ -399,6 +424,19 @@ impl OperationEventEmitter {
         self.running()
     }
 
+    fn byte_progress(
+        &mut self,
+        completed_bytes: u64,
+        total_bytes: u64,
+    ) -> Result<(), ExplorerError> {
+        if completed_bytes > total_bytes {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        self.completed_bytes = Some(completed_bytes);
+        self.total_bytes = Some(total_bytes);
+        self.running()
+    }
+
     fn terminal(&mut self, result: Result<FileOperationOutcomeDto, ExplorerError>) {
         let sequence = self.next_sequence();
         let event = match result {
@@ -408,6 +446,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.total_items,
                 total_items: self.total_items,
+                completed_bytes: self.total_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
                 outcome,
             },
             Err(ExplorerError::Cancelled) => FileOperationEventDto::Cancelled {
@@ -416,6 +456,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.completed_items,
                 total_items: self.total_items,
+                completed_bytes: self.completed_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
             },
             Err(error) => FileOperationEventDto::Failed {
                 operation_id: self.operation_id.clone(),
@@ -423,6 +465,8 @@ impl OperationEventEmitter {
                 action: self.action,
                 completed_items: self.completed_items,
                 total_items: self.total_items,
+                completed_bytes: self.completed_bytes.map(|value| value.to_string()),
+                total_bytes: self.total_bytes.map(|value| value.to_string()),
                 error: ExplorerErrorDto::from(error),
             },
         };
@@ -490,6 +534,8 @@ impl FileOperationCoordinator {
                 action,
                 completed_items: 0,
                 total_items: 1,
+                completed_bytes: None,
+                total_bytes: None,
             })
             .is_err()
         {
@@ -507,6 +553,8 @@ impl FileOperationCoordinator {
                     sequence: 1,
                     completed_items: 0,
                     total_items: 1,
+                    completed_bytes: None,
+                    total_bytes: None,
                     channel: on_event,
                 };
                 let result = coordinator
@@ -524,6 +572,8 @@ impl FileOperationCoordinator {
                     sequence: 1,
                     completed_items: 0,
                     total_items: 1,
+                    completed_bytes: None,
+                    total_bytes: None,
                     channel: on_event,
                 };
                 let result = coordinator.run_local(&local, &request, &active, &mut events);
@@ -581,6 +631,17 @@ impl FileOperationCoordinator {
                     entry: Box::new(entry),
                 }),
             FileOperationActionDto::Move { destination } => {
+                if destination.location_id != source.location_id
+                    && !destination.location_id.starts_with("ssh:")
+                {
+                    return self.run_local_file_transfer(
+                        local,
+                        source,
+                        destination,
+                        active,
+                        events,
+                    );
+                }
                 match self.with_execution_guard(|| {
                     local.move_entry(
                         source,
@@ -684,6 +745,84 @@ impl FileOperationCoordinator {
                 })
                 .map(deleted_outcome)
             }
+        }
+    }
+
+    fn run_local_file_transfer(
+        &self,
+        local: &LocalFilesystem,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        let transfer = |policy, events: &mut OperationEventEmitter| {
+            let mut last_emitted = 0_u64;
+            self.with_execution_guard(|| {
+                local.transfer_file_to_local_location(
+                    source,
+                    destination,
+                    policy,
+                    &active.cancelled,
+                    |completed, total| {
+                        if completed == 0
+                            || completed == total
+                            || completed.saturating_sub(last_emitted)
+                                >= BYTE_PROGRESS_EVENT_INTERVAL
+                        {
+                            last_emitted = completed;
+                            events.byte_progress(completed, total)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            })
+        };
+        match transfer(LocalMoveConflictPolicy::Fail, events) {
+            Ok(moved) => Ok(transferred_local_outcome(moved)),
+            Err(ExplorerError::Conflict) => {
+                let (target_name, destination_name) =
+                    local.describe_transfer_conflict(source, destination)?;
+                let prompt_id = Uuid::new_v4().to_string();
+                let decisions = vec![
+                    FileOperationPromptResponseDto::KeepBoth,
+                    FileOperationPromptResponseDto::Skip,
+                    FileOperationPromptResponseDto::Cancel,
+                ];
+                let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                    id: prompt_id,
+                    title: format!("“{target_name}” already exists"),
+                    message: format!(
+                        "Choose how to handle the existing item in “{destination_name}”. Nothing will be replaced."
+                    ),
+                    target_name: target_name.clone(),
+                    destination_name,
+                    decisions,
+                })?;
+                match active.await_prompt(response)? {
+                    FileOperationPromptResponseDto::KeepBoth => {
+                        events.running()?;
+                        transfer(LocalMoveConflictPolicy::KeepBoth, events)
+                            .map(transferred_local_outcome)
+                    }
+                    FileOperationPromptResponseDto::Skip => {
+                        events.running()?;
+                        Ok(FileOperationOutcomeDto::MoveSkipped {
+                            entry: source.clone(),
+                            name: target_name,
+                        })
+                    }
+                    FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::Confirm => {
+                        Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for a move conflict.".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -863,6 +1002,7 @@ fn moved_outcome(entry: MovedLocalEntry) -> FileOperationOutcomeDto {
         source_parent: entry.source_parent,
         destination: entry.destination,
         rebased_entry_ids: entry.rebased_entry_ids,
+        invalidated_entry_ids: Vec::new(),
     }
 }
 
@@ -872,6 +1012,17 @@ fn moved_remote_outcome(entry: MovedRemoteEntry) -> FileOperationOutcomeDto {
         source_parent: entry.source_parent,
         destination: entry.destination,
         rebased_entry_ids: entry.rebased_entry_ids,
+        invalidated_entry_ids: Vec::new(),
+    }
+}
+
+fn transferred_local_outcome(entry: TransferredLocalEntry) -> FileOperationOutcomeDto {
+    FileOperationOutcomeDto::Moved {
+        entry: Box::new(entry.entry),
+        source_parent: entry.source_parent,
+        destination: entry.destination,
+        rebased_entry_ids: Vec::new(),
+        invalidated_entry_ids: entry.invalidated_entry_ids,
     }
 }
 
@@ -972,6 +1123,63 @@ mod tests {
             )
             .expect("directory listing");
         (temp, local, source.expect("source entry"))
+    }
+
+    fn transfer_fixture() -> (TempDir, Arc<LocalFilesystem>, EntryRefDto, DirectoryRefDto) {
+        let temp = TempDir::new().expect("temporary directory");
+        let source_path = temp.path().join("source");
+        let destination_path = temp.path().join("destination");
+        fs::create_dir(&source_path).expect("source root");
+        fs::create_dir(&destination_path).expect("destination root");
+        fs::write(source_path.join("notes.md"), vec![0x33; 600_000]).expect("fixture file");
+        let local = Arc::new(
+            LocalFilesystem::new(vec![
+                LocalRoot {
+                    id: "operation-source",
+                    name: "Source",
+                    role: LocationRole::Home,
+                    path: source_path,
+                },
+                LocalRoot {
+                    id: "operation-destination",
+                    name: "Destination",
+                    role: LocationRole::Volume,
+                    path: destination_path,
+                },
+            ])
+            .expect("local filesystem"),
+        );
+        let locations = local.locations().expect("locations");
+        let source_root = locations
+            .iter()
+            .find(|location| location.id == "operation-source")
+            .expect("source location")
+            .root
+            .clone();
+        let destination_root = locations
+            .iter()
+            .find(|location| location.id == "operation-destination")
+            .expect("destination location")
+            .root
+            .clone();
+        let mut source = None;
+        local
+            .list_directory(
+                &source_root.id,
+                &source_root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        source = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "notes.md")
+                            .map(|entry| entry.reference);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("source listing");
+        (temp, local, source.expect("source entry"), destination_root)
     }
 
     fn channel(events: Arc<StdMutex<Vec<Value>>>) -> Channel<FileOperationEventDto> {
@@ -1173,6 +1381,8 @@ mod tests {
             action: FileOperationKindDto::Trash,
             completed_items: 0,
             total_items: 1,
+            completed_bytes: None,
+            total_bytes: None,
         };
         assert_eq!(
             serde_json::to_value(event).expect("serializable event"),
@@ -1182,7 +1392,9 @@ mod tests {
                 "sequence": 2,
                 "action": "trash",
                 "completedItems": 0,
-                "totalItems": 1
+                "totalItems": 1,
+                "completedBytes": null,
+                "totalBytes": null
             })
         );
     }
@@ -1284,6 +1496,52 @@ mod tests {
         assert_eq!(events[2]["outcome"]["destination"]["id"], destination.id);
         assert!(temp.path().join("destination/notes.md").is_file());
         assert!(!temp.path().join("notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn coordinator_transfers_and_verifies_a_file_between_local_locations() {
+        let (temp, local, source, destination) = transfer_fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: destination.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start transfer");
+        wait_for_event(&events, "completed").await;
+
+        let events = events.lock().expect("events");
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["outcome"]["kind"], "moved");
+        assert_eq!(
+            terminal["outcome"]["entry"]["reference"]["locationId"],
+            destination.location_id
+        );
+        assert!(terminal["outcome"]["invalidatedEntryIds"]
+            .as_array()
+            .expect("invalidated source identities")
+            .iter()
+            .any(|id| id == &source.id));
+        assert_eq!(terminal["completedBytes"], "600000");
+        assert_eq!(terminal["totalBytes"], "600000");
+        assert!(events.iter().any(|event| {
+            event["event"] == "running"
+                && event["completedBytes"] == "0"
+                && event["totalBytes"] == "600000"
+        }));
+        assert!(!temp.path().join("source/notes.md").exists());
+        assert_eq!(
+            fs::read(temp.path().join("destination/notes.md")).expect("destination bytes"),
+            vec![0x33; 600_000]
+        );
     }
 
     #[tokio::test]

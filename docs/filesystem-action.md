@@ -561,6 +561,17 @@ and refresh. Cross-location remote moves remain Phase 6 transfers.
 - Report partial completion when the verified copy remains but source deletion
   fails.
 
+Implementation is in progress. The first backend slice adds an owned local
+partial-file lifecycle and a coordinator path for regular-file moves between two
+local locations. Partial files are created exclusively with least-privilege
+permissions, written in bounded 256 KiB chunks, synchronized, finalized with a
+no-replace relocation, reopened for byte-for-byte verification, and removed
+automatically on copy, cancellation, finalization, or verification failure. The
+source is revalidated and removed only after verification; a failed source
+removal preserves both copies and reports partial completion. This path remains
+unexposed in the destination chooser until byte progress, directories, symlinks,
+and every local/SFTP direction use the same safe contract.
+
 ### Phase 7: Multi-selection
 
 - Permit multiple sources in the existing request shape.
