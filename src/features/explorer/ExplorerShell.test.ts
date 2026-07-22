@@ -65,6 +65,54 @@ describe("ExplorerShell", () => {
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
   });
 
+  it("provides an accessible inline rename workflow from the keyboard", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const original = screen.getByText("explora-notes.md");
+    const row = original.closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    await fireEvent.keyDown(window, { key: "F2" });
+    const input = screen.getByRole("textbox", {
+      name: "Rename explora-notes.md",
+    });
+    expect(input).toHaveFocus();
+    await fireEvent.input(input, { target: { value: "renamed-notes.md" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(screen.getByText("renamed-notes.md")).toBeInTheDocument(),
+    );
+    expect(state.selectedEntry?.name).toBe("renamed-notes.md");
+    expect(
+      screen.queryByRole("textbox", { name: "Rename explora-notes.md" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the inline editor open for a rename conflict", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("Projects").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    await fireEvent.keyDown(window, { key: "F2" });
+    const input = screen.getByRole("textbox", { name: "Rename Projects" });
+    await fireEvent.input(input, { target: { value: "Photos" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("An item with that name already exists."),
+      ).toBeInTheDocument(),
+    );
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    await fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+  });
+
   it("uses distinct semantic icons for default favorite folders", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

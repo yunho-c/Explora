@@ -26,6 +26,12 @@
   } = $props();
 
   const handleKeydown = (event: KeyboardEvent) => {
+    if (event.key === "F2" && state.selectedEntry?.capabilities.rename) {
+      event.preventDefault();
+      state.startRename();
+      return;
+    }
+
     const refreshShortcut =
       event.key === "F5" ||
       (event.key.toLocaleLowerCase() === "r" &&

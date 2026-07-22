@@ -29,10 +29,10 @@ use zeroize::Zeroize;
 
 use crate::{
     filesystem::{
-        BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
-        FileEntrySummaryDto, LocationRole, LocationSummaryDto, CONNECTION_TIMEOUT,
-        LISTING_BATCH_SIZE, PROMPT_TIMEOUT, SFTP_REQUEST_TIMEOUT_SECONDS, SSH_KEEPALIVE_INTERVAL,
-        SSH_KEEPALIVE_MAX,
+        BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryCapabilitiesDto,
+        EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole, LocationSummaryDto,
+        CONNECTION_TIMEOUT, LISTING_BATCH_SIZE, PROMPT_TIMEOUT, SFTP_REQUEST_TIMEOUT_SECONDS,
+        SSH_KEEPALIVE_INTERVAL, SSH_KEEPALIVE_MAX,
     },
     ssh_targets::{location_id, ResolvedSshTarget, SshTargetSummaryDto},
 };
@@ -437,6 +437,7 @@ impl SshSession {
                 display_path: format!("{}:{entry_path}", self.target.name),
                 directory,
                 detail: None,
+                capabilities: EntryCapabilitiesDto::READ_ONLY,
             });
             if batch.len() == LISTING_BATCH_SIZE {
                 emit(DirectoryListingEvent::Entries {

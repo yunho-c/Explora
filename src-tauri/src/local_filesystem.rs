@@ -13,8 +13,9 @@ use std::{
 use uuid::Uuid;
 
 use crate::filesystem::{
-    BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
-    FileEntrySummaryDto, LocationRole, LocationSummaryDto, LISTING_BATCH_SIZE,
+    BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryCapabilitiesDto,
+    EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole, LocationSummaryDto,
+    LISTING_BATCH_SIZE,
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,13 @@ struct PathRegistryInner {
     paths_by_id: HashMap<String, PathBuf>,
     locations_by_id: HashMap<String, String>,
     ids_by_path: HashMap<(String, PathBuf), String>,
+    identities_by_id: HashMap<String, Option<FileIdentity>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
 }
 
 #[derive(Default)]
@@ -39,14 +47,18 @@ struct PathRegistry {
 
 impl PathRegistry {
     fn register(&self, location_id: &str, path: PathBuf) -> Result<String, ExplorerError> {
+        let identity = fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|metadata| metadata_identity(&metadata));
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| ExplorerError::StateUnavailable)?;
 
         let key = (location_id.to_owned(), path.clone());
-        if let Some(id) = inner.ids_by_path.get(&key) {
-            return Ok(id.clone());
+        if let Some(id) = inner.ids_by_path.get(&key).cloned() {
+            inner.identities_by_id.insert(id.clone(), identity);
+            return Ok(id);
         }
 
         let id = Uuid::new_v4().to_string();
@@ -55,6 +67,7 @@ impl PathRegistry {
             .locations_by_id
             .insert(id.clone(), location_id.to_owned());
         inner.ids_by_path.insert(key, id.clone());
+        inner.identities_by_id.insert(id.clone(), identity);
         Ok(id)
     }
 
@@ -71,6 +84,38 @@ impl PathRegistry {
             .get(id)
             .cloned()
             .ok_or(ExplorerError::InvalidReference)
+    }
+
+    fn resolve_for_operation(&self, location_id: &str, id: &str) -> Result<PathBuf, ExplorerError> {
+        let (path, expected_identity) = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| ExplorerError::StateUnavailable)?;
+            if inner.locations_by_id.get(id).map(String::as_str) != Some(location_id) {
+                return Err(ExplorerError::InvalidReference);
+            }
+            (
+                inner
+                    .paths_by_id
+                    .get(id)
+                    .cloned()
+                    .ok_or(ExplorerError::InvalidReference)?,
+                inner.identities_by_id.get(id).copied().flatten(),
+            )
+        };
+        let current_metadata = fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExplorerError::SourceChanged
+            } else {
+                ExplorerError::io("inspect", &path, error)
+            }
+        })?;
+        let current_identity = metadata_identity(&current_metadata);
+        if expected_identity.is_some() && current_identity != expected_identity {
+            return Err(ExplorerError::SourceChanged);
+        }
+        Ok(path)
     }
 
     fn remove_location(&self, location_id: &str) -> Result<(), ExplorerError> {
@@ -90,6 +135,67 @@ impl PathRegistry {
                 inner.ids_by_path.remove(&(location_id.to_owned(), path));
             }
             inner.locations_by_id.remove(&id);
+            inner.identities_by_id.remove(&id);
+        }
+        Ok(())
+    }
+
+    fn rebase_subtree(
+        &self,
+        location_id: &str,
+        old_path: &Path,
+        new_path: &Path,
+    ) -> Result<(), ExplorerError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let rebased = inner
+            .paths_by_id
+            .iter()
+            .filter(|(id, path)| {
+                inner.locations_by_id.get(*id).map(String::as_str) == Some(location_id)
+                    && path.starts_with(old_path)
+            })
+            .map(|(id, path)| {
+                path.strip_prefix(old_path)
+                    .map(|suffix| (id.clone(), path.clone(), new_path.join(suffix)))
+                    .map_err(|_| ExplorerError::StateUnavailable)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let rebased_ids = rebased
+            .iter()
+            .map(|(id, _, _)| id.as_str())
+            .collect::<Vec<_>>();
+        let stale_destination_ids = inner
+            .ids_by_path
+            .iter()
+            .filter_map(|((registered_location, path), id)| {
+                (registered_location == location_id
+                    && path.starts_with(new_path)
+                    && !rebased_ids.contains(&id.as_str()))
+                .then_some(id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in stale_destination_ids {
+            if let Some(path) = inner.paths_by_id.remove(&id) {
+                inner.ids_by_path.remove(&(location_id.to_owned(), path));
+            }
+            inner.locations_by_id.remove(&id);
+            inner.identities_by_id.remove(&id);
+        }
+
+        for (id, old_registered_path, new_registered_path) in rebased {
+            inner
+                .ids_by_path
+                .remove(&(location_id.to_owned(), old_registered_path));
+            inner
+                .paths_by_id
+                .insert(id.clone(), new_registered_path.clone());
+            inner
+                .ids_by_path
+                .insert((location_id.to_owned(), new_registered_path), id);
         }
         Ok(())
     }
@@ -222,6 +328,67 @@ impl LocalFilesystem {
         self.registry.resolve(location_id, entry_id)
     }
 
+    pub fn rename_entry(
+        &self,
+        entry: &EntryRefDto,
+        new_name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        validate_entry_name(new_name)?;
+
+        let location = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == entry.location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self
+            .registry
+            .resolve(&entry.location_id, &location.root.id)?;
+        let source_path = self
+            .registry
+            .resolve_for_operation(&entry.location_id, &entry.id)?;
+        if source_path == root_path || !source_path.starts_with(&root_path) {
+            return Err(ExplorerError::InvalidReference);
+        }
+        let parent = source_path
+            .parent()
+            .ok_or(ExplorerError::InvalidReference)?;
+        if source_path.file_name() == Some(OsStr::new(new_name)) {
+            return self.describe_path(source_path, &entry.location_id);
+        }
+
+        let source_metadata = fs::symlink_metadata(&source_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExplorerError::SourceChanged
+            } else {
+                ExplorerError::io("inspect", &source_path, error)
+            }
+        })?;
+        let destination_path = parent.join(new_name);
+        match fs::symlink_metadata(&destination_path) {
+            Ok(destination_metadata) => {
+                if !same_entry(&source_metadata, &destination_metadata) {
+                    return Err(ExplorerError::Conflict);
+                }
+                rename_case_only(&source_path, &destination_path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ensure_not_cancelled(cancelled)?;
+                fs::rename(&source_path, &destination_path)
+                    .map_err(|error| ExplorerError::io("rename", &source_path, error))?;
+            }
+            Err(error) => return Err(ExplorerError::io("inspect", &destination_path, error)),
+        }
+
+        self.registry
+            .rebase_subtree(&entry.location_id, &source_path, &destination_path)?;
+        self.describe_path(destination_path, &entry.location_id)
+    }
+
     pub fn list_directory<F>(
         &self,
         directory_id: &str,
@@ -321,12 +488,21 @@ impl LocalFilesystem {
         entry: fs::DirEntry,
         location_id: &str,
     ) -> Result<FileEntrySummaryDto, ExplorerError> {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let file_type = entry
-            .file_type()
+        self.describe_path(entry.path(), location_id)
+    }
+
+    fn describe_path(
+        &self,
+        path: PathBuf,
+        location_id: &str,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or(ExplorerError::InvalidReference)?;
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
-        let metadata = fs::symlink_metadata(&path).ok();
+        let file_type = metadata.file_type();
         let symlink_target_is_directory = file_type.is_symlink()
             && fs::metadata(&path)
                 .map(|target| target.is_dir())
@@ -348,12 +524,10 @@ impl LocalFilesystem {
         } else {
             "other"
         };
-        let size = (file_type.is_file())
-            .then(|| metadata.as_ref().map(|metadata| metadata.len().to_string()))
-            .flatten();
+        let size = file_type.is_file().then(|| metadata.len().to_string());
         let modified_at = metadata
-            .as_ref()
-            .and_then(|metadata| metadata.modified().ok())
+            .modified()
+            .ok()
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
 
@@ -370,8 +544,101 @@ impl LocalFilesystem {
             display_path: display_path(&path),
             directory,
             detail: file_type.is_symlink().then_some("Symbolic link"),
+            capabilities: EntryCapabilitiesDto::LOCAL_RENAME_ONLY,
         })
     }
+}
+
+fn validate_entry_name(name: &str) -> Result<(), ExplorerError> {
+    if name.is_empty() || name.len() > 255 || name == "." || name == ".." {
+        return Err(ExplorerError::InvalidName(
+            "Enter a file name between 1 and 255 bytes.".to_owned(),
+        ));
+    }
+    if name.contains(['/', '\0']) {
+        return Err(ExplorerError::InvalidName(
+            "File names cannot contain a path separator or null character.".to_owned(),
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let invalid_char = name
+            .chars()
+            .any(|character| matches!(character, '<' | '>' | ':' | '"' | '\\' | '|' | '?' | '*'));
+        let stem = name
+            .trim_end_matches(['.', ' '])
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let stem_bytes = stem.as_bytes();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || (stem_bytes.len() == 4
+                && matches!(&stem_bytes[..3], b"COM" | b"LPT")
+                && stem_bytes[3].is_ascii_digit()
+                && stem_bytes[3] != b'0');
+        if invalid_char || name.ends_with(['.', ' ']) || reserved {
+            return Err(ExplorerError::InvalidName(
+                "That name is not valid on Windows.".to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn metadata_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Some(FileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn metadata_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
+    use std::os::windows::fs::MetadataExt;
+
+    Some(FileIdentity {
+        volume: u64::from(metadata.volume_serial_number()?),
+        file: metadata.file_index()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
+fn same_entry(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    metadata_identity(left).is_some() && metadata_identity(left) == metadata_identity(right)
+}
+
+fn rename_case_only(source: &Path, destination: &Path) -> Result<(), ExplorerError> {
+    let parent = source.parent().ok_or(ExplorerError::InvalidReference)?;
+    let intermediate = (0..16)
+        .map(|_| parent.join(format!(".explora-rename-{}", Uuid::new_v4())))
+        .find(|candidate| !candidate.exists())
+        .ok_or_else(|| {
+            ExplorerError::Unexpected(
+                "Explora could not reserve an intermediate rename path.".to_owned(),
+            )
+        })?;
+
+    fs::rename(source, &intermediate)
+        .map_err(|error| ExplorerError::io("rename", source, error))?;
+    if let Err(error) = fs::rename(&intermediate, destination) {
+        if let Err(rollback_error) = fs::rename(&intermediate, source) {
+            return Err(ExplorerError::Unexpected(format!(
+                "The rename failed and Explora could not restore the original name: {rollback_error}"
+            )));
+        }
+        return Err(ExplorerError::io("rename", source, error));
+    }
+    Ok(())
 }
 
 fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), ExplorerError> {
@@ -532,6 +799,8 @@ mod tests {
         assert!(folder.directory.is_some());
         assert_eq!(file.size.as_deref(), Some("5"));
         assert_eq!(file.content_kind, "document");
+        assert!(file.capabilities.rename);
+        assert!(!file.capabilities.move_entry);
         assert!(!file.reference.id.contains("notes.md"));
         assert_eq!(started.0.id, root.id);
         assert!(started.1.is_none());
@@ -539,6 +808,127 @@ mod tests {
             started.2.last().map(|item| &item.directory.id),
             Some(&root.id)
         );
+    }
+
+    fn listed_entries(
+        filesystem: &LocalFilesystem,
+        directory: &DirectoryRefDto,
+    ) -> Vec<FileEntrySummaryDto> {
+        let mut entries = Vec::new();
+        filesystem
+            .list_directory(
+                &directory.id,
+                &directory.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries: batch, .. } = event {
+                        entries.extend(batch);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+        entries
+    }
+
+    #[test]
+    fn renames_a_file_without_changing_its_opaque_identity() {
+        let (temp, filesystem, root) = fixture();
+        let entry = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("notes entry");
+
+        let renamed = filesystem
+            .rename_entry(&entry.reference, "renamed.md", &AtomicBool::new(false))
+            .expect("rename file");
+
+        assert_eq!(renamed.reference, entry.reference);
+        assert_eq!(renamed.name, "renamed.md");
+        assert!(!temp.path().join("notes.md").exists());
+        assert_eq!(
+            fs::read(temp.path().join("renamed.md")).expect("file"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn rebases_registered_descendants_after_a_directory_rename() {
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("folder").join("child.txt"), b"child").expect("nested fixture");
+        let folder = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "folder")
+            .expect("folder entry");
+        let folder_directory = folder.directory.clone().expect("folder directory");
+        let child = listed_entries(&filesystem, &folder_directory)
+            .into_iter()
+            .find(|entry| entry.name == "child.txt")
+            .expect("child entry");
+
+        let renamed = filesystem
+            .rename_entry(&folder.reference, "renamed-folder", &AtomicBool::new(false))
+            .expect("rename folder");
+        let child_path = filesystem
+            .resolve_preview_path(&child.reference.id, &child.reference.location_id)
+            .expect("rebased child reference");
+
+        assert_eq!(renamed.reference, folder.reference);
+        assert_eq!(child_path, temp.path().join("renamed-folder/child.txt"));
+        assert_eq!(
+            listed_entries(&filesystem, &folder_directory)[0].name,
+            "child.txt"
+        );
+    }
+
+    #[test]
+    fn rename_rejects_conflicts_invalid_names_and_stale_sources() {
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("existing.md"), b"existing").expect("conflict fixture");
+        let entry = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("notes entry");
+
+        assert!(matches!(
+            filesystem.rename_entry(&entry.reference, "existing.md", &AtomicBool::new(false)),
+            Err(ExplorerError::Conflict)
+        ));
+        assert!(matches!(
+            filesystem.rename_entry(&entry.reference, "../escape", &AtomicBool::new(false)),
+            Err(ExplorerError::InvalidName(_))
+        ));
+        fs::remove_file(temp.path().join("notes.md")).expect("remove source");
+        fs::write(temp.path().join("notes.md"), b"replacement").expect("replace source");
+        assert!(matches!(
+            filesystem.rename_entry(&entry.reference, "new.md", &AtomicBool::new(false)),
+            Err(ExplorerError::SourceChanged)
+        ));
+        assert_eq!(
+            fs::read(temp.path().join("notes.md")).expect("replacement preserved"),
+            b"replacement"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("existing.md")).expect("conflict preserved"),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn rename_honors_cancellation_before_mutating() {
+        let (temp, filesystem, root) = fixture();
+        let entry = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("notes entry");
+        let cancelled = AtomicBool::new(true);
+
+        assert!(matches!(
+            filesystem.rename_entry(&entry.reference, "new.md", &cancelled),
+            Err(ExplorerError::Cancelled)
+        ));
+        assert!(temp.path().join("notes.md").exists());
+        assert!(!temp.path().join("new.md").exists());
     }
 
     #[test]

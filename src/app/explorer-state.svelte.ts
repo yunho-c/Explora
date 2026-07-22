@@ -75,6 +75,10 @@ export class ExplorerState {
   breadcrumbs = $state<BreadcrumbSegment[]>([]);
   parentDirectory = $state<DirectoryRef | null>(null);
   selectedEntryId = $state<string | null>(null);
+  renamingEntryId = $state<string | null>(null);
+  renameDraft = $state("");
+  renameSaving = $state(false);
+  renameErrorMessage = $state<string | null>(null);
   searchQuery = $state("");
   viewMode = $state<ViewMode>("list");
   sort = $state<SortDescriptor>({ column: "name", direction: "ascending" });
@@ -102,6 +106,7 @@ export class ExplorerState {
   sshConnectionMessage = $state<string | null>(null);
 
   private directoryController: AbortController | null = null;
+  private renameController: AbortController | null = null;
   private previewController: AbortController | null = null;
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
@@ -254,6 +259,7 @@ export class ExplorerState {
 
   dispose(): void {
     this.directoryController?.abort();
+    this.renameController?.abort();
     this.previewController?.abort();
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();
@@ -842,6 +848,104 @@ export class ExplorerState {
     this.selectedEntryId = entryId;
   }
 
+  startRename(entryId = this.selectedEntryId): void {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    if (!entry?.capabilities.rename || this.renameSaving) return;
+
+    this.selectedEntryId = entry.reference.id;
+    this.renamingEntryId = entry.reference.id;
+    this.renameDraft = entry.name;
+    this.renameErrorMessage = null;
+  }
+
+  cancelRename(): void {
+    this.renameController?.abort();
+    this.renameController = null;
+    this.renamingEntryId = null;
+    this.renameDraft = "";
+    this.renameSaving = false;
+    this.renameErrorMessage = null;
+  }
+
+  async commitRename(): Promise<void> {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === this.renamingEntryId,
+    );
+    if (!entry || this.renameSaving) return;
+    if (this.renameDraft === entry.name) {
+      this.cancelRename();
+      return;
+    }
+    if (this.renameDraft.length === 0) {
+      this.renameErrorMessage = "Enter a file name.";
+      return;
+    }
+
+    this.renameController?.abort();
+    const controller = new AbortController();
+    this.renameController = controller;
+    this.renameSaving = true;
+    this.renameErrorMessage = null;
+    try {
+      const renamed = await this.dataSource.renameEntry(
+        entry,
+        this.renameDraft,
+        controller.signal,
+      );
+      if (this.renameController !== controller) return;
+
+      this.entries = this.entries.map((candidate) =>
+        candidate.reference.id === renamed.reference.id ? renamed : candidate,
+      );
+      this.replaceKnownDirectoryReference(renamed);
+      if (this.preview?.entryId === renamed.reference.id) {
+        this.preview = {
+          ...this.preview,
+          title: renamed.name,
+          accessibilityDescription: renamed.displayPath,
+        };
+      }
+      this.renamingEntryId = null;
+      this.renameDraft = "";
+    } catch (error) {
+      if (!isAbortError(error) && this.renameController === controller) {
+        this.renameErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not rename this item.";
+      }
+    } finally {
+      if (this.renameController === controller) {
+        this.renameController = null;
+        this.renameSaving = false;
+      }
+    }
+  }
+
+  private replaceKnownDirectoryReference(renamed: FileEntrySummary): void {
+    const directory = renamed.directory;
+    if (!directory) return;
+
+    const replace = (candidate: DirectoryRef) =>
+      candidate.id === directory.id ? directory : candidate;
+    this.tabs = this.tabs.map((tab) => ({
+      ...tab,
+      directory: replace(tab.directory),
+      history: tab.history.map(replace),
+      title: tab.directory.id === directory.id ? directory.name : tab.title,
+    }));
+    this.breadcrumbs = this.breadcrumbs.map((breadcrumb) =>
+      breadcrumb.directory.id === directory.id
+        ? { label: directory.name, directory }
+        : breadcrumb,
+    );
+    if (this.parentDirectory?.id === directory.id) {
+      this.parentDirectory = directory;
+    }
+  }
+
   private persistLayoutPreferences(patch: LayoutPreferencesPatch): void {
     this.preferenceWriteQueue = this.preferenceWriteQueue.then(async () => {
       try {
@@ -992,6 +1096,7 @@ export class ExplorerState {
       this.warningMessage = `“${location.name}” is no longer available. Reconnect the volume to continue.`;
       return false;
     }
+    this.cancelRename();
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;

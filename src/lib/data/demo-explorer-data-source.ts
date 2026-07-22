@@ -210,6 +210,12 @@ const makeEntry = (
         }
       : null,
   detail,
+  capabilities: {
+    rename: !locationId.startsWith("ssh:"),
+    move: false,
+    trash: false,
+    deletePermanently: false,
+  },
 });
 
 const entriesByLocation: Readonly<Record<string, readonly FileEntrySummary[]>> =
@@ -494,6 +500,7 @@ const wait = (duration: number, signal: AbortSignal) =>
   });
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
+  private readonly renamedEntries = new Map<string, FileEntrySummary>();
   private sshTargets: SshTargetSummary[] = [
     {
       id: "demo:staging-box",
@@ -678,11 +685,12 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     const isKnownChild = Object.values(entriesByLocation)
       .flat()
       .some((entry) => entry.directory?.id === directory.id);
-    const entries =
+    const entries = (
       rootEntries ??
       (this.dynamicRoots.has(directory.locationId) || isKnownChild
         ? []
-        : undefined);
+        : undefined)
+    )?.map((entry) => this.renamedEntries.get(entry.reference.id) ?? entry);
 
     if (!entries || !root) {
       throw new Error(`Unknown demo directory: ${directory.id}`);
@@ -710,6 +718,60 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       onBatch({ entries: entries.slice(splitAt), replace: false });
     }
     onComplete({ skippedEntries: 0 });
+  }
+
+  async renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    await wait(40, signal);
+    if (!entry.capabilities.rename) {
+      throw new Error("This item cannot be renamed.");
+    }
+    if (
+      newName.length === 0 ||
+      new TextEncoder().encode(newName).length > 255 ||
+      newName === "." ||
+      newName === ".." ||
+      newName.includes("/") ||
+      newName.includes("\0")
+    ) {
+      throw new Error("Enter a valid file name between 1 and 255 bytes.");
+    }
+
+    const siblings = Object.values(entriesByLocation)
+      .find((entries) =>
+        entries.some(
+          (candidate) => candidate.reference.id === entry.reference.id,
+        ),
+      )
+      ?.map(
+        (candidate) =>
+          this.renamedEntries.get(candidate.reference.id) ?? candidate,
+      );
+    if (
+      siblings?.some(
+        (candidate) =>
+          candidate.reference.id !== entry.reference.id &&
+          candidate.name === newName,
+      )
+    ) {
+      throw new Error("An item with that name already exists.");
+    }
+
+    const separator = entry.displayPath.lastIndexOf("/");
+    const displayPath = `${entry.displayPath.slice(0, separator + 1)}${newName}`;
+    const renamed: FileEntrySummary = {
+      ...entry,
+      name: newName,
+      displayPath,
+      directory: entry.directory
+        ? { ...entry.directory, name: newName, displayPath }
+        : null,
+    };
+    this.renamedEntries.set(entry.reference.id, renamed);
+    return renamed;
   }
 
   async getPreview(

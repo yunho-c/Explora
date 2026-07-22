@@ -122,6 +122,31 @@ pub struct LocationSummaryDto {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct EntryCapabilitiesDto {
+    pub rename: bool,
+    pub move_entry: bool,
+    pub trash: bool,
+    pub delete_permanently: bool,
+}
+
+impl EntryCapabilitiesDto {
+    pub const LOCAL_RENAME_ONLY: Self = Self {
+        rename: true,
+        move_entry: false,
+        trash: false,
+        delete_permanently: false,
+    };
+
+    pub const READ_ONLY: Self = Self {
+        rename: false,
+        move_entry: false,
+        trash: false,
+        delete_permanently: false,
+    };
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FileEntrySummaryDto {
     pub reference: EntryRefDto,
     pub name: String,
@@ -132,6 +157,7 @@ pub struct FileEntrySummaryDto {
     pub display_path: String,
     pub directory: Option<DirectoryRefDto>,
     pub detail: Option<&'static str>,
+    pub capabilities: EntryCapabilitiesDto,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -159,6 +185,9 @@ pub enum DirectoryListingEvent {
 #[serde(rename_all = "camelCase")]
 pub enum ExplorerErrorCode {
     InvalidReference,
+    InvalidName,
+    Conflict,
+    SourceChanged,
     NotFound,
     PermissionDenied,
     NotDirectory,
@@ -182,6 +211,12 @@ pub struct ExplorerErrorDto {
 pub enum ExplorerError {
     #[error("This filesystem reference is no longer valid.")]
     InvalidReference,
+    #[error("{0}")]
+    InvalidName(String),
+    #[error("An item with that name already exists.")]
+    Conflict,
+    #[error("The source changed before the operation could finish.")]
+    SourceChanged,
     #[error("The request was cancelled.")]
     Cancelled,
     #[error("Explora's filesystem state is unavailable.")]
@@ -220,6 +255,9 @@ impl From<ExplorerError> for ExplorerErrorDto {
     fn from(error: ExplorerError) -> Self {
         let code = match &error {
             ExplorerError::InvalidReference => ExplorerErrorCode::InvalidReference,
+            ExplorerError::InvalidName(_) => ExplorerErrorCode::InvalidName,
+            ExplorerError::Conflict => ExplorerErrorCode::Conflict,
+            ExplorerError::SourceChanged => ExplorerErrorCode::SourceChanged,
             ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
             ExplorerError::Io { kind, .. } => match kind {
                 std::io::ErrorKind::NotFound => ExplorerErrorCode::NotFound,

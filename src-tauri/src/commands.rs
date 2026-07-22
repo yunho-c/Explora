@@ -9,6 +9,7 @@ use std::{
 use tauri::{ipc::Channel, State};
 
 use crate::{
+    file_operations::{FileOperationCoordinator, FileOperationEventDto, FileOperationRequestDto},
     filesystem::{
         DirectoryListingEvent, ExplorerError, ExplorerErrorDto, ImagePreviewMode,
         LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
@@ -31,6 +32,7 @@ pub struct AppState {
     preview: Arc<PreviewManager>,
     volumes: Arc<VolumeManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    operations: Arc<FileOperationCoordinator>,
 }
 
 impl AppState {
@@ -48,6 +50,7 @@ impl AppState {
             preview: Arc::new(PreviewManager::default()),
             volumes,
             listings: Mutex::new(HashMap::new()),
+            operations: Arc::new(FileOperationCoordinator::default()),
         }
     }
 
@@ -303,6 +306,30 @@ pub fn cancel_listing(
 ) -> Result<(), ExplorerErrorDto> {
     state
         .cancel_listing(&request_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn start_file_operation(
+    state: State<'_, AppState>,
+    request: FileOperationRequestDto,
+    on_event: Channel<FileOperationEventDto>,
+) -> Result<String, ExplorerErrorDto> {
+    state
+        .operations
+        .start(state.local.clone(), request, on_event)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_file_operation(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&operation_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .operations
+        .cancel(&operation_id)
         .map_err(ExplorerErrorDto::from)
 }
 

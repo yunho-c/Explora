@@ -176,6 +176,45 @@ class ControllableVolumeDataSource extends DemoExplorerDataSource {
 }
 
 describe("ExplorerState", () => {
+  it("renames an entry while preserving selection and opaque identity", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry?.capabilities.rename).toBe(true);
+    state.selectEntry(entry!.reference.id);
+    state.startRename();
+    state.renameDraft = "renamed-notes.md";
+
+    await state.commitRename();
+
+    const renamed = state.entries.find(
+      ({ reference }) => reference.id === entry!.reference.id,
+    );
+    expect(renamed).toMatchObject({
+      name: "renamed-notes.md",
+      reference: entry!.reference,
+    });
+    expect(state.selectedEntryId).toBe(entry!.reference.id);
+    expect(state.renamingEntryId).toBeNull();
+    expect(state.renameErrorMessage).toBeNull();
+  });
+
+  it("keeps rename active after a conflict so the user can correct it", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    state.startRename(projects!.reference.id);
+    state.renameDraft = "Photos";
+
+    await state.commitRename();
+
+    expect(state.renamingEntryId).toBe(projects!.reference.id);
+    expect(state.renameErrorMessage).toBe(
+      "An item with that name already exists.",
+    );
+    expect(state.entries.some(({ name }) => name === "Projects")).toBe(true);
+    state.cancelRename();
+    expect(state.renamingEntryId).toBeNull();
+  });
+
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
 

@@ -40,6 +40,22 @@ test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await expect(page.getByRole("grid", { name: "Files" })).toBeVisible();
 });
 
+test("renames a selected local entry inline", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("explora-notes.md").click();
+  await page.keyboard.press("F2");
+  const editor = page.getByRole("textbox", {
+    name: "Rename explora-notes.md",
+  });
+  await expect(editor).toBeFocused();
+  await editor.fill("renamed-notes.md");
+  await editor.press("Enter");
+
+  await expect(page.getByText("renamed-notes.md")).toBeVisible();
+  await expect(editor).toBeHidden();
+});
+
 test("previews a multipage PDF with custom canvas controls", async ({
   page,
 }) => {

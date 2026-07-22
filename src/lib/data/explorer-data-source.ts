@@ -80,6 +80,11 @@ export interface ExplorerDataSource {
     directory: DirectoryRef,
     options: ListDirectoryOptions,
   ): Promise<void>;
+  renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary>;
   getPreview(
     entry: FileEntrySummary,
     options: PreparePreviewOptions,

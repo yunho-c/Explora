@@ -116,6 +116,17 @@ const requireString = (
   return value;
 };
 
+const requireBoolean = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => {
+  const value = record[key];
+  if (typeof value !== "boolean") {
+    throw new Error(`Invalid filesystem response: ${key} must be a boolean.`);
+  }
+  return value;
+};
+
 const parseDirectoryRef = (value: unknown): DirectoryRef => {
   if (!isRecord(value)) {
     throw new Error(
@@ -298,7 +309,11 @@ const parseSshConnectionEvent = (value: unknown): SshConnectionEvent => {
 };
 
 const parseEntry = (value: unknown): FileEntrySummary => {
-  if (!isRecord(value) || !isRecord(value.reference)) {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.reference) ||
+    !isRecord(value.capabilities)
+  ) {
     throw new Error("Invalid filesystem response: entry must be an object.");
   }
 
@@ -340,6 +355,13 @@ const parseEntry = (value: unknown): FileEntrySummary => {
   ) {
     throw new Error("Invalid filesystem response: entry detail is malformed.");
   }
+  const capabilities = value.capabilities;
+  const parsedCapabilities = {
+    rename: requireBoolean(capabilities, "rename"),
+    move: requireBoolean(capabilities, "moveEntry"),
+    trash: requireBoolean(capabilities, "trash"),
+    deletePermanently: requireBoolean(capabilities, "deletePermanently"),
+  };
 
   return {
     reference: {
@@ -355,6 +377,7 @@ const parseEntry = (value: unknown): FileEntrySummary => {
     directory:
       value.directory === null ? null : parseDirectoryRef(value.directory),
     detail: typeof value.detail === "string" ? value.detail : undefined,
+    capabilities: parsedCapabilities,
   };
 };
 
@@ -935,6 +958,117 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     } catch (error) {
       if (signal.aborted) throw abortError();
       if (payloadError) throw payloadError;
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  async renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    if (signal.aborted) throw abortError();
+
+    const channel = new Channel<unknown>();
+    let operationId: string | null = null;
+    let observedOperationId: string | null = null;
+    let lastSequence = -1;
+    let settled = false;
+    let resolveCompletion: (entry: FileEntrySummary) => void = () => {};
+    let rejectCompletion: (error: Error) => void = () => {};
+    const completion = new Promise<FileEntrySummary>((resolve, reject) => {
+      resolveCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    const cancel = () => {
+      if (!operationId) return;
+      void invoke("cancel_file_operation", { operationId }).catch(() => {
+        // Cancellation is best-effort; terminal operation events stay authoritative.
+      });
+    };
+
+    channel.onmessage = (payload) => {
+      if (settled) return;
+      try {
+        if (!isRecord(payload)) {
+          throw new Error(
+            "Invalid filesystem response: operation event is malformed.",
+          );
+        }
+        const eventOperationId = requireString(payload, "operationId");
+        if (
+          observedOperationId !== null &&
+          observedOperationId !== eventOperationId
+        ) {
+          throw new Error(
+            "Invalid filesystem response: operation identity changed.",
+          );
+        }
+        observedOperationId = eventOperationId;
+        if (
+          typeof payload.sequence !== "number" ||
+          !Number.isSafeInteger(payload.sequence) ||
+          payload.sequence <= lastSequence
+        ) {
+          throw new Error(
+            "Invalid filesystem response: operation sequence is stale.",
+          );
+        }
+        lastSequence = payload.sequence;
+
+        if (payload.event === "queued" || payload.event === "running") return;
+        settled = true;
+        if (payload.event === "completed") {
+          resolveCompletion(parseEntry(payload.entry));
+        } else if (payload.event === "cancelled") {
+          rejectCompletion(abortError());
+        } else if (payload.event === "failed") {
+          rejectCompletion(commandError(payload.error));
+        } else {
+          throw new Error(
+            "Invalid filesystem response: unknown operation event.",
+          );
+        }
+      } catch (error) {
+        settled = true;
+        cancel();
+        rejectCompletion(
+          error instanceof Error
+            ? error
+            : new Error("Invalid filesystem operation response."),
+        );
+      }
+    };
+
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const started = await invoke<unknown>("start_file_operation", {
+        request: {
+          sources: [entry.reference],
+          action: { kind: "rename", newName },
+        },
+        onEvent: channel,
+      });
+      if (typeof started !== "string" || started.length === 0) {
+        throw new Error(
+          "Invalid filesystem response: operation ID is malformed.",
+        );
+      }
+      operationId = started;
+      if (observedOperationId !== null && observedOperationId !== operationId) {
+        throw new Error(
+          "Invalid filesystem response: operation ID does not match.",
+        );
+      }
+      if (signal.aborted) {
+        cancel();
+        throw abortError();
+      }
+      return await completion;
+    } catch (error) {
+      if (signal.aborted) throw abortError();
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);

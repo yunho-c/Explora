@@ -9,6 +9,7 @@
   import * as Table from "$lib/components/ui/table";
 
   import FileGlyph from "./FileGlyph.svelte";
+  import RenameInput from "./RenameInput.svelte";
 
   let { state }: { state: ExplorerState } = $props();
 
@@ -89,7 +90,10 @@
             onclick={() => state.selectEntry(entry.reference.id)}
             ondblclick={() => void state.openEntry(entry.reference.id)}
             onkeydown={(event) => {
-              if (event.key === "Enter") {
+              if (event.key === "F2") {
+                event.preventDefault();
+                state.startRename(entry.reference.id);
+              } else if (event.key === "Enter") {
                 event.preventDefault();
                 void state.openEntry(entry.reference.id);
               }
@@ -99,8 +103,12 @@
               <div class="flex min-w-0 items-center gap-3">
                 <FileGlyph kind={entry.contentKind} size="sm" />
                 <div class="min-w-0">
-                  <p class="truncate font-medium">{entry.name}</p>
-                  {#if entry.detail}<p
+                  {#if state.renamingEntryId === entry.reference.id}
+                    <RenameInput {state} {entry} />
+                  {:else}
+                    <p class="truncate font-medium">{entry.name}</p>
+                  {/if}
+                  {#if entry.detail && state.renamingEntryId !== entry.reference.id}<p
                       class="truncate text-xs text-muted-foreground sm:hidden"
                     >
                       {entry.detail}
@@ -125,7 +133,10 @@
       onclick={() => void state.openPreview()}>Quick Preview</ContextMenu.Item
     >
     <ContextMenu.Separator />
-    <ContextMenu.Item disabled>Rename</ContextMenu.Item>
+    <ContextMenu.Item
+      disabled={!state.selectedEntry?.capabilities.rename}
+      onclick={() => state.startRename()}>Rename</ContextMenu.Item
+    >
     <ContextMenu.Item disabled>Move to Trash</ContextMenu.Item>
   </ContextMenu.Content>
 </ContextMenu.Root>

@@ -121,6 +121,13 @@ export type SshPromptResponse =
   | { response: "reject" }
   | { response: "answers"; answers: string[] };
 
+export interface EntryCapabilities {
+  rename: boolean;
+  move: boolean;
+  trash: boolean;
+  deletePermanently: boolean;
+}
+
 export interface FileEntrySummary {
   reference: EntryRef;
   name: string;
@@ -131,6 +138,7 @@ export interface FileEntrySummary {
   displayPath: string;
   directory: DirectoryRef | null;
   detail?: string;
+  capabilities: EntryCapabilities;
 }
 
 export interface ExplorerTab {

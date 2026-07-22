@@ -33,6 +33,12 @@ const entryPayload = {
   displayPath: "/Users/test/notes.md",
   directory: null,
   detail: null,
+  capabilities: {
+    rename: true,
+    moveEntry: false,
+    trash: false,
+    deletePermanently: false,
+  },
 };
 
 const previewEntry: FileEntrySummary = {
@@ -44,6 +50,12 @@ const previewEntry: FileEntrySummary = {
   modifiedAt: entryPayload.modifiedAt,
   displayPath: entryPayload.displayPath,
   directory: null,
+  capabilities: {
+    rename: true,
+    move: false,
+    trash: false,
+    deletePermanently: false,
+  },
 };
 
 const sshTargetPayload = {
@@ -168,10 +180,78 @@ describe("TauriExplorerDataSource", () => {
       breadcrumbs: [{ label: "Home", directory: root }],
     });
     expect(onBatch).toHaveBeenCalledWith({
-      entries: [{ ...entryPayload, detail: undefined }],
+      entries: [previewEntry],
       replace: true,
     });
     expect(onComplete).toHaveBeenCalledWith({ skippedEntries: 0 });
+  });
+
+  it("starts a typed rename operation and resolves its terminal entry", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (
+        !payload ||
+        Array.isArray(payload) ||
+        payload instanceof ArrayBuffer ||
+        payload instanceof Uint8Array
+      ) {
+        throw new Error("Expected operation command arguments.");
+      }
+      expect(payload.request).toEqual({
+        sources: [entryPayload.reference],
+        action: { kind: "rename", newName: "renamed.md" },
+      });
+      sendChannelMessages(payload.onEvent, [
+        { event: "queued", operationId: "operation-1", sequence: 0 },
+        { event: "running", operationId: "operation-1", sequence: 1 },
+        {
+          event: "completed",
+          operationId: "operation-1",
+          sequence: 2,
+          entry: {
+            ...entryPayload,
+            name: "renamed.md",
+            displayPath: "/Users/test/renamed.md",
+          },
+        },
+      ]);
+      return "operation-1";
+    });
+
+    const renamed = await new TauriExplorerDataSource().renameEntry(
+      previewEntry,
+      "renamed.md",
+      new AbortController().signal,
+    );
+
+    expect(renamed).toMatchObject({
+      reference: entryPayload.reference,
+      name: "renamed.md",
+      displayPath: "/Users/test/renamed.md",
+      capabilities: { rename: true, move: false },
+    });
+  });
+
+  it("rejects stale or malformed rename operation events", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        { event: "queued", operationId: "operation-1", sequence: 1 },
+        { event: "running", operationId: "operation-1", sequence: 1 },
+      ]);
+      return "operation-1";
+    });
+
+    await expect(
+      new TauriExplorerDataSource().renameEntry(
+        previewEntry,
+        "renamed.md",
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("operation sequence is stale");
   });
 
   it("rejects malformed IPC data before it reaches explorer state", async () => {

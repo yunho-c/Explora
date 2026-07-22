@@ -1,4 +1,5 @@
 mod commands;
+mod file_operations;
 mod filesystem;
 mod local_filesystem;
 mod preferences;
@@ -169,6 +170,8 @@ pub fn run() {
             commands::disconnect_ssh_target,
             commands::list_directory,
             commands::cancel_listing,
+            commands::start_file_operation,
+            commands::cancel_file_operation,
             commands::prepare_preview,
             commands::cancel_preview,
             commands::read_preview_resource,
