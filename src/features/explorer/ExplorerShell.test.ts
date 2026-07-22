@@ -13,7 +13,9 @@ import {
   type WindowChromeAdapter,
 } from "../../app/window-chrome.svelte";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
+import type { WatchSyncedFoldersOptions } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
+import type { LocationSummary } from "$lib/contracts/explorer";
 
 import ExplorerShell from "./ExplorerShell.svelte";
 
@@ -33,6 +35,78 @@ const renderShell = (state: ExplorerState) => {
     ...render(ExplorerShell, { state, windowChrome }),
   };
 };
+
+class ManualSyncedFolderDataSource extends DemoExplorerDataSource {
+  private revision = 1;
+  private onSnapshot: WatchSyncedFoldersOptions["onSnapshot"] | null = null;
+  readonly folder: LocationSummary = {
+    id: "synced:manual:5f4c234c-bc60-41f4-86e7-f43082f7d331",
+    name: "Synced Folder 1",
+    backend: "local",
+    kind: "syncedFolder",
+    role: "syncedFolder",
+    status: "available",
+    displayPath: "/home/test/Sync",
+    detail: "Manually added · Synced folder",
+    root: {
+      id: "manual-root-token",
+      locationId: "synced:manual:5f4c234c-bc60-41f4-86e7-f43082f7d331",
+      name: "Synced Folder 1",
+      displayPath: "/home/test/Sync",
+    },
+    syncedFolder: {
+      provider: "other",
+      status: "available",
+      source: "manual",
+    },
+  };
+
+  override async listLocations(
+    signal: AbortSignal,
+  ): Promise<readonly LocationSummary[]> {
+    return (await super.listLocations(signal)).filter(
+      ({ kind }) => kind !== "syncedFolder",
+    );
+  }
+
+  override async watchSyncedFolders({
+    signal,
+    onSnapshot,
+  }: WatchSyncedFoldersOptions): Promise<void> {
+    this.onSnapshot = onSnapshot;
+    onSnapshot({
+      revision: this.revision,
+      folders: [],
+      warning: null,
+      canAddFolder: true,
+    });
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  override async addSyncedFolder(): Promise<string | null> {
+    this.revision += 1;
+    this.onSnapshot?.({
+      revision: this.revision,
+      folders: [this.folder],
+      warning: null,
+      canAddFolder: true,
+    });
+    return this.folder.id;
+  }
+
+  override async removeSyncedFolder(folderId: string): Promise<void> {
+    expect(folderId).toBe(this.folder.id);
+    this.revision += 1;
+    this.onSnapshot?.({
+      revision: this.revision,
+      folders: [],
+      warning: null,
+      canAddFolder: true,
+    });
+  }
+}
 
 describe("ExplorerShell", () => {
   it("renders the loaded shell and switches between list and grid views", async () => {
@@ -283,6 +357,45 @@ describe("ExplorerShell", () => {
         screen.getByRole("button", { name: "Configure cloud storage" }),
       ).toHaveFocus(),
     );
+  });
+
+  it("adds and removes an explicit local synced folder without exposing its path as authority", async () => {
+    const dataSource = new ManualSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    renderShell(state);
+
+    expect(
+      screen.getByText("Add a local folder managed by your sync client."),
+    ).toBeInTheDocument();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Add synced folder" }),
+    );
+    const cloudStorage = within(
+      screen.getByRole("navigation", { name: "Cloud storage" }),
+    );
+    await waitFor(() =>
+      expect(
+        cloudStorage.getByRole("button", {
+          name: "Synced Folder 1 available",
+        }),
+      ).toBeInTheDocument(),
+    );
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Configure cloud storage" }),
+    );
+    await fireEvent.click(
+      cloudStorage.getByRole("button", {
+        name: "Remove Synced Folder 1 from Explora",
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText("Add a local folder managed by your sync client."),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("/home/test/Sync")).not.toBeInTheDocument();
   });
 
   it("labels online-only entries and requires a download before preview", async () => {

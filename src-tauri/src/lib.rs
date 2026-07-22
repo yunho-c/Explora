@@ -1,6 +1,7 @@
 mod commands;
 mod filesystem;
 mod local_filesystem;
+mod manual_synced_folders;
 mod preferences;
 mod preview;
 mod ssh;
@@ -88,6 +89,7 @@ fn show_native_titlebar_fallback(window: WebviewWindow) -> Result<(), WindowChro
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_decoration::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let paths = app.path();
             let mut roots = vec![LocalRoot {
@@ -147,13 +149,15 @@ pub fn run() {
 
             let filesystem = std::sync::Arc::new(LocalFilesystem::new(roots)?);
             let volumes = VolumeManager::start(filesystem.clone())?;
-            let synced_folders = SyncedFolderManager::start(filesystem.clone(), paths.home_dir()?)?;
-            let preferences =
-                PreferencesStore::new(paths.app_config_dir()?.join("preferences.json"));
-            let ssh_targets = SshTargetStore::new(
-                paths.app_config_dir()?.join("ssh-targets.json"),
+            let app_config_dir = paths.app_config_dir()?;
+            let synced_folders = SyncedFolderManager::start(
+                filesystem.clone(),
                 paths.home_dir()?,
+                app_config_dir.join("synced-folders.json"),
             )?;
+            let preferences = PreferencesStore::new(app_config_dir.join("preferences.json"));
+            let ssh_targets =
+                SshTargetStore::new(app_config_dir.join("ssh-targets.json"), paths.home_dir()?)?;
             app.manage(AppState::new(
                 filesystem,
                 preferences,
@@ -170,6 +174,8 @@ pub fn run() {
             commands::cancel_volume_watch,
             commands::watch_synced_folders,
             commands::cancel_synced_folder_watch,
+            commands::add_synced_folder,
+            commands::remove_synced_folder,
             commands::get_user_preferences,
             commands::update_user_preferences,
             commands::list_locations,

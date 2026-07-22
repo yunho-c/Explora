@@ -205,7 +205,12 @@ class ControllableSyncedFolderDataSource extends DemoExplorerDataSource {
     revision: number,
     folders: readonly LocationSummary[],
   ): void {
-    this.onSyncedFolderSnapshot?.({ revision, folders, warning: null });
+    this.onSyncedFolderSnapshot?.({
+      revision,
+      folders,
+      warning: null,
+      canAddFolder: false,
+    });
   }
 }
 
@@ -283,6 +288,46 @@ describe("ExplorerState", () => {
       expect(state.activeLocation?.status).toBe("available"),
     );
     expect(state.activeDirectory?.id).toBe(icloud?.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
+  it("keeps a configured manual folder in place while it is offline", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const existing = state.locations.find(({ id }) => id === "synced:icloud");
+    expect(existing).toBeDefined();
+    await state.selectLocation("synced:icloud");
+    const offline: LocationSummary = {
+      ...(existing as LocationSummary),
+      status: "offline",
+      detail: "Manually added · Folder unavailable",
+      syncedFolder: {
+        provider: "other",
+        status: "offline",
+        source: "manual",
+      },
+    };
+
+    dataSource.emitSyncedFolders(1, [offline]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("offline"),
+    );
+    expect(state.activeTab?.locationId).toBe(offline.id);
+    expect(state.warningMessage).toContain("Restore the folder");
+
+    dataSource.emitSyncedFolders(2, [
+      {
+        ...offline,
+        status: "available",
+        detail: "Manually added · Synced folder",
+        syncedFolder: { ...offline.syncedFolder!, status: "available" },
+      },
+    ]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("available"),
+    );
     expect(state.warningMessage).toBeNull();
     state.dispose();
   });

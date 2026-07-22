@@ -25,6 +25,7 @@ import type {
   SshTargetSummary,
   SyncedFolderProvider,
   SyncedFolderSnapshot,
+  SyncedFolderSource,
   SyncedFolderStatus,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
@@ -101,6 +102,9 @@ const syncedFolderStatuses = new Set<SyncedFolderStatus>([
   "error",
   "unknown",
 ]);
+const syncedFolderSources = new Set<SyncedFolderSource>(["system", "manual"]);
+const manualSyncedFolderIdPattern =
+  /^synced:manual:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const sshTargetSources = new Set<SshTargetSource>(["manual", "openSshConfig"]);
 const sshTargetStatuses = new Set<SshTargetStatus>([
   "disconnected",
@@ -229,6 +233,7 @@ const parseLocation = (value: unknown): LocationSummary => {
     }
     const provider = requireString(value.syncedFolder, "provider");
     const syncedStatus = requireString(value.syncedFolder, "status");
+    const source = requireString(value.syncedFolder, "source");
     if (!syncedFolderProviders.has(provider as SyncedFolderProvider)) {
       throw new Error(
         `Invalid filesystem response: unknown synced-folder provider ${provider}.`,
@@ -239,9 +244,15 @@ const parseLocation = (value: unknown): LocationSummary => {
         `Invalid filesystem response: unknown synced-folder status ${syncedStatus}.`,
       );
     }
+    if (!syncedFolderSources.has(source as SyncedFolderSource)) {
+      throw new Error(
+        `Invalid filesystem response: unknown synced-folder source ${source}.`,
+      );
+    }
     syncedFolder = {
       provider: provider as SyncedFolderProvider,
       status: syncedStatus as SyncedFolderStatus,
+      source: source as SyncedFolderSource,
     };
   } else if (value.syncedFolder !== null) {
     throw new Error(
@@ -750,6 +761,11 @@ const parseSyncedFolderSnapshot = (value: unknown): SyncedFolderSnapshot => {
   if (value.warning !== null && typeof value.warning !== "string") {
     throw new Error("Invalid synced-folder response: warning is malformed.");
   }
+  if (typeof value.canAddFolder !== "boolean") {
+    throw new Error(
+      "Invalid synced-folder response: add-folder capability is malformed.",
+    );
+  }
   const folders = value.folders.map(parseLocation);
   if (
     folders.some(
@@ -770,6 +786,7 @@ const parseSyncedFolderSnapshot = (value: unknown): SyncedFolderSnapshot => {
     revision: value.revision,
     folders,
     warning: value.warning,
+    canAddFolder: value.canAddFolder,
   };
 };
 
@@ -890,6 +907,40 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     } finally {
       signal.removeEventListener("abort", cancel);
     }
+  }
+
+  async addSyncedFolder(signal: AbortSignal): Promise<string | null> {
+    if (signal.aborted) throw abortError();
+    const result = await invoke<unknown>("add_synced_folder").catch((error) => {
+      throw commandError(error);
+    });
+    if (signal.aborted) throw abortError();
+    if (result === null) return null;
+    if (
+      typeof result !== "string" ||
+      result.length > 512 ||
+      !manualSyncedFolderIdPattern.test(result) ||
+      /\p{Cc}/u.test(result)
+    ) {
+      throw new Error(
+        "Invalid synced-folder response: folder ID is malformed.",
+      );
+    }
+    return result;
+  }
+
+  async removeSyncedFolder(
+    folderId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) throw abortError();
+    if (!manualSyncedFolderIdPattern.test(folderId)) {
+      throw new Error("Invalid synced-folder request: folder ID is malformed.");
+    }
+    await invoke("remove_synced_folder", { folderId }).catch((error) => {
+      throw commandError(error);
+    });
+    if (signal.aborted) throw abortError();
   }
 
   async listSshTargets(

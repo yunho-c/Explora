@@ -6,7 +6,8 @@ use std::{
     },
 };
 
-use tauri::{ipc::Channel, State};
+use tauri::{ipc::Channel, AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::{
     filesystem::{
@@ -182,6 +183,52 @@ pub fn cancel_synced_folder_watch(
         .synced_folders
         .unsubscribe(&request_id)
         .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn add_synced_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, ExplorerErrorDto> {
+    if !state.synced_folders.can_add_folder() {
+        return Err(ExplorerErrorDto::from(ExplorerError::Unsupported(
+            "Adding synced folders manually is not supported on this platform.".to_owned(),
+        )));
+    }
+    let Some(selection) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let path = selection.into_path().map_err(|_| {
+        ExplorerErrorDto::from(ExplorerError::InvalidConfiguration(
+            "The selected synced folder is not a local filesystem directory.".to_owned(),
+        ))
+    })?;
+    state
+        .synced_folders
+        .add_manual_folder(path)
+        .map(Some)
+        .map_err(|error| synced_folder_configuration_error(error).into())
+}
+
+#[tauri::command]
+pub async fn remove_synced_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    state
+        .synced_folders
+        .remove_manual_folder(&folder_id)
+        .map_err(|error| synced_folder_configuration_error(error).into())
+}
+
+fn synced_folder_configuration_error(error: ExplorerError) -> ExplorerError {
+    match error {
+        ExplorerError::Io { kind, .. } => ExplorerError::Io {
+            message: "Explora could not update its saved synced folders.".to_owned(),
+            kind,
+        },
+        error => error,
+    }
 }
 
 #[tauri::command]
@@ -552,6 +599,21 @@ mod tests {
         let redacted = redact_synced_folder_error(error).to_string();
         assert_eq!(redacted, "Explora could not read this synced folder.");
         assert!(!redacted.contains("account@example.com"));
+    }
+
+    #[test]
+    fn synced_folder_configuration_errors_do_not_expose_selected_paths() {
+        let error = ExplorerError::Io {
+            message: "could not save /home/person/private-cloud".to_owned(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+
+        let redacted = synced_folder_configuration_error(error).to_string();
+        assert_eq!(
+            redacted,
+            "Explora could not update its saved synced folders."
+        );
+        assert!(!redacted.contains("private-cloud"));
     }
 
     #[test]

@@ -15,9 +15,9 @@ use uuid::Uuid;
 use crate::filesystem::{
     BreadcrumbSegmentDto, ContentAvailability, DirectoryListingEvent, DirectoryRefDto, EntryRefDto,
     ExplorerError, FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
-    SyncedFolderMetadataDto, SyncedFolderProvider, LISTING_BATCH_SIZE,
+    SyncedFolderMetadataDto, LISTING_BATCH_SIZE,
 };
-use crate::synced_availability::SyncedAvailabilityInspector;
+use crate::synced_availability::{SyncedAvailabilityInspector, SyncedAvailabilityPolicy};
 
 #[derive(Debug, Clone)]
 pub struct LocalRoot {
@@ -100,7 +100,8 @@ impl PathRegistry {
 pub struct LocalFilesystem {
     registry: PathRegistry,
     locations: RwLock<Vec<LocationSummaryDto>>,
-    availability: SyncedAvailabilityInspector,
+    synced_availability: RwLock<HashMap<String, SyncedAvailabilityPolicy>>,
+    availability_inspector: SyncedAvailabilityInspector,
 }
 
 pub(crate) struct LocalPreviewAccess {
@@ -125,6 +126,7 @@ pub struct SyncedFolderRoot {
     pub path: PathBuf,
     pub detail: String,
     pub metadata: SyncedFolderMetadataDto,
+    pub availability: SyncedAvailabilityPolicy,
 }
 
 impl LocalFilesystem {
@@ -164,7 +166,8 @@ impl LocalFilesystem {
         Ok(Self {
             registry,
             locations: RwLock::new(locations),
-            availability: SyncedAvailabilityInspector::default(),
+            synced_availability: RwLock::new(HashMap::new()),
+            availability_inspector: SyncedAvailabilityInspector::default(),
         })
     }
 
@@ -261,10 +264,17 @@ impl LocalFilesystem {
             .map(|location| (location.id.clone(), location.clone()))
             .collect::<HashMap<_, _>>();
         locations.retain(|location| location.kind != "syncedFolder");
+        let mut availability = self
+            .synced_availability
+            .write()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let mut next_availability = HashMap::new();
 
         let mut summaries = Vec::with_capacity(folders.len());
         for folder in folders {
-            if !folder.path.is_dir() {
+            if folder.metadata.status == crate::filesystem::SyncedFolderStatus::Available
+                && !folder.path.is_dir()
+            {
                 continue;
             }
             let display_path = folder.path.display().to_string();
@@ -279,17 +289,19 @@ impl LocalFilesystem {
                 self.registry.remove_location(&folder.id)?;
                 directory_ref(&self.registry, &folder.path, &folder.id, Some(&folder.name))?
             };
+            next_availability.insert(folder.id.clone(), folder.availability);
             summaries.push(LocationSummaryDto {
                 id: folder.id,
                 name: folder.name,
                 backend: LocationBackend::Local,
                 kind: "syncedFolder",
                 role: LocationRole::SyncedFolder,
-                status: if folder.metadata.status == crate::filesystem::SyncedFolderStatus::Offline
+                status: if folder.metadata.status
+                    == crate::filesystem::SyncedFolderStatus::Available
                 {
-                    "offline"
-                } else {
                     "available"
+                } else {
+                    "offline"
                 },
                 display_path: directory.display_path.clone(),
                 detail: folder.detail,
@@ -297,6 +309,7 @@ impl LocalFilesystem {
                 synced_folder: Some(folder.metadata),
             });
         }
+        *availability = next_availability;
         for id in previous.keys() {
             if !summaries.iter().any(|location| &location.id == id) {
                 self.registry.remove_location(id)?;
@@ -311,14 +324,12 @@ impl LocalFilesystem {
         entry_id: &str,
         location_id: &str,
     ) -> Result<LocalPreviewAccess, ExplorerError> {
-        let location = self
-            .locations
-            .read()
-            .map_err(|_| ExplorerError::StateUnavailable)?
-            .iter()
-            .find(|location| location.id == location_id)
-            .cloned()
-            .ok_or(ExplorerError::InvalidReference)?;
+        let (location, synced_availability) = self.location_with_availability(location_id)?;
+        if location.status == "offline" {
+            return Err(ExplorerError::Offline(
+                "This synced folder is currently unavailable.".to_owned(),
+            ));
+        }
         let path = self.registry.resolve(location_id, entry_id)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
@@ -332,12 +343,10 @@ impl LocalFilesystem {
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let availability = if metadata.file_type().is_file() {
-            location
-                .synced_folder
-                .as_ref()
-                .map(|synced| {
-                    self.availability
-                        .inspect(synced.provider, path.as_path(), false)
+            synced_availability
+                .map(|policy| {
+                    self.availability_inspector
+                        .inspect(policy, path.as_path(), false)
                 })
                 .unwrap_or(ContentAvailability::Local)
         } else {
@@ -366,14 +375,12 @@ impl LocalFilesystem {
         F: FnMut(DirectoryListingEvent) -> Result<(), ExplorerError>,
     {
         ensure_not_cancelled(cancelled)?;
-        let location = self
-            .locations
-            .read()
-            .map_err(|_| ExplorerError::StateUnavailable)?
-            .iter()
-            .find(|location| location.id == location_id)
-            .cloned()
-            .ok_or(ExplorerError::InvalidReference)?;
+        let (location, synced_availability) = self.location_with_availability(location_id)?;
+        if location.status == "offline" {
+            return Err(ExplorerError::Offline(
+                "This synced folder is currently unavailable.".to_owned(),
+            ));
+        }
         let root_path = self.registry.resolve(location_id, &location.root.id)?;
         let path = self.registry.resolve(location_id, directory_id)?;
         if !path.starts_with(&root_path) {
@@ -418,11 +425,7 @@ impl LocalFilesystem {
                 }
             };
 
-            let synced_provider = location
-                .synced_folder
-                .as_ref()
-                .map(|synced| synced.provider);
-            match self.describe_entry(entry, location_id, synced_provider) {
+            match self.describe_entry(entry, location_id, synced_availability) {
                 Ok(entry) => batch.push(entry),
                 Err(_) => {
                     skipped_entries += 1;
@@ -457,7 +460,7 @@ impl LocalFilesystem {
         &self,
         entry: fs::DirEntry,
         location_id: &str,
-        synced_provider: Option<SyncedFolderProvider>,
+        synced_availability: Option<SyncedAvailabilityPolicy>,
     ) -> Result<FileEntrySummaryDto, ExplorerError> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -495,8 +498,11 @@ impl LocalFilesystem {
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
         let availability = if file_type.is_file() {
-            synced_provider
-                .map(|provider| self.availability.inspect(provider, path.as_path(), false))
+            synced_availability
+                .map(|policy| {
+                    self.availability_inspector
+                        .inspect(policy, path.as_path(), false)
+                })
                 .unwrap_or(ContentAvailability::Local)
         } else {
             ContentAvailability::Local
@@ -517,6 +523,31 @@ impl LocalFilesystem {
             availability,
             detail: file_type.is_symlink().then_some("Symbolic link"),
         })
+    }
+
+    fn location_with_availability(
+        &self,
+        location_id: &str,
+    ) -> Result<(LocationSummaryDto, Option<SyncedAvailabilityPolicy>), ExplorerError> {
+        // Keep the location read lock while reading the policy. Synced-folder
+        // replacement takes the same locks in write order, so callers never
+        // observe a new location paired with stale availability behavior.
+        let locations = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let location = locations
+            .iter()
+            .find(|location| location.id == location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let availability = self
+            .synced_availability
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .get(location_id)
+            .copied();
+        Ok((location, availability))
     }
 }
 
@@ -829,7 +860,9 @@ mod tests {
             metadata: SyncedFolderMetadataDto {
                 provider: crate::filesystem::SyncedFolderProvider::Other,
                 status: crate::filesystem::SyncedFolderStatus::Available,
+                source: crate::filesystem::SyncedFolderSource::System,
             },
+            availability: SyncedAvailabilityPolicy::Unknown,
         };
 
         let first = filesystem
@@ -894,7 +927,9 @@ mod tests {
                 metadata: SyncedFolderMetadataDto {
                     provider: crate::filesystem::SyncedFolderProvider::Other,
                     status: crate::filesystem::SyncedFolderStatus::Available,
+                    source: crate::filesystem::SyncedFolderSource::System,
                 },
+                availability: SyncedAvailabilityPolicy::Unknown,
             }])
             .expect("synced snapshot")
             .remove(0);
@@ -941,6 +976,88 @@ mod tests {
         assert!(matches!(
             filesystem.resolve_preview_access("forged-token", &location.id),
             Err(ExplorerError::InvalidReference)
+        ));
+    }
+
+    #[test]
+    fn local_mirror_policy_allows_bounded_content_access() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("local-mirror");
+        fs::create_dir(&synced_path).expect("local mirror");
+        let file_path = synced_path.join("available.txt");
+        File::create(&file_path).expect("local file");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:manual:test".to_owned(),
+                name: "Synced Folder 1".to_owned(),
+                path: synced_path,
+                detail: "Manually added · Synced folder".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::Other,
+                    status: crate::filesystem::SyncedFolderStatus::Available,
+                    source: crate::filesystem::SyncedFolderSource::Manual,
+                },
+                availability: SyncedAvailabilityPolicy::LocalMirror,
+            }])
+            .expect("synced snapshot")
+            .remove(0);
+        let mut file = None;
+
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        file = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "available.txt");
+                    }
+                    Ok(())
+                },
+            )
+            .expect("local mirror listing");
+        let file = file.expect("listed local file");
+        assert_eq!(file.availability, ContentAvailability::Local);
+        assert_eq!(
+            filesystem
+                .resolve_preview_access(&file.reference.id, &location.id)
+                .expect("preview access")
+                .availability,
+            ContentAvailability::Local
+        );
+    }
+
+    #[test]
+    fn offline_manual_roots_remain_listed_but_cannot_be_traversed() {
+        let (temp, filesystem, _) = fixture();
+        let missing_path = temp.path().join("temporarily-unavailable");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:manual:offline".to_owned(),
+                name: "Synced Folder 1".to_owned(),
+                path: missing_path,
+                detail: "Manually added · Folder unavailable".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::Other,
+                    status: crate::filesystem::SyncedFolderStatus::Offline,
+                    source: crate::filesystem::SyncedFolderSource::Manual,
+                },
+                availability: SyncedAvailabilityPolicy::LocalMirror,
+            }])
+            .expect("offline snapshot")
+            .remove(0);
+
+        assert_eq!(location.status, "offline");
+        assert!(matches!(
+            filesystem.list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |_| Ok(())
+            ),
+            Err(ExplorerError::Offline(_))
         ));
     }
 

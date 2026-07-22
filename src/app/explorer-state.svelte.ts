@@ -85,6 +85,7 @@ export class ExplorerState {
   preferencesWarningMessage = $state<string | null>(null);
   volumeWarningMessage = $state<string | null>(null);
   syncedFolderWarningMessage = $state<string | null>(null);
+  syncedFolderConfigurationError = $state<string | null>(null);
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
@@ -95,6 +96,8 @@ export class ExplorerState {
   hiddenSshTargetIds = $state<string[]>([]);
   editingFavorites = $state(false);
   editingSyncedFolders = $state(false);
+  canAddSyncedFolder = $state(false);
+  syncedFolderSaving = $state(false);
   editingSshTargets = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
@@ -111,6 +114,7 @@ export class ExplorerState {
   private sshConnectionController: AbortController | null = null;
   private volumeWatchController: AbortController | null = null;
   private syncedFolderWatchController: AbortController | null = null;
+  private syncedFolderMutationController: AbortController | null = null;
   private volumeRevision = -1;
   private syncedFolderRevision = -1;
   private tabSequence = 0;
@@ -282,6 +286,7 @@ export class ExplorerState {
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();
     this.syncedFolderWatchController?.abort();
+    this.syncedFolderMutationController?.abort();
   }
 
   private startVolumeWatch(): void {
@@ -401,6 +406,7 @@ export class ExplorerState {
     if (snapshot.revision <= this.syncedFolderRevision) return;
     this.syncedFolderRevision = snapshot.revision;
     this.syncedFolderWarningMessage = snapshot.warning;
+    this.canAddSyncedFolder = snapshot.canAddFolder;
 
     const previousFolders = this.locations.filter(
       ({ kind }) => kind === "syncedFolder",
@@ -429,18 +435,33 @@ export class ExplorerState {
     const removedActiveFolder = activeTab
       ? offlineFolders.find(({ id }) => id === activeTab.locationId)
       : undefined;
-    if (removedActiveFolder) {
+    const transitionedOfflineFolder = activeTab
+      ? snapshot.folders.find(
+          ({ id, status }) =>
+            id === activeTab.locationId &&
+            status === "offline" &&
+            previousFolders.find((folder) => folder.id === id)?.status !==
+              "offline",
+        )
+      : undefined;
+    const unavailableActiveFolder =
+      removedActiveFolder ?? transitionedOfflineFolder;
+    if (unavailableActiveFolder) {
       this.directoryController?.abort();
       this.previewController?.abort();
       this.loading = false;
-      this.warningMessage = `“${removedActiveFolder.name}” is no longer available. Restart its sync provider to continue.`;
+      this.warningMessage =
+        unavailableActiveFolder.syncedFolder?.source === "manual"
+          ? `“${unavailableActiveFolder.name}” is no longer available. Restore the folder or add it again to continue.`
+          : `“${unavailableActiveFolder.name}” is no longer available. Restart its sync provider to continue.`;
     }
 
     const restoredIds = snapshot.folders
       .filter(
-        ({ id }) =>
+        ({ id, status }) =>
+          status === "available" &&
           previousFolders.find((location) => location.id === id)?.status ===
-          "offline",
+            "offline",
       )
       .map(({ id }) => id);
     if (restoredIds.length === 0) return;
@@ -971,6 +992,67 @@ export class ExplorerState {
         : [...this.hiddenSyncedFolderIds, folderId].sort();
     this.hiddenSyncedFolderIds = hiddenSyncedFolderIds;
     this.persistLayoutPreferences({ hiddenSyncedFolderIds });
+  }
+
+  async addSyncedFolder(): Promise<void> {
+    if (!this.canAddSyncedFolder || this.syncedFolderSaving) return;
+    this.syncedFolderMutationController?.abort();
+    const controller = new AbortController();
+    this.syncedFolderMutationController = controller;
+    this.syncedFolderSaving = true;
+    this.syncedFolderConfigurationError = null;
+    try {
+      const folderId = await this.dataSource.addSyncedFolder(controller.signal);
+      if (folderId && this.hiddenSyncedFolderIds.includes(folderId)) {
+        this.setSyncedFolderVisible(folderId, true);
+      }
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.syncedFolderConfigurationError =
+          error instanceof Error
+            ? error.message
+            : "Explora could not add the selected synced folder.";
+      }
+    } finally {
+      if (this.syncedFolderMutationController === controller) {
+        this.syncedFolderSaving = false;
+        this.syncedFolderMutationController = null;
+      }
+    }
+  }
+
+  async removeSyncedFolder(folderId: string): Promise<void> {
+    const folder = this.syncedFolderLocations.find(({ id }) => id === folderId);
+    if (
+      !folder ||
+      folder.syncedFolder?.source !== "manual" ||
+      this.syncedFolderSaving
+    )
+      return;
+    this.syncedFolderMutationController?.abort();
+    const controller = new AbortController();
+    this.syncedFolderMutationController = controller;
+    this.syncedFolderSaving = true;
+    this.syncedFolderConfigurationError = null;
+    try {
+      await this.dataSource.removeSyncedFolder(folderId, controller.signal);
+      this.editingSyncedFolders = false;
+      if (this.hiddenSyncedFolderIds.includes(folderId)) {
+        this.setSyncedFolderVisible(folderId, true);
+      }
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.syncedFolderConfigurationError =
+          error instanceof Error
+            ? error.message
+            : "Explora could not remove the synced folder.";
+      }
+    } finally {
+      if (this.syncedFolderMutationController === controller) {
+        this.syncedFolderSaving = false;
+        this.syncedFolderMutationController = null;
+      }
+    }
   }
 
   selectEntry(entryId: string): void {

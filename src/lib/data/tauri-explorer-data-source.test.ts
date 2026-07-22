@@ -100,7 +100,11 @@ const syncedFolderPayload = {
     name: "iCloud Drive",
     displayPath: "/Users/test/Library/Mobile Documents/com~apple~CloudDocs",
   },
-  syncedFolder: { provider: "iCloud", status: "available" },
+  syncedFolder: {
+    provider: "iCloud",
+    status: "available",
+    source: "system",
+  },
 };
 
 const sendChannelMessages = (
@@ -330,7 +334,12 @@ describe("TauriExplorerDataSource", () => {
           throw new Error("Expected synced-folder watch arguments.");
         }
         sendChannelMessages(payload.onEvent, [
-          { revision: 3, folders: [syncedFolderPayload], warning: null },
+          {
+            revision: 3,
+            folders: [syncedFolderPayload],
+            warning: null,
+            canAddFolder: true,
+          },
         ]);
       }
       return null;
@@ -345,6 +354,7 @@ describe("TauriExplorerDataSource", () => {
       revision: 3,
       folders: [syncedFolderPayload],
       warning: null,
+      canAddFolder: true,
     });
     expect(commands).toContain("cancel_synced_folder_watch");
   });
@@ -360,6 +370,7 @@ describe("TauriExplorerDataSource", () => {
             revision: 1,
             folders: [{ ...syncedFolderPayload, syncedFolder: null }],
             warning: null,
+            canAddFolder: false,
           },
         ]);
       }
@@ -373,6 +384,45 @@ describe("TauriExplorerDataSource", () => {
         onSnapshot: () => {},
       }),
     ).rejects.toThrow("synced-folder metadata is missing");
+  });
+
+  it("adds and removes only opaque manual synced-folder IDs", async () => {
+    const calls: Array<{ command: string; payload: unknown }> = [];
+    mockIPC((command, payload) => {
+      calls.push({ command, payload });
+      if (command === "add_synced_folder") {
+        return "synced:manual:5f4c234c-bc60-41f4-86e7-f43082f7d331";
+      }
+      return null;
+    });
+    const source = new TauriExplorerDataSource();
+    const signal = new AbortController().signal;
+
+    const id = await source.addSyncedFolder(signal);
+    expect(id).toBe("synced:manual:5f4c234c-bc60-41f4-86e7-f43082f7d331");
+    await source.removeSyncedFolder(id!, signal);
+    expect(calls).toContainEqual({
+      command: "remove_synced_folder",
+      payload: { folderId: id },
+    });
+  });
+
+  it("rejects malformed manual synced-folder command results", async () => {
+    mockIPC((command) =>
+      command === "add_synced_folder" ? "/Users/private/Cloud" : null,
+    );
+
+    await expect(
+      new TauriExplorerDataSource().addSyncedFolder(
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("folder ID is malformed");
+    await expect(
+      new TauriExplorerDataSource().removeSyncedFolder(
+        "/home/person/private-cloud",
+        new AbortController().signal,
+      ),
+    ).rejects.toThrow("folder ID is malformed");
   });
 
   it("forwards AbortSignal cancellation to the active Rust listing", async () => {

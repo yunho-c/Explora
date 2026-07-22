@@ -67,6 +67,8 @@ export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   watchVolumes(options: WatchVolumesOptions): Promise<void>;
   watchSyncedFolders(options: WatchSyncedFoldersOptions): Promise<void>;
+  addSyncedFolder(signal: AbortSignal): Promise<string | null>;
+  removeSyncedFolder(folderId: string, signal: AbortSignal): Promise<void>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
   createSshTarget(
     input: ManualSshTargetInput,

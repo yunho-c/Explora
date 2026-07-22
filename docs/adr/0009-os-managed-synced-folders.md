@@ -56,6 +56,15 @@ Platform adapters use the strongest provider-neutral facility available:
 - Linux may use ordinary local roots immediately; non-file GIO/GVfs locations
   require a real GIO backend before they are shown as browseable.
 
+On Linux, the initial fallback lets the user select an ordinary local directory
+through a Rust-owned native folder picker. The picker returns the selected path
+only to Rust, and its command result contains only an opaque location identity.
+Explora stores the path in a versioned owner-only configuration file, including
+raw OS path data needed to preserve non-UTF-8 names. Display paths in normal
+read-only filesystem summaries remain presentation-only and are never accepted
+back as authority. Removing the location changes only Explora's configuration;
+it never deletes or modifies the selected directory.
+
 ## Security and privacy invariants
 
 - Display paths, folder names, account labels, and provider names are never
@@ -65,6 +74,8 @@ Platform adapters use the strongest provider-neutral facility available:
 - Removing a root revokes every opaque path reference for that location before
   the removal snapshot is published.
 - A non-file URI is never coerced into a local path or passed through a shell.
+- Native folder selection and saved-path authority remain behind Rust; the
+  webview receives no generic dialog or filesystem permission.
 - Metadata, preview, search, and thumbnail work may not trigger unbounded or
   implicit hydration.
 - Unsupported platforms and unavailable providers report honest capability and

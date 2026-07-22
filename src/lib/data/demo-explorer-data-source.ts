@@ -209,7 +209,11 @@ const locations: readonly LocationSummary[] = [
     displayPath: "iCloud Drive",
     detail: "iCloud Drive · Synced folder",
     root: roots["synced:icloud"],
-    syncedFolder: { provider: "iCloud", status: "available" },
+    syncedFolder: {
+      provider: "iCloud",
+      status: "available",
+      source: "system",
+    },
   },
   {
     id: "synced:onedrive",
@@ -221,7 +225,11 @@ const locations: readonly LocationSummary[] = [
     displayPath: "OneDrive",
     detail: "OneDrive · Synced folder",
     root: roots["synced:onedrive"],
-    syncedFolder: { provider: "oneDrive", status: "available" },
+    syncedFolder: {
+      provider: "oneDrive",
+      status: "available",
+      source: "system",
+    },
   },
   {
     id: "synced:google-drive",
@@ -233,7 +241,11 @@ const locations: readonly LocationSummary[] = [
     displayPath: "Google Drive",
     detail: "Google Drive · Synced folder",
     root: roots["synced:google-drive"],
-    syncedFolder: { provider: "googleDrive", status: "available" },
+    syncedFolder: {
+      provider: "googleDrive",
+      status: "available",
+      source: "system",
+    },
   },
   {
     id: "staging-box",
@@ -710,11 +722,25 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       revision: 1,
       folders: locations.filter(({ kind }) => kind === "syncedFolder"),
       warning: null,
+      canAddFolder: false,
     };
     onSnapshot(snapshot);
     await new Promise<void>((resolve) => {
       signal.addEventListener("abort", () => resolve(), { once: true });
     });
+  }
+
+  async addSyncedFolder(signal: AbortSignal): Promise<string | null> {
+    await wait(0, signal);
+    return null;
+  }
+
+  async removeSyncedFolder(
+    _folderId: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await wait(0, signal);
+    throw new Error("Demo synced folders cannot be removed.");
   }
 
   async listSshTargets(

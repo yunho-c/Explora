@@ -152,13 +152,16 @@ type SyncedFolderProvider = "iCloud" | "oneDrive" | "googleDrive" | "other";
 interface SyncedFolderMetadata {
   provider: SyncedFolderProvider;
   status: "available" | "offline" | "paused" | "error" | "unknown";
+  source: "system" | "manual";
 }
 ```
 
 The important invariant is that provider names and string ID prefixes do not
 become backend dispatch. Rust now resolves an ID against registered local roots
-or active SSH sessions and rejects unknown or ambiguous identities. A later GIO
-transport must extend the backend contract explicitly.
+or active SSH sessions and rejects unknown or ambiguous identities. Availability
+inspection is also selected by a Rust-owned access policy—iCloud metadata,
+Windows Cloud Files, known local mirror, or unknown—rather than provider brand.
+A later GIO transport must extend the backend contract explicitly.
 
 ### Identity and privacy
 
@@ -222,6 +225,10 @@ Prefer a small typed command/event surface:
 
 - `watch_synced_folders(request_id, channel)`
 - `cancel_synced_folder_watch(request_id)`
+- `add_synced_folder()` opens a Rust-owned native directory picker where the
+  snapshot reports that capability and returns only an opaque location ID; the
+  selected path is not a command result.
+- `remove_synced_folder(folder_id)` removes only a manually configured location.
 - A later generic content-availability query or event stream.
 - A later task-based `request_content` operation, shared with remote and other
   delayed-content backends where practical.
@@ -322,10 +329,22 @@ requires a GIO filesystem backend for listing, metadata, reads, cancellation,
 and errors; resolving its URI through shell commands or assuming a FUSE mirror
 is not an acceptable substitute.
 
-The first Linux slice may discover only synced folders that are real local paths
-and allow users to add such a folder explicitly. GIO/GVfs support should be a
-separate vertical slice with contract tests. The UI must describe the limitation
-honestly rather than showing an unusable mount.
+The first Linux slice supports ordinary local paths through an explicit **Add
+synced folder** action. The official Tauri dialog plugin is invoked only from an
+async Rust command; its frontend commands are not granted, and the selected path
+is not returned by the command. Explora rejects files and symlink roots,
+canonicalizes the selected directory, derives a random opaque location identity,
+and stores the OS path representation in a versioned owner-only configuration
+file. This preserves non-UTF-8 Unix paths without making the display paths in
+normal filesystem summaries authoritative.
+
+Manually added roots use an explicit local-mirror availability policy, so known
+local files may enter the existing bounded preview pipeline. If a saved root is
+temporarily missing or no longer a real directory, it remains visible as offline
+or errored and can still be removed. Removing it only forgets the Explora
+location; it never touches files. Automatic local-root discovery is still open.
+GIO/GVfs support remains a separate vertical slice with contract tests. The UI
+must describe the limitation honestly rather than showing an unusable mount.
 
 ## Implementation strategy
 
@@ -366,7 +385,9 @@ honestly rather than showing an unusable mount.
 
 ### Phase 4: Linux vertical slices
 
-- Support explicitly added and reliably detected local sync folders.
+- Support explicitly added local sync folders through a Rust-owned picker.
+- Add only reliably detected local sync folders when a provider-neutral source
+  can prove their identity.
 - Evaluate GIO dependencies, runtime availability, licensing, and packaging.
 - Add a GIO backend before displaying non-file GVfs roots.
 - Validate GNOME Online Accounts and common non-GNOME fallback behavior.
@@ -429,13 +450,18 @@ honestly rather than showing an unusable mount.
 
 - [ ] Define the initial supported desktop and distribution matrix.
 - [ ] Discover accessible local synced folders without provider databases.
-- [ ] Provide an explicit add-folder fallback.
+- [x] Provide an explicit add-folder fallback through a Rust-owned native picker.
+- [x] Persist manual roots with opaque IDs and owner-only, non-UTF-8-safe storage.
+- [x] Keep unavailable manual roots visible, offline, and removable.
+- [x] Keep picker results and dialog capabilities behind Rust; expose paths only
+      as non-authoritative display data in normal filesystem summaries.
 - [ ] Evaluate `GVolumeMonitor` and mount lifecycle integration.
 - [ ] Decide whether a GIO backend is accepted for the first stable release.
 - [ ] Implement GIO listing and reads before exposing non-file mounts.
 - [ ] Test GNOME Online Accounts Google Drive where supported.
 - [ ] Test environments without GVfs or a running GLib main loop.
 - [ ] Verify packaging does not silently load unapproved GIO modules.
+- [ ] Test the native folder picker on representative GNOME and KDE sessions.
 - [ ] Run packaged Linux native smoke tests.
 
 ### Hydration and preview
@@ -474,11 +500,13 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   stored.
 - Duplicate provider roots receive sanitized ordinal labels such as
   `OneDrive 1` and `OneDrive 2`; account identifiers stay private.
+- Explicit Linux roots receive stable generic labels and are treated as local
+  mirrors; no provider is inferred from the selected folder name.
 
 ## Open decisions
 
-- Should an explicitly added local folder be marked as synced only by the user,
-  or may Explora infer that status from platform metadata?
+- Which provider-neutral signals, if any, are strong enough for automatic Linux
+  local-root discovery?
 - Is GIO an accepted backend dependency, or should Linux initially support only
   ordinary local paths?
 - Which packaging models are supported on macOS, and will a sandboxed build need
@@ -517,3 +545,5 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [GNOME API Documentation](https://docs.gtk.org/gio/class.VolumeMonitor.html)
 - GIO mount semantics:
   [GNOME API Documentation](https://docs.gtk.org/gio/iface.Mount.html)
+- Rust-owned native folder selection:
+  [Tauri Dialog Plugin](https://v2.tauri.app/plugin/dialog/)

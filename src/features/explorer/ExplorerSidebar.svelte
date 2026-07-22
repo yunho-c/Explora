@@ -345,7 +345,7 @@
         {/each}
       </nav>
 
-      {#if state.syncedFolderLocations.length > 0}
+      {#if state.syncedFolderLocations.length > 0 || state.canAddSyncedFolder}
         <div
           class={cn(
             "group/synced-folders flex items-center pt-5 pb-1",
@@ -353,42 +353,74 @@
           )}
         >
           {#if compact}
-            <CloudIcon
-              class="size-3.5 text-muted-foreground"
-              aria-hidden="true"
-            />
+            {#if state.canAddSyncedFolder}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                title="Add synced folder"
+                aria-label="Add synced folder"
+                aria-busy={state.syncedFolderSaving}
+                disabled={state.syncedFolderSaving}
+                onclick={() => void state.addSyncedFolder()}
+              >
+                <PlusIcon />
+              </Button>
+            {:else}
+              <CloudIcon
+                class="size-3.5 text-muted-foreground"
+                aria-hidden="true"
+              />
+            {/if}
           {:else}
             <p class="text-xs font-medium text-muted-foreground">
               Cloud Storage
             </p>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              data-synced-folder-editor
-              class={cn(
-                "opacity-100 transition-opacity",
-                !state.editingSyncedFolders &&
-                  "md:opacity-0 md:group-focus-within/synced-folders:opacity-100 md:group-hover/synced-folders:opacity-100",
-              )}
-              title={state.editingSyncedFolders
-                ? "Finish editing cloud storage"
-                : "Configure cloud storage"}
-              aria-label={state.editingSyncedFolders
-                ? "Finish editing cloud storage"
-                : "Configure cloud storage"}
-              aria-pressed={state.editingSyncedFolders}
-              onclick={() => {
-                if (state.editingSyncedFolders) finishEditingSyncedFolders();
-                else {
-                  finishEditingFavorites();
-                  finishEditingSshTargets();
-                  state.editingSyncedFolders = true;
-                }
-              }}
-            >
-              {#if state.editingSyncedFolders}<CheckIcon />{:else}<Settings2Icon
-                />{/if}
-            </Button>
+            <div class="flex items-center">
+              {#if state.canAddSyncedFolder}
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  title="Add synced folder"
+                  aria-label="Add synced folder"
+                  aria-busy={state.syncedFolderSaving}
+                  disabled={state.syncedFolderSaving}
+                  onclick={() => void state.addSyncedFolder()}
+                >
+                  <PlusIcon />
+                </Button>
+              {/if}
+              {#if state.syncedFolderLocations.length > 0}
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  data-synced-folder-editor
+                  class={cn(
+                    "opacity-100 transition-opacity",
+                    !state.editingSyncedFolders &&
+                      "md:opacity-0 md:group-focus-within/synced-folders:opacity-100 md:group-hover/synced-folders:opacity-100",
+                  )}
+                  title={state.editingSyncedFolders
+                    ? "Finish editing cloud storage"
+                    : "Configure cloud storage"}
+                  aria-label={state.editingSyncedFolders
+                    ? "Finish editing cloud storage"
+                    : "Configure cloud storage"}
+                  aria-pressed={state.editingSyncedFolders}
+                  onclick={() => {
+                    if (state.editingSyncedFolders)
+                      finishEditingSyncedFolders();
+                    else {
+                      finishEditingFavorites();
+                      finishEditingSshTargets();
+                      state.editingSyncedFolders = true;
+                    }
+                  }}
+                >
+                  {#if state.editingSyncedFolders}<CheckIcon
+                    />{:else}<Settings2Icon />{/if}
+                </Button>
+              {/if}
+            </div>
           {/if}
         </div>
         <nav aria-label="Cloud storage" class="space-y-1">
@@ -433,14 +465,36 @@
                   {#if visibleSyncedFolder}<CircleMinusIcon
                     />{:else}<CirclePlusIcon />{/if}
                 </Button>
+                {#if location.syncedFolder?.source === "manual"}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    class="text-muted-foreground hover:text-destructive"
+                    title={`Remove ${location.name} from Explora`}
+                    aria-label={`Remove ${location.name} from Explora`}
+                    disabled={state.syncedFolderSaving}
+                    onclick={() => void state.removeSyncedFolder(location.id)}
+                  >
+                    <Trash2Icon />
+                  </Button>
+                {/if}
               {/if}
             </div>
           {/each}
         </nav>
         {#if !compact && !state.editingSyncedFolders && state.visibleSyncedFolderLocations.length === 0}
           <p class="px-2 py-2 text-xs text-muted-foreground">
-            All cloud storage locations are hidden. Configure Cloud Storage to
-            show one.
+            {#if state.syncedFolderLocations.length === 0}
+              Add a local folder managed by your sync client.
+            {:else}
+              All cloud storage locations are hidden. Configure Cloud Storage to
+              show one.
+            {/if}
+          </p>
+        {/if}
+        {#if !compact && state.syncedFolderConfigurationError}
+          <p class="px-2 py-1 text-xs text-destructive" role="alert">
+            {state.syncedFolderConfigurationError}
           </p>
         {/if}
       {/if}

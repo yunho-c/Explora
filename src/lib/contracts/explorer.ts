@@ -24,6 +24,7 @@ export type ContentAvailability =
   | "syncing"
   | "error"
   | "unknown";
+export type SyncedFolderSource = "system" | "manual";
 export type SshTargetSource = "manual" | "openSshConfig";
 export type SshTargetStatus =
   "disconnected" | "connecting" | "connected" | "error";
@@ -75,6 +76,7 @@ export interface LocationSummary {
 export interface SyncedFolderMetadata {
   provider: SyncedFolderProvider;
   status: SyncedFolderStatus;
+  source: SyncedFolderSource;
 }
 
 export interface VolumeSnapshot {
@@ -87,6 +89,7 @@ export interface SyncedFolderSnapshot {
   revision: number;
   folders: readonly LocationSummary[];
   warning: string | null;
+  canAddFolder: boolean;
 }
 
 export interface SshTargetSummary {

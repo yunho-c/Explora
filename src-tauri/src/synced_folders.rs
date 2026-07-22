@@ -18,9 +18,11 @@ use uuid::Uuid;
 use crate::{
     filesystem::{
         ExplorerError, LocationSummaryDto, SyncedFolderMetadataDto, SyncedFolderProvider,
-        SyncedFolderStatus,
+        SyncedFolderSource, SyncedFolderStatus,
     },
     local_filesystem::{LocalFilesystem, SyncedFolderRoot},
+    manual_synced_folders::ManualSyncedFolderStore,
+    synced_availability::SyncedAvailabilityPolicy,
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -32,6 +34,7 @@ pub struct SyncedFolderSnapshotEventDto {
     pub revision: u64,
     pub folders: Vec<LocationSummaryDto>,
     pub warning: Option<String>,
+    pub can_add_folder: bool,
 }
 
 trait SyncedFolderDiscovery: Send + Sync + 'static {
@@ -74,6 +77,7 @@ struct SyncedFolderCandidate {
     identity: Vec<u8>,
     path: PathBuf,
     provider: SyncedFolderProvider,
+    availability: SyncedAvailabilityPolicy,
 }
 
 struct SyncedFolderState {
@@ -86,6 +90,7 @@ struct SyncedFolderState {
 pub struct SyncedFolderManager {
     filesystem: Arc<LocalFilesystem>,
     discovery: Arc<dyn SyncedFolderDiscovery>,
+    manual: ManualSyncedFolderStore,
     state: Mutex<SyncedFolderState>,
     subscribers: Mutex<HashMap<String, Channel<SyncedFolderSnapshotEventDto>>>,
     stopped: Arc<AtomicBool>,
@@ -95,11 +100,13 @@ impl SyncedFolderManager {
     pub fn start(
         filesystem: Arc<LocalFilesystem>,
         home_dir: PathBuf,
+        storage_path: PathBuf,
     ) -> Result<Arc<Self>, ExplorerError> {
         let stopped = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             filesystem,
             discovery: Arc::new(SystemSyncedFolderDiscovery::new(home_dir)),
+            manual: ManualSyncedFolderStore::new(storage_path, cfg!(target_os = "linux"))?,
             state: Mutex::new(SyncedFolderState {
                 revision: 0,
                 roots: Vec::new(),
@@ -149,6 +156,7 @@ impl SyncedFolderManager {
             revision: state.revision,
             folders: state.summaries.clone(),
             warning: state.warning.clone(),
+            can_add_folder: self.manual.enabled(),
         };
         let mut subscribers = self
             .subscribers
@@ -169,8 +177,26 @@ impl SyncedFolderManager {
         Ok(())
     }
 
+    pub fn add_manual_folder(&self, path: PathBuf) -> Result<String, ExplorerError> {
+        let id = self.manual.add(path)?;
+        self.refresh()?;
+        Ok(id)
+    }
+
+    pub const fn can_add_folder(&self) -> bool {
+        self.manual.enabled()
+    }
+
+    pub fn remove_manual_folder(&self, folder_id: &str) -> Result<(), ExplorerError> {
+        self.manual.remove(folder_id)?;
+        self.refresh()
+    }
+
     fn refresh(&self) -> Result<(), ExplorerError> {
-        let roots = match self.discovery.discover() {
+        let roots = match self.discovery.discover().and_then(|mut roots| {
+            roots.extend(self.manual.discover()?);
+            Ok(roots)
+        }) {
             Ok(roots) => roots,
             Err(error) => {
                 let mut state = self
@@ -185,6 +211,7 @@ impl SyncedFolderManager {
                         revision: state.revision,
                         folders: state.summaries.clone(),
                         warning: state.warning.clone(),
+                        can_add_folder: self.manual.enabled(),
                     };
                     drop(state);
                     self.broadcast(event)?;
@@ -209,6 +236,7 @@ impl SyncedFolderManager {
             revision: state.revision,
             folders: state.summaries.clone(),
             warning: None,
+            can_add_folder: self.manual.enabled(),
         };
         drop(state);
         self.broadcast(event)
@@ -238,6 +266,7 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
             identity: path_identity(&icloud),
             path: icloud,
             provider: SyncedFolderProvider::ICloud,
+            availability: SyncedAvailabilityPolicy::ICloud,
         });
     }
 
@@ -261,6 +290,7 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
                     identity: path_identity(&path),
                     path,
                     provider,
+                    availability: SyncedAvailabilityPolicy::Unknown,
                 });
             }
         }
@@ -326,7 +356,9 @@ fn roots_from_candidates(
             metadata: SyncedFolderMetadataDto {
                 provider: candidate.provider,
                 status: SyncedFolderStatus::Available,
+                source: SyncedFolderSource::System,
             },
+            availability: candidate.availability,
         });
     }
     Ok(roots)
@@ -350,6 +382,7 @@ fn discover_windows_roots() -> Result<Vec<SyncedFolderRoot>, ExplorerError> {
             provider: provider_from_windows_registration_provider_id(
                 &root.registration_provider_id,
             ),
+            availability: SyncedAvailabilityPolicy::WindowsCloudFiles,
         });
     }
 
@@ -508,16 +541,19 @@ mod tests {
                 identity: b"OneDrive!private-account-one".to_vec(),
                 path: one,
                 provider: SyncedFolderProvider::OneDrive,
+                availability: SyncedAvailabilityPolicy::Unknown,
             },
             SyncedFolderCandidate {
                 identity: b"OneDrive!private-account-two".to_vec(),
                 path: two,
                 provider: SyncedFolderProvider::OneDrive,
+                availability: SyncedAvailabilityPolicy::Unknown,
             },
             SyncedFolderCandidate {
                 identity: b"duplicate-registration".to_vec(),
                 path: duplicate_path,
                 provider: SyncedFolderProvider::Other,
+                availability: SyncedAvailabilityPolicy::Unknown,
             },
         ])
         .expect("normalized candidates");

@@ -1,6 +1,16 @@
 use std::{path::Path, sync::Arc};
 
-use crate::filesystem::{ContentAvailability, SyncedFolderProvider};
+use crate::filesystem::ContentAvailability;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Each target constructs only its own platform policy in non-test builds.
+#[allow(dead_code)]
+pub(crate) enum SyncedAvailabilityPolicy {
+    ICloud,
+    WindowsCloudFiles,
+    LocalMirror,
+    Unknown,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ICloudDownloadStatus {
@@ -84,29 +94,32 @@ impl Default for SyncedAvailabilityInspector {
 impl SyncedAvailabilityInspector {
     pub(crate) fn inspect(
         &self,
-        provider: SyncedFolderProvider,
+        policy: SyncedAvailabilityPolicy,
         path: &Path,
         is_directory: bool,
     ) -> ContentAvailability {
-        #[cfg(target_os = "windows")]
-        {
-            let _ = (provider, is_directory);
-            return inspect_windows_metadata(self.windows_source.as_ref(), path);
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            // Apple's ubiquitous-item keys describe iCloud storage, not arbitrary
-            // third-party File Provider domains. Keep those providers unknown until
-            // a documented provider-neutral metadata API is available.
-            if provider != SyncedFolderProvider::ICloud {
-                return ContentAvailability::Unknown;
-            }
-
-            self.source
+        match policy {
+            SyncedAvailabilityPolicy::ICloud => self
+                .source
                 .read_metadata(path, is_directory)
                 .map(map_icloud_metadata)
-                .unwrap_or(ContentAvailability::Unknown)
+                .unwrap_or(ContentAvailability::Unknown),
+            SyncedAvailabilityPolicy::WindowsCloudFiles => self.inspect_windows_metadata(path),
+            SyncedAvailabilityPolicy::LocalMirror => ContentAvailability::Local,
+            SyncedAvailabilityPolicy::Unknown => ContentAvailability::Unknown,
+        }
+    }
+
+    fn inspect_windows_metadata(&self, path: &Path) -> ContentAvailability {
+        #[cfg(any(target_os = "windows", test))]
+        {
+            inspect_windows_metadata(self.windows_source.as_ref(), path)
+        }
+
+        #[cfg(not(any(target_os = "windows", test)))]
+        {
+            let _ = path;
+            ContentAvailability::Unknown
         }
     }
 }
@@ -440,7 +453,7 @@ mod tests {
 
     #[test]
     #[cfg(not(target_os = "windows"))]
-    fn third_party_providers_do_not_query_icloud_metadata() {
+    fn unknown_and_local_mirror_policies_do_not_query_icloud_metadata() {
         let calls = Arc::new(AtomicUsize::new(0));
         let inspector = SyncedAvailabilityInspector {
             source: Arc::new(FixtureSource {
@@ -450,20 +463,30 @@ mod tests {
             windows_source: Arc::new(SystemWindowsPlaceholderMetadataSource),
         };
 
-        for provider in [
-            SyncedFolderProvider::OneDrive,
-            SyncedFolderProvider::GoogleDrive,
-            SyncedFolderProvider::Other,
-        ] {
-            assert_eq!(
-                inspector.inspect(provider, Path::new("ignored"), false),
-                ContentAvailability::Unknown
-            );
-        }
+        assert_eq!(
+            inspector.inspect(
+                SyncedAvailabilityPolicy::Unknown,
+                Path::new("ignored"),
+                false
+            ),
+            ContentAvailability::Unknown
+        );
+        assert_eq!(
+            inspector.inspect(
+                SyncedAvailabilityPolicy::LocalMirror,
+                Path::new("ignored"),
+                false
+            ),
+            ContentAvailability::Local
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
         assert_eq!(
-            inspector.inspect(SyncedFolderProvider::ICloud, Path::new("ignored"), false),
+            inspector.inspect(
+                SyncedAvailabilityPolicy::ICloud,
+                Path::new("ignored"),
+                false
+            ),
             ContentAvailability::Local
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -525,7 +548,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().expect("temporary file");
         assert_eq!(
             SyncedAvailabilityInspector::default().inspect(
-                SyncedFolderProvider::ICloud,
+                SyncedAvailabilityPolicy::ICloud,
                 temp.path(),
                 false
             ),

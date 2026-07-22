@@ -126,11 +126,19 @@ pub enum SyncedFolderStatus {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncedFolderSource {
+    System,
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncedFolderMetadataDto {
     pub provider: SyncedFolderProvider,
     pub status: SyncedFolderStatus,
+    pub source: SyncedFolderSource,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
