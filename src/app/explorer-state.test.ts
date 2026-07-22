@@ -1,14 +1,27 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import type { DirectoryRef, FileEntrySummary } from "$lib/contracts/explorer";
-import type { SshConnectionEvent } from "$lib/contracts/explorer";
+import type {
+  DirectoryRef,
+  FileEntrySummary,
+  LocationSummary,
+  SshConnectionEvent,
+  VolumeSnapshot,
+} from "$lib/contracts/explorer";
+import type {
+  PreferencesSnapshot,
+  UserPreferences,
+  UserPreferencesPatch,
+} from "$lib/contracts/preferences";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
 import type {
   ConnectSshOptions,
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
+import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
+import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
 
 import { ExplorerState } from "./explorer-state.svelte";
 
@@ -98,6 +111,70 @@ class StalePreviewDataSource extends DemoExplorerDataSource {
   }
 }
 
+class FailingPreferencesDataSource implements PreferencesDataSource {
+  async getPreferences(): Promise<PreferencesSnapshot> {
+    return {
+      preferences: {
+        layout: {
+          sidebarCollapsed: false,
+          viewMode: "list",
+          sort: { column: "name", direction: "ascending" },
+          favoriteRoles: [
+            "home",
+            "desktop",
+            "documents",
+            "downloads",
+            "pictures",
+            "music",
+            "videos",
+          ],
+          hiddenSshTargetIds: [],
+        },
+      },
+      warning: null,
+    };
+  }
+
+  async updatePreferences(): Promise<UserPreferences> {
+    throw new Error("The preference file is read-only.");
+  }
+}
+
+class DelayedPreferencesDataSource extends MemoryPreferencesDataSource {
+  override async updatePreferences(
+    patch: UserPreferencesPatch,
+  ): Promise<UserPreferences> {
+    if (patch.layout.viewMode === "grid") {
+      await new Promise((resolve) => window.setTimeout(resolve, 25));
+    }
+    return super.updatePreferences(patch);
+  }
+}
+
+class HangingPreferencesDataSource extends MemoryPreferencesDataSource {
+  override async getPreferences(): Promise<PreferencesSnapshot> {
+    return new Promise(() => {});
+  }
+}
+
+class ControllableVolumeDataSource extends DemoExplorerDataSource {
+  private onVolumeSnapshot: ((snapshot: VolumeSnapshot) => void) | null = null;
+
+  override async watchVolumes({
+    signal,
+    onSnapshot,
+  }: WatchVolumesOptions): Promise<void> {
+    this.onVolumeSnapshot = onSnapshot;
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  emitVolumes(revision: number, volumes: readonly LocationSummary[]): void {
+    this.onVolumeSnapshot?.({ revision, volumes, warning: null });
+  }
+}
+
 describe("ExplorerState", () => {
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
@@ -123,6 +200,30 @@ describe("ExplorerState", () => {
     expect(state.loading).toBe(false);
   });
 
+  it("preserves an active volume tab across removal and restores it at the root", async () => {
+    const dataSource = new ControllableVolumeDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const workspace = state.locations.find(({ id }) => id === "workspace");
+    expect(workspace).toBeDefined();
+    await state.selectLocation("workspace");
+
+    dataSource.emitVolumes(1, []);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("offline"),
+    );
+    expect(state.activeTab?.locationId).toBe("workspace");
+    expect(state.warningMessage).toContain("no longer available");
+
+    dataSource.emitVolumes(2, [workspace as LocationSummary]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("available"),
+    );
+    expect(state.activeDirectory?.id).toBe(workspace?.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
   it("filters, sorts, and switches views without mutating source entries", async () => {
     const state = await initializedState();
     const originalCount = state.entries.length;
@@ -139,6 +240,126 @@ describe("ExplorerState", () => {
     expect(state.entries).toHaveLength(originalCount);
     expect(state.viewMode).toBe("grid");
     expect(state.sort.column).toBe("modifiedAt");
+  });
+
+  it("restores global layout preferences before loading explorer data", async () => {
+    const preferences = new MemoryPreferencesDataSource({
+      layout: {
+        sidebarCollapsed: true,
+        viewMode: "grid",
+        sort: { column: "size", direction: "descending" },
+        favoriteRoles: ["home", "music"],
+        hiddenSshTargetIds: ["demo:render-node"],
+      },
+    });
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+
+    await state.initialize();
+
+    expect(state.sidebarCollapsed).toBe(true);
+    expect(state.viewMode).toBe("grid");
+    expect(state.sort).toEqual({ column: "size", direction: "descending" });
+    expect(state.visibleFavoriteLocations.map(({ role }) => role)).toEqual([
+      "home",
+      "music",
+    ]);
+    expect(state.visibleSshTargets.map(({ id }) => id)).toEqual([
+      "demo:staging-box",
+    ]);
+  });
+
+  it("persists favorite visibility in canonical sidebar order", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+
+    state.setFavoriteVisible("downloads", false);
+    state.setFavoriteVisible("home", false);
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout.favoriteRoles,
+      ).toEqual(["desktop", "documents", "pictures", "music", "videos"]);
+    });
+
+    expect(
+      state.visibleFavoriteLocations.map(({ role }) => role),
+    ).not.toContain("home");
+  });
+
+  it("persists SSH target visibility without changing connection state", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+    const connectedTarget = state.sshTargets.find(
+      ({ id }) => id === "demo:staging-box",
+    );
+
+    state.setSshTargetVisible("demo:staging-box", false);
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout
+          .hiddenSshTargetIds,
+      ).toEqual(["demo:staging-box"]);
+    });
+
+    expect(state.visibleSshTargets.map(({ id }) => id)).not.toContain(
+      "demo:staging-box",
+    );
+    expect(connectedTarget?.status).toBe("connected");
+    expect(connectedTarget?.connectedLocationId).toBe("staging-box");
+  });
+
+  it("serializes rapid preference writes so the latest choice wins", async () => {
+    const preferences = new DelayedPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initializePreferences();
+
+    state.setViewMode("grid");
+    state.setViewMode("list");
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout.viewMode,
+      ).toBe("list");
+    });
+
+    expect(state.viewMode).toBe("list");
+  });
+
+  it("keeps optimistic layout state and reports preference write failures", async () => {
+    const state = new ExplorerState(
+      new DemoExplorerDataSource(),
+      new FailingPreferencesDataSource(),
+    );
+    await state.initializePreferences();
+
+    state.setSidebarCollapsed(true);
+    await vi.waitFor(() =>
+      expect(state.preferencesWarningMessage).toBe(
+        "The preference file is read-only.",
+      ),
+    );
+
+    expect(state.sidebarCollapsed).toBe(true);
+  });
+
+  it("bounds preference loading so a hidden application can still recover", async () => {
+    vi.useFakeTimers();
+    try {
+      const state = new ExplorerState(
+        new DemoExplorerDataSource(),
+        new HangingPreferencesDataSource(),
+      );
+      const initialization = state.initializePreferences();
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await initialization;
+
+      expect(state.preferencesWarningMessage).toBe(
+        "Explora timed out while loading saved preferences.",
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maintains independent tab state and navigation history", async () => {

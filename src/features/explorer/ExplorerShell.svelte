@@ -3,6 +3,7 @@
   import ServerOffIcon from "@lucide/svelte/icons/server-off";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
+  import type { WindowChromeController } from "../../app/window-chrome.svelte";
   import { Input } from "$lib/components/ui/input";
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
@@ -16,7 +17,13 @@
   import SshPromptDialog from "./SshPromptDialog.svelte";
   import SshTargetDialog from "./SshTargetDialog.svelte";
 
-  let { state }: { state: ExplorerState } = $props();
+  let {
+    state,
+    windowChrome,
+  }: {
+    state: ExplorerState;
+    windowChrome: WindowChromeController;
+  } = $props();
 
   const handleKeydown = (event: KeyboardEvent) => {
     const refreshShortcut =
@@ -80,11 +87,17 @@
 
 <div
   class="flex h-screen min-h-0 overflow-hidden bg-background text-foreground"
+  data-window-chrome={windowChrome.mode}
+  data-sidebar-collapsed={state.sidebarCollapsed}
 >
-  <ExplorerSidebar {state} />
+  <ExplorerSidebar {state} chromeMode={windowChrome.mode} />
 
   <main class="flex min-w-0 flex-1 flex-col" aria-label="File explorer">
-    <ExplorerTabs {state} />
+    <ExplorerTabs
+      {state}
+      chromeMode={windowChrome.mode}
+      sidebarCollapsed={state.sidebarCollapsed}
+    />
     <ExplorerToolbar {state} />
 
     <div class="relative min-h-0 flex-1 overflow-auto">

@@ -112,6 +112,103 @@ test("opens a folder and returns to its parent", async ({ page }) => {
   await expect(page.getByText("explora-notes.md")).toBeVisible();
 });
 
+test("opens a discovered volume from Locations", async ({ page }) => {
+  await page.goto("/");
+
+  await expect(page.getByText("Locations", { exact: true })).toBeVisible();
+  const locations = page.getByRole("navigation", {
+    name: "Mounted locations",
+  });
+  await locations.getByRole("button", { name: "Workspace" }).click();
+  await expect(
+    locations.getByRole("button", { name: "Workspace" }),
+  ).toHaveAttribute("aria-current", "page");
+});
+
+test("configures standard favorites from the section header", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const favorites = page.getByRole("navigation", { name: "Favorites" });
+
+  await page.getByText("Favorites", { exact: true }).hover();
+  await page.getByRole("button", { name: "Configure favorites" }).click();
+  await favorites
+    .getByRole("button", { name: "Remove Home from Favorites" })
+    .click();
+  await expect(
+    favorites.getByRole("button", { name: "Home", exact: true }),
+  ).toBeHidden();
+  await expect(favorites.getByLabel("Home, not in Favorites")).toBeVisible();
+
+  await favorites
+    .getByRole("button", { name: "Add Home to Favorites" })
+    .click();
+  await expect(
+    favorites.getByRole("button", { name: "Home", exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "Configure favorites" }),
+  ).toBeFocused();
+});
+
+test("configures visible SSH targets without disconnecting them", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const sshTargets = page.getByRole("navigation", { name: "SSH targets" });
+
+  await page.getByText("SSH", { exact: true }).hover();
+  await page.getByRole("button", { name: "Configure SSH targets" }).click();
+  await expect(
+    page.getByRole("button", { name: "Finish editing SSH targets" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Add SSH target" }),
+  ).toBeHidden();
+  await sshTargets
+    .getByRole("button", { name: "Hide staging-box from SSH" })
+    .click();
+  await expect(
+    sshTargets.getByRole("button", {
+      name: "staging-box connected",
+      exact: true,
+    }),
+  ).toBeHidden();
+  await expect(
+    sshTargets.getByLabel("staging-box, hidden from SSH"),
+  ).toBeVisible();
+
+  await sshTargets
+    .getByRole("button", { name: "Show staging-box in SSH" })
+    .click();
+  await page.keyboard.press("Escape");
+  await expect(
+    page.getByRole("button", { name: "Configure SSH targets" }),
+  ).toBeFocused();
+  await expect(sshTargets.getByRole("button", { name: /Manage / })).toHaveCount(
+    0,
+  );
+  await expect(sshTargets.getByText("Config", { exact: true })).toHaveCount(0);
+
+  await sshTargets
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .click({ button: "right" });
+  await expect(page.getByRole("menuitem", { name: "Edit" })).toBeVisible();
+  await expect(
+    page.getByRole("menuitem", { name: "Disconnect" }),
+  ).toBeVisible();
+  await expect(page.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await sshTargets
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .focus();
+  await page.keyboard.press("Shift+F10");
+  await expect(page.getByRole("menuitem", { name: "Edit" })).toBeVisible();
+});
+
 test("opens the responsive locations sheet", async ({ page }) => {
   await page.setViewportSize({ width: 760, height: 720 });
   await page.goto("/");
@@ -142,7 +239,9 @@ test("adds an SSH target and connects a configured demo remote", async ({
     page.getByRole("button", { name: "Lab disconnected" }),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: /render-node Config/ }).click();
+  await page
+    .getByRole("button", { name: "render-node disconnected", exact: true })
+    .click();
   await expect(page.getByRole("tab", { name: "render-node" })).toBeVisible();
   await expect(page.getByText("This location is empty")).toBeVisible();
 });
@@ -152,11 +251,17 @@ test("preserves an SSH tab through disconnect, reconnect, and refresh", async ({
 }) => {
   await page.goto("/");
 
-  await page.getByRole("button", { name: /render-node Config/ }).click();
+  const renderNode = page.getByRole("button", {
+    name: "render-node disconnected",
+    exact: true,
+  });
+  await renderNode.click();
   const remoteTab = page.getByRole("tab", { name: "render-node" });
   await expect(remoteTab).toBeVisible();
 
-  await page.getByRole("button", { name: "Manage render-node" }).click();
+  await page
+    .getByRole("button", { name: "render-node connected", exact: true })
+    .click({ button: "right" });
   await page.getByRole("menuitem", { name: "Disconnect" }).click();
   await expect(page.getByText("Remote location is offline")).toBeVisible();
   await expect(remoteTab).toBeVisible();

@@ -80,6 +80,7 @@ pub enum LocationRole {
     Pictures,
     Music,
     Videos,
+    Volume,
     Ssh,
 }
 

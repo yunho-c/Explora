@@ -15,6 +15,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 
 const roots: Readonly<Record<string, DirectoryRef>> = {
@@ -533,6 +534,21 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   ): Promise<readonly LocationSummary[]> {
     await wait(40, signal);
     return locations;
+  }
+
+  async watchVolumes({
+    signal,
+    onSnapshot,
+  }: WatchVolumesOptions): Promise<void> {
+    if (signal.aborted) throw abortError();
+    onSnapshot({
+      revision: 1,
+      volumes: locations.filter(({ kind }) => kind === "volume"),
+      warning: null,
+    });
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
   }
 
   async listSshTargets(

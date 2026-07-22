@@ -21,6 +21,7 @@ import type {
   SshTargetSource,
   SshTargetStatus,
   SshTargetSummary,
+  VolumeSnapshot,
 } from "$lib/contracts/explorer";
 import type {
   ConnectSshOptions,
@@ -28,6 +29,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
 
@@ -570,6 +572,43 @@ const parseBreadcrumb = (value: unknown): BreadcrumbSegment => {
   };
 };
 
+const parseVolumeSnapshot = (value: unknown): VolumeSnapshot => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid volume response: snapshot is malformed.");
+  }
+  if (
+    typeof value.revision !== "number" ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 0
+  ) {
+    throw new Error("Invalid volume response: revision is malformed.");
+  }
+  if (!Array.isArray(value.volumes)) {
+    throw new Error("Invalid volume response: volumes must be a list.");
+  }
+  if (value.warning !== null && typeof value.warning !== "string") {
+    throw new Error("Invalid volume response: warning is malformed.");
+  }
+  const volumes = value.volumes.map(parseLocation);
+  if (
+    volumes.some(
+      ({ id, kind, role, status }) =>
+        !id.startsWith("volume:") ||
+        kind !== "volume" ||
+        role !== "volume" ||
+        status !== "available",
+    ) ||
+    new Set(volumes.map(({ id }) => id)).size !== volumes.length
+  ) {
+    throw new Error("Invalid volume response: volume entries are malformed.");
+  }
+  return {
+    revision: value.revision,
+    volumes,
+    warning: value.warning,
+  };
+};
+
 const abortError = () => {
   const error = new Error("The filesystem request was cancelled.");
   error.name = "AbortError";
@@ -605,6 +644,47 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       throw new Error("Invalid filesystem response: locations must be a list.");
     }
     return payload.map(parseLocation);
+  }
+
+  async watchVolumes({
+    signal,
+    onSnapshot,
+  }: WatchVolumesOptions): Promise<void> {
+    if (signal.aborted) throw abortError();
+    const id = requestId();
+    const channel = new Channel<unknown>();
+    let rejectWatch: (error: Error) => void = () => {};
+    const watching = new Promise<void>((resolve, reject) => {
+      rejectWatch = reject;
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    const cancel = () => {
+      void invoke("cancel_volume_watch", { requestId: id }).catch(() => {
+        // Cancellation is best-effort; aborted snapshots are ignored below.
+      });
+    };
+    channel.onmessage = (payload) => {
+      if (signal.aborted) return;
+      try {
+        onSnapshot(parseVolumeSnapshot(payload));
+      } catch (error) {
+        cancel();
+        rejectWatch(
+          error instanceof Error
+            ? error
+            : new Error("Invalid volume response."),
+        );
+      }
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      await invoke("watch_volumes", { requestId: id, onEvent: channel });
+      await watching;
+    } catch (error) {
+      if (!signal.aborted) throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
   }
 
   async listSshTargets(

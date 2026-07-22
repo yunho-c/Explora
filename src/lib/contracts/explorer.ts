@@ -56,6 +56,12 @@ export interface LocationSummary {
   root: DirectoryRef;
 }
 
+export interface VolumeSnapshot {
+  revision: number;
+  volumes: readonly LocationSummary[];
+  warning: string | null;
+}
+
 export interface SshTargetSummary {
   id: string;
   locationId: string;

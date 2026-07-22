@@ -14,26 +14,39 @@ use crate::{
         LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
     },
     local_filesystem::LocalFilesystem,
+    preferences::{
+        PreferencesSnapshotDto, PreferencesStore, UserPreferencesDto, UserPreferencesPatchDto,
+    },
     preview::{metadata_result, PreviewManager},
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
+    volumes::{VolumeManager, VolumeSnapshotEventDto},
 };
 
 pub struct AppState {
     local: Arc<LocalFilesystem>,
+    preferences: Arc<PreferencesStore>,
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
     preview: Arc<PreviewManager>,
+    volumes: Arc<VolumeManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 impl AppState {
-    pub fn new(local: LocalFilesystem, ssh_targets: SshTargetStore) -> Self {
+    pub fn new(
+        local: Arc<LocalFilesystem>,
+        preferences: PreferencesStore,
+        ssh_targets: SshTargetStore,
+        volumes: Arc<VolumeManager>,
+    ) -> Self {
         Self {
-            local: Arc::new(local),
+            local,
+            preferences: Arc::new(preferences),
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
             preview: Arc::new(PreviewManager::default()),
+            volumes,
             listings: Mutex::new(HashMap::new()),
         }
     }
@@ -80,10 +93,57 @@ fn validate_request_id(request_id: &str) -> Result<(), ExplorerError> {
 }
 
 #[tauri::command]
-pub fn list_locations(state: State<'_, AppState>) -> Vec<LocationSummaryDto> {
-    let mut locations = state.local.locations();
+pub fn get_user_preferences(
+    state: State<'_, AppState>,
+) -> Result<PreferencesSnapshotDto, ExplorerErrorDto> {
+    state.preferences.snapshot().map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn update_user_preferences(
+    state: State<'_, AppState>,
+    patch: UserPreferencesPatchDto,
+) -> Result<UserPreferencesDto, ExplorerErrorDto> {
+    let preferences = state.preferences.clone();
+    tauri::async_runtime::spawn_blocking(move || preferences.update(patch))
+        .await
+        .map_err(|error| {
+            ExplorerError::Unexpected(format!("The preference update task failed: {error}"))
+        })?
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn list_locations(
+    state: State<'_, AppState>,
+) -> Result<Vec<LocationSummaryDto>, ExplorerErrorDto> {
+    let mut locations = state.local.locations().map_err(ExplorerErrorDto::from)?;
     locations.extend(state.ssh.locations());
-    locations
+    Ok(locations)
+}
+
+#[tauri::command]
+pub fn watch_volumes(
+    state: State<'_, AppState>,
+    request_id: String,
+    on_event: Channel<VolumeSnapshotEventDto>,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .volumes
+        .subscribe(request_id, on_event)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_volume_watch(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    state
+        .volumes
+        .unsubscribe(&request_id)
+        .map_err(ExplorerErrorDto::from)
 }
 
 #[tauri::command]

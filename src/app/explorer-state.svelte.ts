@@ -13,8 +13,17 @@ import type {
   SortColumn,
   SortDescriptor,
   ViewMode,
+  VolumeSnapshot,
 } from "$lib/contracts/explorer";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
+import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
+import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
+import {
+  DEFAULT_FAVORITE_ROLES,
+  isFavoriteRole,
+  type FavoriteRole,
+  type LayoutPreferencesPatch,
+} from "$lib/contracts/preferences";
 import { compareFileSizes } from "$lib/file-metadata";
 
 const nameCollator = new Intl.Collator(undefined, {
@@ -24,6 +33,27 @@ const nameCollator = new Intl.Collator(undefined, {
 
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
+
+const PREFERENCES_LOAD_TIMEOUT_MS = 2_000;
+
+const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T> =>
+  new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(
+      () =>
+        reject(new Error("Explora timed out while loading saved preferences.")),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error: unknown) => {
+        window.clearTimeout(timeoutId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
 
 type SshPromptEvent = Extract<
   SshConnectionEvent,
@@ -51,11 +81,17 @@ export class ExplorerState {
   loading = $state(false);
   errorMessage = $state<string | null>(null);
   warningMessage = $state<string | null>(null);
+  preferencesWarningMessage = $state<string | null>(null);
+  volumeWarningMessage = $state<string | null>(null);
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
   imagePreviewMode = $state<ImagePreviewMode>("direct");
   sidebarCollapsed = $state(false);
+  favoriteRoles = $state<FavoriteRole[]>([...DEFAULT_FAVORITE_ROLES]);
+  hiddenSshTargetIds = $state<string[]>([]);
+  editingFavorites = $state(false);
+  editingSshTargets = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
   editingSshTargetId = $state<string | null>(null);
@@ -69,9 +105,16 @@ export class ExplorerState {
   private previewController: AbortController | null = null;
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
+  private volumeWatchController: AbortController | null = null;
+  private volumeRevision = -1;
   private tabSequence = 0;
+  private preferencesInitialization: Promise<void> | null = null;
+  private preferenceWriteQueue: Promise<void> = Promise.resolve();
 
-  constructor(private readonly dataSource: ExplorerDataSource) {}
+  constructor(
+    private readonly dataSource: ExplorerDataSource,
+    private readonly preferencesDataSource: PreferencesDataSource = new MemoryPreferencesDataSource(),
+  ) {}
 
   get activeTab(): ExplorerTab | undefined {
     return this.tabs.find(({ id }) => id === this.activeTabId);
@@ -149,7 +192,26 @@ export class ExplorerState {
     });
   }
 
+  get availableFavoriteLocations(): LocationSummary[] {
+    return this.locations.filter(
+      ({ kind, role }) => kind === "local" && isFavoriteRole(role),
+    );
+  }
+
+  get visibleFavoriteLocations(): LocationSummary[] {
+    return this.availableFavoriteLocations.filter(({ role }) =>
+      this.favoriteRoles.includes(role as FavoriteRole),
+    );
+  }
+
+  get visibleSshTargets(): SshTargetSummary[] {
+    return this.sshTargets.filter(
+      ({ id }) => !this.hiddenSshTargetIds.includes(id),
+    );
+  }
+
   async initialize(): Promise<void> {
+    await this.initializePreferences();
     const controller = new AbortController();
 
     try {
@@ -165,6 +227,7 @@ export class ExplorerState {
       ]);
       this.locations = [...locations];
       this.sshTargets = [...sshTargets];
+      this.startVolumeWatch();
       const initialLocation = this.locations[0];
 
       if (!initialLocation) {
@@ -186,6 +249,129 @@ export class ExplorerState {
             ? error.message
             : "Explora could not load its locations.";
       }
+    }
+  }
+
+  dispose(): void {
+    this.directoryController?.abort();
+    this.previewController?.abort();
+    this.sshConnectionController?.abort();
+    this.volumeWatchController?.abort();
+  }
+
+  private startVolumeWatch(): void {
+    this.volumeWatchController?.abort();
+    const controller = new AbortController();
+    this.volumeWatchController = controller;
+    void this.dataSource
+      .watchVolumes({
+        signal: controller.signal,
+        onSnapshot: (snapshot) => void this.applyVolumeSnapshot(snapshot),
+      })
+      .catch((error: unknown) => {
+        if (isAbortError(error) || this.volumeWatchController !== controller)
+          return;
+        this.volumeWarningMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not watch mounted volumes.";
+      });
+  }
+
+  private async applyVolumeSnapshot(snapshot: VolumeSnapshot): Promise<void> {
+    if (snapshot.revision <= this.volumeRevision) return;
+    this.volumeRevision = snapshot.revision;
+    this.volumeWarningMessage = snapshot.warning;
+
+    const previousVolumes = this.locations.filter(
+      ({ kind }) => kind === "volume",
+    );
+    const offlineVolumes = previousVolumes
+      .filter(
+        ({ id }) =>
+          !snapshot.volumes.some((volume) => volume.id === id) &&
+          this.tabs.some(({ locationId }) => locationId === id),
+      )
+      .map((location) => ({
+        ...location,
+        status: "offline" as const,
+        detail: "Volume unavailable",
+      }));
+    this.locations = [
+      ...this.locations.filter(({ kind }) => kind !== "volume"),
+      ...snapshot.volumes,
+      ...offlineVolumes,
+    ];
+
+    const activeTab = this.activeTab;
+    const removedActiveVolume = activeTab
+      ? offlineVolumes.find(({ id }) => id === activeTab.locationId)
+      : undefined;
+    if (removedActiveVolume) {
+      this.directoryController?.abort();
+      this.previewController?.abort();
+      this.loading = false;
+      this.warningMessage = `“${removedActiveVolume.name}” is no longer available. Reconnect the volume to continue.`;
+    }
+
+    const restoredIds = snapshot.volumes
+      .filter(
+        ({ id }) =>
+          previousVolumes.find((location) => location.id === id)?.status ===
+          "offline",
+      )
+      .map(({ id }) => id);
+    if (restoredIds.length === 0) return;
+
+    for (const tab of this.tabs) {
+      if (!restoredIds.includes(tab.locationId)) continue;
+      const volume = snapshot.volumes.find(({ id }) => id === tab.locationId);
+      if (!volume) continue;
+      tab.directory = volume.root;
+      tab.history = [volume.root];
+      tab.historyIndex = 0;
+      tab.title = volume.name;
+    }
+    if (activeTab && restoredIds.includes(activeTab.locationId)) {
+      const volume = snapshot.volumes.find(
+        ({ id }) => id === activeTab.locationId,
+      );
+      if (volume) {
+        this.warningMessage = null;
+        await this.loadDirectory(volume.root, (directory) => {
+          activeTab.directory = directory;
+          activeTab.history = [directory];
+          activeTab.historyIndex = 0;
+          activeTab.title = directory.name;
+        });
+      }
+    }
+  }
+
+  initializePreferences(): Promise<void> {
+    this.preferencesInitialization ??= this.loadPreferences();
+    return this.preferencesInitialization;
+  }
+
+  private async loadPreferences(): Promise<void> {
+    try {
+      const snapshot = await withTimeout(
+        this.preferencesDataSource.getPreferences(),
+        PREFERENCES_LOAD_TIMEOUT_MS,
+      );
+      this.sidebarCollapsed = snapshot.preferences.layout.sidebarCollapsed;
+      this.viewMode = snapshot.preferences.layout.viewMode;
+      this.sort = { ...snapshot.preferences.layout.sort };
+      this.favoriteRoles = [...snapshot.preferences.layout.favoriteRoles];
+      this.hiddenSshTargetIds = [
+        ...snapshot.preferences.layout.hiddenSshTargetIds,
+      ];
+      this.preferencesWarningMessage = snapshot.warning?.message ?? null;
+    } catch (error) {
+      this.preferencesWarningMessage =
+        error instanceof Error
+          ? error.message
+          : "Explora could not load saved preferences and used defaults instead.";
     }
   }
 
@@ -613,21 +799,60 @@ export class ExplorerState {
   }
 
   toggleSort(column: SortColumn): void {
-    this.sort = {
+    const sort: SortDescriptor = {
       column,
       direction:
         this.sort.column === column && this.sort.direction === "ascending"
           ? "descending"
           : "ascending",
     };
+    this.sort = sort;
+    this.persistLayoutPreferences({ sort });
   }
 
   setViewMode(viewMode: ViewMode): void {
     this.viewMode = viewMode;
+    this.persistLayoutPreferences({ viewMode });
+  }
+
+  setSidebarCollapsed(sidebarCollapsed: boolean): void {
+    this.sidebarCollapsed = sidebarCollapsed;
+    this.persistLayoutPreferences({ sidebarCollapsed });
+  }
+
+  setFavoriteVisible(role: FavoriteRole, visible: boolean): void {
+    const favoriteRoles = DEFAULT_FAVORITE_ROLES.filter((candidate) =>
+      candidate === role ? visible : this.favoriteRoles.includes(candidate),
+    );
+    this.favoriteRoles = [...favoriteRoles];
+    this.persistLayoutPreferences({ favoriteRoles: [...favoriteRoles] });
+  }
+
+  setSshTargetVisible(targetId: string, visible: boolean): void {
+    const hiddenSshTargetIds = visible
+      ? this.hiddenSshTargetIds.filter((id) => id !== targetId)
+      : this.hiddenSshTargetIds.includes(targetId)
+        ? [...this.hiddenSshTargetIds]
+        : [...this.hiddenSshTargetIds, targetId].sort();
+    this.hiddenSshTargetIds = hiddenSshTargetIds;
+    this.persistLayoutPreferences({ hiddenSshTargetIds });
   }
 
   selectEntry(entryId: string): void {
     this.selectedEntryId = entryId;
+  }
+
+  private persistLayoutPreferences(patch: LayoutPreferencesPatch): void {
+    this.preferenceWriteQueue = this.preferenceWriteQueue.then(async () => {
+      try {
+        await this.preferencesDataSource.updatePreferences({ layout: patch });
+      } catch (error) {
+        this.preferencesWarningMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not save the latest preference change.";
+      }
+    });
   }
 
   async openPreview(entryId = this.selectedEntryId): Promise<void> {
@@ -762,6 +987,11 @@ export class ExplorerState {
     target: DirectoryRef,
     commit: (directory: DirectoryRef) => void,
   ): Promise<boolean> {
+    const location = this.locations.find(({ id }) => id === target.locationId);
+    if (location?.kind === "volume" && location.status === "offline") {
+      this.warningMessage = `“${location.name}” is no longer available. Reconnect the volume to continue.`;
+      return false;
+    }
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;

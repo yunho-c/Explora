@@ -27,14 +27,27 @@ russh-config = "0.58.0"
 russh-sftp = "2.3.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.150"
+sysinfo = "0.37.2"
 tauri = { version = "2", features = [] }
+tauri-plugin-decoration = "=2.1.4"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 tokio = { version = "1.48.0", features = ["sync", "time"] }
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.24.0", features = ["v4", "v5"] }
 zeroize = "1.8.2"
 
 [dev-dependencies]
 futures = "0.3.31"
 rand = "0.10.0"
 tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3.1"
+objc2-core-foundation = "0.3.2"
+objc2-disk-arbitration = "0.3.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.12.0", default-features = false, features = ["blocking"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader"] }

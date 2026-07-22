@@ -10,6 +10,15 @@ Saved SSH targets and concrete aliases from
 application retains deterministic local and remote demo assets for UI development
 and tests.
 
+The packaged application integrates its tab strip into a guarded custom
+titlebar. macOS keeps native traffic lights, Windows 11 retains the native Snap
+Layout menu, and supported GNOME/KDE Wayland sessions receive GTK-themed window
+controls. Activation failures and unsupported Linux sessions automatically
+restore the native operating-system titlebar; browser-only development does not
+activate desktop window chrome. See
+[`docs/adr/0006-integrated-window-chrome.md`](docs/adr/0006-integrated-window-chrome.md)
+for the dependency, security, and fallback decision.
+
 ## Technology
 
 - Tauri 2 and stable Rust for the desktop application boundary
@@ -53,9 +62,16 @@ keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
 silently executed. Bounded keepalives detect dropped sessions, offline tabs retain
 their current folder and history, and an explicit reconnect resumes the same
 opaque directory reference when it is still valid. Refresh reloads the active
-folder without changing navigation history. File watching, mounted-volume
-discovery, hidden-file controls, mutations, remote content previews, and
-additional preview formats remain later vertical slices.
+folder without changing navigation history. Mounted local volumes are discovered
+in the Rust boundary and updated through native platform notifications with a
+bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
+target visibility persist as versioned local preferences. File watching,
+hidden-file controls, mutations, remote content previews, and additional preview
+formats remain later vertical slices. See
+[`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
+and
+[`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)
+for the persistence and volume-lifecycle decisions.
 
 Local preview reads are authorized by opaque entry references and performed in
 bounded Rust workers. Text previews are capped and decoded without rendering

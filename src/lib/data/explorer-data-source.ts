@@ -9,6 +9,7 @@ import type {
   SshConnectionEvent,
   SshPromptResponse,
   SshTargetSummary,
+  VolumeSnapshot,
 } from "$lib/contracts/explorer";
 
 export interface DirectoryStart {
@@ -51,8 +52,14 @@ export interface PreparePreviewOptions {
   imageMode: ImagePreviewMode;
 }
 
+export interface WatchVolumesOptions {
+  signal: AbortSignal;
+  onSnapshot: (snapshot: VolumeSnapshot) => void;
+}
+
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
+  watchVolumes(options: WatchVolumesOptions): Promise<void>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
   createSshTarget(
     input: ManualSshTargetInput,

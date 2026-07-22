@@ -132,3 +132,115 @@
     @apply font-sans;
   }
 }
+
+@layer components {
+  [data-tauri-drag-region] {
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  [data-window-chrome="activating"] .explora-titlebar-content,
+  [data-window-chrome="custom"] .explora-titlebar-content {
+    /* The plugin drag plane is at 2147483000. Content sits just above it,
+       remains visually transparent over native controls, and opts only real
+       application controls back into pointer hit-testing. */
+    position: relative;
+    z-index: 2147483001;
+    background-color: transparent;
+    pointer-events: none;
+  }
+
+  [data-window-chrome="activating"]
+    .explora-titlebar-content
+    :is(button, a, input, select, textarea, [role="tab"]),
+  [data-window-chrome="custom"]
+    .explora-titlebar-content
+    :is(button, a, input, select, textarea, [role="tab"]) {
+    pointer-events: auto;
+  }
+
+  .explora-titlebar-left {
+    padding-right: 0.5rem;
+    padding-left: max(
+      0.5rem,
+      var(--tauri-plugin-decoration-left-clearance, 0px)
+    );
+  }
+
+  .explora-sidebar-scroll {
+    --explora-sidebar-scrollbar-thumb: color-mix(
+      in oklch,
+      var(--muted-foreground) 20%,
+      transparent
+    );
+
+    scrollbar-width: thin;
+    scrollbar-color: var(--explora-sidebar-scrollbar-thumb) transparent;
+  }
+
+  .explora-sidebar-scroll:hover {
+    --explora-sidebar-scrollbar-thumb: color-mix(
+      in oklch,
+      var(--muted-foreground) 40%,
+      transparent
+    );
+
+    scrollbar-color: var(--explora-sidebar-scrollbar-thumb) transparent;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar {
+    width: 0.5rem;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar-track,
+  .explora-sidebar-scroll::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  .explora-sidebar-scroll::-webkit-scrollbar-thumb {
+    min-height: 2rem;
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-color: var(--explora-sidebar-scrollbar-thumb);
+    background-clip: content-box;
+  }
+
+  @media (forced-colors: active) {
+    .explora-sidebar-scroll,
+    .explora-sidebar-scroll:hover {
+      --explora-sidebar-scrollbar-thumb: CanvasText;
+
+      scrollbar-width: auto;
+      scrollbar-color: auto;
+    }
+
+    .explora-sidebar-scroll::-webkit-scrollbar-thumb {
+      border-color: Canvas;
+    }
+  }
+
+  .explora-titlebar-tabs {
+    padding-right: max(
+      0.5rem,
+      var(--tauri-plugin-decoration-right-clearance, 0px)
+    );
+    padding-left: max(
+      0.5rem,
+      var(--tauri-plugin-decoration-left-clearance, 0px)
+    );
+  }
+
+  @media (min-width: 768px) {
+    .explora-titlebar-tabs {
+      padding-left: 0.5rem;
+    }
+
+    .explora-titlebar-tabs-collapsed {
+      padding-left: max(
+        0.5rem,
+        calc(var(--tauri-plugin-decoration-left-clearance, 0px) - 4rem + 0.5rem)
+      );
+    }
+  }
+}
