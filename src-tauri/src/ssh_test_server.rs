@@ -444,6 +444,38 @@ impl TestSshServer {
         filesystem.nodes.insert(path, TestNode::File(bytes));
     }
 
+    pub async fn create_symlink(&self, path: &str, target: &str) {
+        self.state
+            .filesystem
+            .lock()
+            .await
+            .create_symlink(path, target)
+            .expect("create test symbolic link");
+    }
+
+    pub async fn create_dir(&self, path: &str) {
+        self.state
+            .filesystem
+            .lock()
+            .await
+            .create_dir(path)
+            .expect("create test directory");
+    }
+
+    pub async fn read_link(&self, path: &str) -> Option<String> {
+        match self
+            .state
+            .filesystem
+            .lock()
+            .await
+            .nodes
+            .get(&canonical_path(path))
+        {
+            Some(TestNode::Symlink(target)) => Some(target.clone()),
+            _ => None,
+        }
+    }
+
     pub async fn shutdown(self) {
         self.disconnect_clients().await;
         let _ = self.shutdown.send(true);
@@ -851,6 +883,23 @@ impl russh_sftp::server::Handler for TestSftpHandler {
                 .metadata(&path, false)
                 .ok_or(StatusCode::NoSuchFile)?,
         })
+    }
+
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        let path = canonical_path(&path);
+        if is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if !self.filesystem.lock().await.nodes.contains_key(&path) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(ok_status(id))
     }
 
     async fn rename(

@@ -833,13 +833,10 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     if (!entry.capabilities.move || !destination.capabilities.acceptMove) {
       throw new Error("This item cannot be moved to that folder.");
     }
-    if (entry.reference.locationId !== destination.locationId) {
-      throw new Error(
-        "Moving between locations requires a transfer, which is not available yet.",
-      );
-    }
+    const transferred = entry.reference.locationId !== destination.locationId;
     if (
       entry.directory &&
+      !transferred &&
       (entry.directory.id === destination.id ||
         destination.displayPath.startsWith(`${entry.displayPath}/`))
     ) {
@@ -858,7 +855,10 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     if (!sourceParentId) throw new Error("The source is no longer available.");
     const sourceParent = this.findDemoDirectory(sourceParentId);
     if (!sourceParent) throw new Error("The source folder is unavailable.");
-    if (sourceParent.id === destination.id) {
+    if (
+      sourceParent.locationId === destination.locationId &&
+      sourceParent.id === destination.id
+    ) {
       return {
         kind: "moved",
         entry,
@@ -918,10 +918,20 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     const displayPath = `${destination.displayPath}/${name}`;
     const moved: FileEntrySummary = {
       ...entry,
+      reference: transferred
+        ? { ...entry.reference, locationId: destination.locationId }
+        : entry.reference,
       name,
       displayPath,
       directory: entry.directory
-        ? { ...entry.directory, name, displayPath }
+        ? {
+            ...entry.directory,
+            locationId: transferred
+              ? destination.locationId
+              : entry.directory.locationId,
+            name,
+            displayPath,
+          }
         : null,
     };
     this.renamedEntries.set(entry.reference.id, moved);
@@ -931,8 +941,8 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       entry: moved,
       sourceParent,
       destination,
-      rebasedEntryIds: [entry.reference.id],
-      invalidatedEntryIds: [],
+      rebasedEntryIds: transferred ? [] : [entry.reference.id],
+      invalidatedEntryIds: transferred ? [entry.reference.id] : [],
     };
   }
 

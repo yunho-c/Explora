@@ -561,7 +561,7 @@ and refresh. Cross-location remote moves remain Phase 6 transfers.
 - Report partial completion when the verified copy remains but source deletion
   fails.
 
-Implementation is in progress. The local-to-local slice supports regular files,
+Implemented for single entries. The local-to-local path supports regular files,
 directory trees, and symbolic links without following link targets. It snapshots
 at most 100,000 entries and 256 levels, aggregates regular-file byte totals,
 copies in bounded 256 KiB chunks, and checks cancellation between entries and
@@ -572,9 +572,7 @@ the complete source and destination structure, link targets, metadata identity,
 and every regular-file byte before source removal. Deletion removes only entries
 from the verified snapshot, so a late-arriving child is preserved and produces a
 partial result instead of being deleted without a copy. A failed source removal
-preserves the verified destination and reports partial completion. This path
-remains unexposed in the destination chooser until every local/SFTP direction
-uses the same safe contract.
+preserves the verified destination and reports partial completion.
 
 Regular-file streaming is implemented in every direction: local to SFTP, SFTP
 to local, and SFTP to SFTP, in addition to local to local. Remote destinations
@@ -587,9 +585,25 @@ acknowledgement is never replayed; Explora reports an uncertain outcome and
 requires a refresh. After successful finalization, source deletion runs exactly
 once. A rejected source deletion preserves the verified destination and reports
 partial completion. SFTP-to-local transfers translate ordinary permission bits
-without copying special mode bits. Remote directory and symbolic-link transfer
-manifests remain to be implemented before cross-location destinations are
-enabled in the UI.
+without copying special mode bits.
+
+Remote directory and symbolic-link transfers use the same bounded contract in
+every local/SFTP direction. Remote manifests are deterministic, limited to
+100,000 entries and 256 levels, preserve empty directories and link targets, and
+never recurse through links. Hidden remote directory artifacts track exactly the
+paths Explora created, so cancellation and failures clean those entries in
+reverse order without scanning or following unexpected children. Complete trees
+are structure-checked and every regular file is byte-verified before the root is
+finalized. Source manifests are revalidated before cleanup, and remote source
+removal deletes only verified entries; an unplanned late child prevents its
+parent directory from being removed and produces a partial result.
+
+The destination chooser enables every online location whose advertised
+directory capability accepts moves, rather than checking backend names or
+requiring the source location. On Windows, a remote symbolic link cannot be
+recreated locally when SFTP provides no authoritative target-type metadata;
+that direction returns an explicit unsupported error instead of following the
+link or guessing whether to create a file or directory link.
 
 ### Phase 7: Multi-selection
 

@@ -264,6 +264,29 @@ describe("ExplorerState", () => {
     );
   });
 
+  it("moves an entry to another capable location through the transfer path", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    const workspace = state.locations.find(({ id }) => id === "workspace");
+    expect(entry).toBeDefined();
+    expect(workspace).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    await state.openMoveSelected();
+    await state.fileOperations.browseMoveDestination(workspace!.root);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Workspace");
+    expect(state.fileOperations.canConfirmMove).toBe(true);
+    await state.confirmMoveSelected();
+
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      false,
+    );
+    expect(state.fileOperations.errorMessage).toBeNull();
+    await state.openDirectory(workspace!.root);
+    const moved = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(moved?.reference.locationId).toBe("workspace");
+  });
+
   it("does not allow a directory to be chosen as its own move destination", async () => {
     const state = await initializedState();
     const projects = state.entries.find(({ name }) => name === "Projects");

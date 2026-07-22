@@ -224,10 +224,10 @@ describe("ExplorerShell", () => {
     ).toBeInTheDocument();
     expect(
       within(dialog).getByRole("button", { name: "Workspace" }),
-    ).toBeDisabled();
+    ).toBeEnabled();
     expect(
       within(dialog).getByRole("button", { name: "staging-box" }),
-    ).toBeDisabled();
+    ).toBeEnabled();
     const cancel = within(dialog).getByRole("button", { name: "Cancel" });
     await waitFor(() => expect(cancel).toHaveFocus());
     expect(

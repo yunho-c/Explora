@@ -35,6 +35,9 @@ export interface MoveChooserState {
 const isAbortError = (error: unknown) =>
   error instanceof Error && error.name === "AbortError";
 
+const isSameDirectory = (left: DirectoryRef, right: DirectoryRef) =>
+  left.locationId === right.locationId && left.id === right.id;
+
 export class FileOperationStore {
   activeEntryId = $state<string | null>(null);
   activeEntryName = $state<string | null>(null);
@@ -55,9 +58,9 @@ export class FileOperationStore {
       chooser &&
       !chooser.loading &&
       chooser.directory.capabilities.acceptMove &&
-      chooser.directory.locationId === chooser.entry.reference.locationId &&
-      chooser.directory.id !== chooser.sourceParent.id &&
-      chooser.directory.id !== chooser.entry.directory?.id,
+      !isSameDirectory(chooser.directory, chooser.sourceParent) &&
+      (!chooser.entry.directory ||
+        !isSameDirectory(chooser.directory, chooser.entry.directory)),
     );
   }
 
@@ -245,8 +248,8 @@ export class FileOperationStore {
     return Boolean(
       chooser &&
       directory.capabilities.acceptMove &&
-      directory.locationId === chooser.entry.reference.locationId &&
-      directory.id !== chooser.entry.directory?.id,
+      (!chooser.entry.directory ||
+        !isSameDirectory(directory, chooser.entry.directory)),
     );
   }
 

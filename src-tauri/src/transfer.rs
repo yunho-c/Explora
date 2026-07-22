@@ -1,7 +1,7 @@
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::SystemTime,
 };
@@ -22,22 +22,71 @@ struct TransferFileIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LocalTransferEntryKind {
+pub(crate) enum LocalTransferEntryKind {
     File,
     Directory,
     Symlink { target_is_directory: bool },
 }
 
 #[derive(Clone)]
-struct LocalTransferPlanEntry {
-    relative_path: PathBuf,
-    kind: LocalTransferEntryKind,
-    len: u64,
+pub(crate) struct LocalTransferPlanEntry {
+    pub(crate) relative_path: PathBuf,
+    pub(crate) kind: LocalTransferEntryKind,
+    pub(crate) len: u64,
     modified: Option<SystemTime>,
     identity: Option<TransferFileIdentity>,
     permission_fingerprint: u64,
-    link_target: Option<PathBuf>,
-    permissions: fs::Permissions,
+    pub(crate) link_target: Option<PathBuf>,
+    pub(crate) permissions: fs::Permissions,
+}
+
+impl LocalTransferPlanEntry {
+    pub(crate) fn remote_relative_path(&self) -> Result<String, ExplorerError> {
+        let mut components = Vec::new();
+        for component in self.relative_path.components() {
+            let Component::Normal(component) = component else {
+                return Err(ExplorerError::InvalidReference);
+            };
+            let component = component.to_str().ok_or_else(|| {
+                ExplorerError::Unsupported(
+                    "A local file name cannot be represented on the remote filesystem.".to_owned(),
+                )
+            })?;
+            if component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.len() > 1_024
+                || component.contains('/')
+                || component.contains('\0')
+            {
+                return Err(ExplorerError::Unsupported(
+                    "A local file name is not valid on the remote filesystem.".to_owned(),
+                ));
+            }
+            components.push(component);
+        }
+        Ok(components.join("/"))
+    }
+
+    pub(crate) fn remote_permissions(&self) -> Option<u32> {
+        local_permissions_for_remote(&self.permissions)
+    }
+}
+
+#[cfg(unix)]
+fn local_permissions_for_remote(permissions: &fs::Permissions) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(permissions.mode() & 0o777)
+}
+
+#[cfg(windows)]
+fn local_permissions_for_remote(permissions: &fs::Permissions) -> Option<u32> {
+    Some(if permissions.readonly() { 0o444 } else { 0o644 })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_permissions_for_remote(_permissions: &fs::Permissions) -> Option<u32> {
+    None
 }
 
 #[derive(Clone)]
@@ -66,8 +115,27 @@ impl LocalTransferPlan {
         )
     }
 
+    pub(crate) fn root_is_symlink(&self) -> bool {
+        matches!(
+            self.entries.first().map(|entry| entry.kind),
+            Some(LocalTransferEntryKind::Symlink { .. })
+        )
+    }
+
+    pub(crate) fn root_link_target(&self) -> Option<&Path> {
+        self.entries.first()?.link_target.as_deref()
+    }
+
     pub(crate) fn source_root(&self) -> &Path {
         &self.source_root
+    }
+
+    pub(crate) fn entries(&self) -> &[LocalTransferPlanEntry] {
+        &self.entries
+    }
+
+    pub(crate) fn source_entry_path(&self, entry: &LocalTransferPlanEntry) -> PathBuf {
+        transfer_entry_path(&self.source_root, &entry.relative_path)
     }
 
     fn root_kind(&self) -> Result<LocalTransferEntryKind, ExplorerError> {
@@ -262,7 +330,7 @@ impl OwnedLocalTransferArtifact {
         ))
     }
 
-    fn create_directory(
+    pub(crate) fn create_directory(
         destination_directory: &Path,
         final_name: &std::ffi::OsStr,
     ) -> Result<Self, ExplorerError> {
@@ -300,7 +368,7 @@ impl OwnedLocalTransferArtifact {
         ))
     }
 
-    fn create_symlink(
+    pub(crate) fn create_symlink(
         destination_directory: &Path,
         final_name: &std::ffi::OsStr,
         target: &Path,
@@ -393,6 +461,50 @@ impl OwnedLocalTransferArtifact {
 
     pub(crate) fn current_path(&self) -> &Path {
         &self.owned_path
+    }
+
+    pub(crate) fn entry_path(&self, relative_path: &Path) -> Result<PathBuf, ExplorerError> {
+        if relative_path.as_os_str().is_empty() {
+            return Ok(self.owned_path.clone());
+        }
+        if relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ExplorerError::InvalidReference);
+        }
+        Ok(self.owned_path.join(relative_path))
+    }
+
+    pub(crate) fn create_directory_entry(&self, relative_path: &Path) -> Result<(), ExplorerError> {
+        if self.kind != OwnedLocalArtifactKind::Directory || self.finalized {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        create_owned_directory(&self.entry_path(relative_path)?)
+    }
+
+    pub(crate) fn create_symlink_entry(
+        &self,
+        relative_path: &Path,
+        target: &Path,
+        target_is_directory: bool,
+    ) -> Result<(), ExplorerError> {
+        if self.kind != OwnedLocalArtifactKind::Directory || self.finalized {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        create_local_symlink(
+            target,
+            &self.entry_path(relative_path)?,
+            target_is_directory,
+        )
+        .map_err(|error| ExplorerError::io("create", relative_path, error))
+    }
+
+    pub(crate) fn create_file_entry(&self, relative_path: &Path) -> Result<File, ExplorerError> {
+        if self.kind != OwnedLocalArtifactKind::Directory || self.finalized {
+            return Err(ExplorerError::StateUnavailable);
+        }
+        create_owned_file(&self.entry_path(relative_path)?)
     }
 
     pub(crate) fn take_file(&mut self) -> Result<File, ExplorerError> {

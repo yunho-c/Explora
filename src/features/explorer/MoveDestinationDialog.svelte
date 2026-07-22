@@ -57,7 +57,6 @@
             {#each chooser.locations as location (location.id)}
               {@const compatible =
                 location.status !== "offline" &&
-                location.id === chooser.entry.reference.locationId &&
                 location.root.capabilities.acceptMove}
               <button
                 type="button"
@@ -69,7 +68,7 @@
                   ? `Browse ${location.name}`
                   : location.status === "offline"
                     ? `${location.name} is offline`
-                    : "This destination requires a transfer"}
+                    : "This location cannot accept moved items"}
                 class="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45 aria-[current=location]:bg-muted aria-[current=location]:font-medium"
                 onclick={() =>
                   void state.fileOperations.browseMoveDestination(

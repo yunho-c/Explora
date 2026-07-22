@@ -22,7 +22,7 @@ use crate::platform_trash::PlatformTrash;
 use crate::transfer::{
     copy_local_transfer_into_owned_artifact, plan_local_transfer,
     remove_verified_local_transfer_source, revalidate_local_transfer_source, verify_local_transfer,
-    LocalTransferPlan, OwnedLocalTransferArtifact,
+    LocalTransferEntryKind, LocalTransferPlan, OwnedLocalTransferArtifact,
 };
 
 const MAX_PERMANENT_DELETE_ENTRIES: usize = 1_000_000;
@@ -599,10 +599,20 @@ impl LocalFilesystem {
         ensure_not_cancelled(cancelled)?;
         let (source_path, _) = self.resolve_mutation_source(entry)?;
         let plan = plan_local_transfer(&source_path, cancelled)?;
-        if !plan.root_is_file() {
-            return Err(ExplorerError::Unsupported(
-                "This cross-backend transfer path currently accepts regular files only.".to_owned(),
-            ));
+        for transfer_entry in plan.entries() {
+            transfer_entry.remote_relative_path()?;
+            if matches!(transfer_entry.kind, LocalTransferEntryKind::Symlink { .. })
+                && transfer_entry
+                    .link_target
+                    .as_deref()
+                    .and_then(Path::to_str)
+                    .is_none()
+            {
+                return Err(ExplorerError::Unsupported(
+                    "A symbolic-link target cannot be represented on the remote filesystem."
+                        .to_owned(),
+                ));
+            }
         }
         let name = source_path
             .file_name()
@@ -703,12 +713,143 @@ impl LocalFilesystem {
         })
     }
 
+    pub(crate) fn prepare_symlink_transfer_destination(
+        &self,
+        destination: &DirectoryRefDto,
+        source_name: &str,
+        link_target: &Path,
+        target_is_directory: bool,
+        conflict_policy: LocalMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedLocalFileDestination, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        validate_entry_name(source_name)?;
+        let destination_path = self.resolve_transfer_destination(destination)?;
+        let artifact = match conflict_policy {
+            LocalMoveConflictPolicy::Fail => OwnedLocalTransferArtifact::create_symlink(
+                &destination_path,
+                OsStr::new(source_name),
+                link_target,
+                target_is_directory,
+            )?,
+            LocalMoveConflictPolicy::KeepBoth => {
+                let mut artifact = None;
+                for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+                    ensure_not_cancelled(cancelled)?;
+                    let candidate = keep_both_name(OsStr::new(source_name), false, attempt);
+                    match OwnedLocalTransferArtifact::create_symlink(
+                        &destination_path,
+                        &candidate,
+                        link_target,
+                        target_is_directory,
+                    ) {
+                        Ok(created) => {
+                            artifact = Some(created);
+                            break;
+                        }
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                artifact.ok_or(ExplorerError::Conflict)?
+            }
+        };
+        let destination = directory_ref(
+            &self.registry,
+            &destination_path,
+            &destination.location_id,
+            None,
+        )?;
+        Ok(PreparedLocalFileDestination {
+            artifact,
+            destination,
+        })
+    }
+
+    pub(crate) fn prepare_directory_transfer_destination(
+        &self,
+        destination: &DirectoryRefDto,
+        source_name: &str,
+        conflict_policy: LocalMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedLocalFileDestination, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        validate_entry_name(source_name)?;
+        let destination_path = self.resolve_transfer_destination(destination)?;
+        let artifact = match conflict_policy {
+            LocalMoveConflictPolicy::Fail => OwnedLocalTransferArtifact::create_directory(
+                &destination_path,
+                OsStr::new(source_name),
+            )?,
+            LocalMoveConflictPolicy::KeepBoth => {
+                let mut artifact = None;
+                for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+                    ensure_not_cancelled(cancelled)?;
+                    let candidate = keep_both_name(OsStr::new(source_name), true, attempt);
+                    match OwnedLocalTransferArtifact::create_directory(
+                        &destination_path,
+                        &candidate,
+                    ) {
+                        Ok(created) => {
+                            artifact = Some(created);
+                            break;
+                        }
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                artifact.ok_or(ExplorerError::Conflict)?
+            }
+        };
+        let destination = directory_ref(
+            &self.registry,
+            &destination_path,
+            &destination.location_id,
+            None,
+        )?;
+        Ok(PreparedLocalFileDestination {
+            artifact,
+            destination,
+        })
+    }
+
+    pub(crate) fn apply_received_permissions(
+        prepared: &PreparedLocalFileDestination,
+        relative_path: &Path,
+        source_permissions: Option<u32>,
+    ) -> Result<(), ExplorerError> {
+        apply_remote_file_permissions(
+            &prepared.artifact.entry_path(relative_path)?,
+            source_permissions,
+        )
+    }
+
     pub(crate) fn finalize_received_file(
         &self,
         mut prepared: PreparedLocalFileDestination,
         source_permissions: Option<u32>,
     ) -> Result<(FileEntrySummaryDto, DirectoryRefDto), ExplorerError> {
         apply_remote_file_permissions(prepared.artifact.current_path(), source_permissions)?;
+        let final_path = prepared.artifact.finalize()?.to_path_buf();
+        let entry = self.describe_path(final_path, &prepared.destination.location_id)?;
+        prepared.artifact.preserve();
+        Ok((entry, prepared.destination))
+    }
+
+    pub(crate) fn finalize_received_symlink(
+        &self,
+        mut prepared: PreparedLocalFileDestination,
+    ) -> Result<(FileEntrySummaryDto, DirectoryRefDto), ExplorerError> {
+        let final_path = prepared.artifact.finalize()?.to_path_buf();
+        let entry = self.describe_path(final_path, &prepared.destination.location_id)?;
+        prepared.artifact.preserve();
+        Ok((entry, prepared.destination))
+    }
+
+    pub(crate) fn finalize_received_directory(
+        &self,
+        mut prepared: PreparedLocalFileDestination,
+    ) -> Result<(FileEntrySummaryDto, DirectoryRefDto), ExplorerError> {
         let final_path = prepared.artifact.finalize()?.to_path_buf();
         let entry = self.describe_path(final_path, &prepared.destination.location_id)?;
         prepared.artifact.preserve();
