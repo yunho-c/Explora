@@ -15,6 +15,7 @@
   import FileGrid from "./FileGrid.svelte";
   import FileList from "./FileList.svelte";
   import FileOperationConfirmationDialog from "./FileOperationConfirmationDialog.svelte";
+  import MoveDestinationDialog from "./MoveDestinationDialog.svelte";
   import QuickPreview from "./QuickPreview.svelte";
   import SshPromptDialog from "./SshPromptDialog.svelte";
   import SshTargetDialog from "./SshTargetDialog.svelte";
@@ -81,14 +82,19 @@
       return;
 
     const deletion = deletionShortcut(event);
-    if (deletion === "trash" && state.selectedEntry?.capabilities.trash) {
+    if (
+      deletion === "trash" &&
+      state.selectedEntry?.capabilities.trash &&
+      state.fileOperations.activeEntryId === null
+    ) {
       event.preventDefault();
       void state.moveSelectedToTrash();
       return;
     }
     if (
       deletion === "deletePermanently" &&
-      state.selectedEntry?.capabilities.deletePermanently
+      state.selectedEntry?.capabilities.deletePermanently &&
+      state.fileOperations.activeEntryId === null
     ) {
       event.preventDefault();
       void state.deleteSelectedPermanently();
@@ -236,6 +242,7 @@
 
   <QuickPreview {state} />
   <FileOperationConfirmationDialog {state} />
+  <MoveDestinationDialog {state} />
   <SshTargetDialog {state} />
   <SshPromptDialog {state} />
 </div>

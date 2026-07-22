@@ -98,6 +98,28 @@ pub struct DirectoryRefDto {
     pub location_id: String,
     pub name: String,
     pub display_path: String,
+    pub capabilities: DirectoryCapabilitiesDto,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryCapabilitiesDto {
+    pub accept_move: bool,
+    pub atomic_replace: bool,
+}
+
+impl DirectoryCapabilitiesDto {
+    pub const READ_ONLY: Self = Self {
+        accept_move: false,
+        atomic_replace: false,
+    };
+
+    pub const LOCAL: Self = Self {
+        accept_move: true,
+        // Replacement stays disabled until an atomic or staged replacement
+        // strategy is implemented and covered on every supported platform.
+        atomic_replace: false,
+    };
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -140,7 +162,7 @@ impl EntryCapabilitiesDto {
     pub const fn local(trash_available: bool) -> Self {
         Self {
             rename: true,
-            move_entry: false,
+            move_entry: true,
             trash: trash_available,
             delete_permanently: true,
         }
@@ -170,8 +192,8 @@ pub struct FileEntrySummaryDto {
 )]
 pub enum DirectoryListingEvent {
     Started {
-        directory: DirectoryRefDto,
-        parent: Option<DirectoryRefDto>,
+        directory: Box<DirectoryRefDto>,
+        parent: Option<Box<DirectoryRefDto>>,
         breadcrumbs: Vec<BreadcrumbSegmentDto>,
     },
     Entries {
@@ -190,6 +212,7 @@ pub enum ExplorerErrorCode {
     InvalidName,
     Conflict,
     SourceChanged,
+    DestinationUnavailable,
     NotFound,
     PermissionDenied,
     NotDirectory,
@@ -219,6 +242,8 @@ pub enum ExplorerError {
     Conflict,
     #[error("The source changed before the operation could finish.")]
     SourceChanged,
+    #[error("{0}")]
+    DestinationUnavailable(String),
     #[error("The request was cancelled.")]
     Cancelled,
     #[error("Explora's filesystem state is unavailable.")]
@@ -260,6 +285,7 @@ impl From<ExplorerError> for ExplorerErrorDto {
             ExplorerError::InvalidName(_) => ExplorerErrorCode::InvalidName,
             ExplorerError::Conflict => ExplorerErrorCode::Conflict,
             ExplorerError::SourceChanged => ExplorerErrorCode::SourceChanged,
+            ExplorerError::DestinationUnavailable(_) => ExplorerErrorCode::DestinationUnavailable,
             ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
             ExplorerError::Io { kind, .. } => match kind {
                 std::io::ErrorKind::NotFound => ExplorerErrorCode::NotFound,

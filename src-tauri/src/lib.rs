@@ -2,6 +2,7 @@ mod commands;
 mod file_operations;
 mod filesystem;
 mod local_filesystem;
+mod local_relocate;
 mod platform_trash;
 mod preferences;
 mod preview;

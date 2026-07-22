@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   DirectoryRef,
   FileEntrySummary,
-  FileOperationConfirmation,
+  FileOperationPrompt,
   FileOperationPromptResponse,
 } from "$lib/contracts/explorer";
 
@@ -15,6 +15,7 @@ const root: DirectoryRef = {
   locationId: "home",
   name: "Home",
   displayPath: "/Users/test",
+  capabilities: { acceptMove: true, atomicReplace: false },
 };
 
 const locationPayload = {
@@ -40,7 +41,7 @@ const entryPayload = {
   detail: null,
   capabilities: {
     rename: true,
-    moveEntry: false,
+    moveEntry: true,
     trash: true,
     deletePermanently: true,
   },
@@ -57,10 +58,18 @@ const previewEntry: FileEntrySummary = {
   directory: null,
   capabilities: {
     rename: true,
-    move: false,
+    move: true,
     trash: true,
     deletePermanently: true,
   },
+};
+
+const destination: DirectoryRef = {
+  id: "destination-token",
+  locationId: "home",
+  name: "Archive",
+  displayPath: "/Users/test/Archive",
+  capabilities: { acceptMove: true, atomicReplace: false },
 };
 
 const sshTargetPayload = {
@@ -96,6 +105,7 @@ const volumePayload = {
     locationId: "volume:test",
     name: "Test Volume",
     displayPath: "/Volumes/Test Volume",
+    capabilities: { acceptMove: true, atomicReplace: false },
   },
 };
 
@@ -257,7 +267,188 @@ describe("TauriExplorerDataSource", () => {
       reference: entryPayload.reference,
       name: "renamed.md",
       displayPath: "/Users/test/renamed.md",
-      capabilities: { rename: true, move: false },
+      capabilities: { rename: true, move: true },
+    });
+  });
+
+  it("moves through the typed operation protocol and validates rebased identities", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      expect(Reflect.get(payload, "request")).toEqual({
+        sources: [entryPayload.reference],
+        action: { kind: "move", destination },
+      });
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "queued",
+          operationId: "operation-move",
+          sequence: 0,
+          action: "move",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "running",
+          operationId: "operation-move",
+          sequence: 1,
+          action: "move",
+          completedItems: 0,
+          totalItems: 1,
+        },
+        {
+          event: "completed",
+          operationId: "operation-move",
+          sequence: 2,
+          action: "move",
+          completedItems: 1,
+          totalItems: 1,
+          outcome: {
+            kind: "moved",
+            entry: {
+              ...entryPayload,
+              displayPath: "/Users/test/Archive/notes.md",
+            },
+            sourceParent: root,
+            destination,
+            rebasedEntryIds: [entryPayload.reference.id],
+          },
+        },
+      ]);
+      return "operation-move";
+    });
+
+    await expect(
+      new TauriExplorerDataSource().moveEntry(previewEntry, destination, {
+        signal: new AbortController().signal,
+        onPrompt: vi.fn(),
+      }),
+    ).resolves.toMatchObject({
+      kind: "moved",
+      entry: { reference: entryPayload.reference },
+      sourceParent: root,
+      destination,
+      rebasedEntryIds: [entryPayload.reference.id],
+    });
+  });
+
+  it("answers an authoritative move conflict with keep-both", async () => {
+    let operationChannel: unknown;
+    let prompt:
+      | [
+          FileOperationPrompt,
+          (response: FileOperationPromptResponse) => Promise<void>,
+        ]
+      | undefined;
+    mockIPC((command, payload) => {
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("Expected operation command arguments.");
+      }
+      if (command === "start_file_operation") {
+        operationChannel = Reflect.get(payload, "onEvent");
+        sendChannelMessages(
+          operationChannel,
+          [
+            {
+              event: "queued",
+              operationId: "operation-move-conflict",
+              sequence: 0,
+              action: "move",
+              completedItems: 0,
+              totalItems: 1,
+            },
+            {
+              event: "running",
+              operationId: "operation-move-conflict",
+              sequence: 1,
+              action: "move",
+              completedItems: 0,
+              totalItems: 1,
+            },
+            {
+              event: "awaitingConflict",
+              operationId: "operation-move-conflict",
+              sequence: 2,
+              action: "move",
+              completedItems: 0,
+              totalItems: 1,
+              prompt: {
+                id: "prompt-move",
+                kind: "moveConflict",
+                title: "“notes.md” already exists",
+                message: "Nothing will be replaced.",
+                targetName: "notes.md",
+                destinationName: "Archive",
+                decisions: ["keepBoth", "skip", "cancel"],
+              },
+            },
+          ],
+          false,
+        );
+        return "operation-move-conflict";
+      }
+      if (command === "respond_file_operation") {
+        expect(payload).toEqual({
+          operationId: "operation-move-conflict",
+          promptId: "prompt-move",
+          response: "keepBoth",
+        });
+        sendChannelMessages(
+          operationChannel,
+          [
+            {
+              event: "running",
+              operationId: "operation-move-conflict",
+              sequence: 3,
+              action: "move",
+              completedItems: 0,
+              totalItems: 1,
+            },
+            {
+              event: "completed",
+              operationId: "operation-move-conflict",
+              sequence: 4,
+              action: "move",
+              completedItems: 1,
+              totalItems: 1,
+              outcome: {
+                kind: "moved",
+                entry: {
+                  ...entryPayload,
+                  name: "notes copy.md",
+                  displayPath: "/Users/test/Archive/notes copy.md",
+                },
+                sourceParent: root,
+                destination,
+                rebasedEntryIds: [entryPayload.reference.id],
+              },
+            },
+          ],
+          true,
+          3,
+        );
+        return null;
+      }
+      return null;
+    });
+
+    const move = new TauriExplorerDataSource().moveEntry(
+      previewEntry,
+      destination,
+      {
+        signal: new AbortController().signal,
+        onPrompt: (...args) => {
+          prompt = args;
+        },
+      },
+    );
+    await vi.waitFor(() => expect(prompt?.[0].kind).toBe("moveConflict"));
+    await prompt?.[1]("keepBoth");
+    await expect(move).resolves.toMatchObject({
+      kind: "moved",
+      entry: { name: "notes copy.md" },
     });
   });
 
@@ -347,7 +538,7 @@ describe("TauriExplorerDataSource", () => {
       previewEntry,
       {
         signal: new AbortController().signal,
-        onConfirmation,
+        onPrompt: onConfirmation,
       },
     );
 
@@ -446,7 +637,7 @@ describe("TauriExplorerDataSource", () => {
     });
     let confirmation:
       | [
-          FileOperationConfirmation,
+          FileOperationPrompt,
           (response: FileOperationPromptResponse) => Promise<void>,
         ]
       | undefined;
@@ -454,7 +645,7 @@ describe("TauriExplorerDataSource", () => {
       previewEntry,
       {
         signal: new AbortController().signal,
-        onConfirmation: (...args) => {
+        onPrompt: (...args) => {
           confirmation = args;
         },
       },
@@ -536,7 +727,7 @@ describe("TauriExplorerDataSource", () => {
     await expect(
       new TauriExplorerDataSource().trashEntry(previewEntry, {
         signal: controller.signal,
-        onConfirmation: vi.fn(),
+        onPrompt: vi.fn(),
       }),
     ).resolves.toMatchObject({ kind: "trashed" });
     expect(cancel).toHaveBeenCalledWith({ operationId: "operation-trash" });

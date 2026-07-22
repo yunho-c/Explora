@@ -1338,6 +1338,7 @@ dependencies = [
  "russh",
  "russh-config",
  "russh-sftp",
+ "rustix",
  "serde",
  "serde_json",
  "sysinfo",

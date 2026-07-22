@@ -6,7 +6,8 @@ import type {
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
-  FileOperationConfirmation,
+  FileMoveResult,
+  FileOperationPrompt,
   FileRemovalResult,
   ImagePreviewMode,
   LocationKind,
@@ -28,6 +29,7 @@ import type {
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
+  FileOperationOptions,
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
@@ -137,11 +139,20 @@ const parseDirectoryRef = (value: unknown): DirectoryRef => {
     );
   }
 
+  if (!isRecord(value.capabilities)) {
+    throw new Error(
+      "Invalid filesystem response: directory capabilities are malformed.",
+    );
+  }
   return {
     id: requireString(value, "id"),
     locationId: requireString(value, "locationId"),
     name: requireString(value, "name"),
     displayPath: requireString(value, "displayPath"),
+    capabilities: {
+      acceptMove: requireBoolean(value.capabilities, "acceptMove"),
+      atomicReplace: requireBoolean(value.capabilities, "atomicReplace"),
+    },
   };
 };
 
@@ -386,11 +397,14 @@ const parseEntry = (value: unknown): FileEntrySummary => {
 
 type FileOperationAction =
   | { kind: "rename"; newName: string }
+  | { kind: "move"; destination: DirectoryRef }
   | { kind: "trash" }
   | { kind: "deletePermanently" };
 
 type FileOperationOutcome =
-  { kind: "renamed"; entry: FileEntrySummary } | FileRemovalResult;
+  | { kind: "renamed"; entry: FileEntrySummary }
+  | FileMoveResult
+  | FileRemovalResult;
 
 const parseEntryRef = (value: unknown) => {
   if (!isRecord(value)) {
@@ -422,23 +436,61 @@ const parseOperationProgress = (value: Record<string, unknown>) => {
   }
 };
 
-const parseOperationConfirmation = (
-  value: unknown,
-): FileOperationConfirmation => {
-  if (!isRecord(value) || value.kind !== "permanentDelete") {
+const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
+  if (!isRecord(value)) {
     throw new Error(
-      "Invalid filesystem response: operation confirmation is malformed.",
+      "Invalid filesystem response: operation prompt is malformed.",
     );
   }
-  return {
-    id: requireString(value, "id"),
-    kind: "permanentDelete",
-    title: requireString(value, "title"),
-    message: requireString(value, "message"),
-    targetName: requireString(value, "targetName"),
-    locationName: requireString(value, "locationName"),
-    confirmLabel: requireString(value, "confirmLabel"),
-  };
+  if (value.kind === "permanentDelete") {
+    return {
+      id: requireString(value, "id"),
+      kind: "permanentDelete",
+      title: requireString(value, "title"),
+      message: requireString(value, "message"),
+      targetName: requireString(value, "targetName"),
+      locationName: requireString(value, "locationName"),
+      confirmLabel: requireString(value, "confirmLabel"),
+    };
+  }
+  if (value.kind === "moveConflict") {
+    if (!Array.isArray(value.decisions)) {
+      throw new Error(
+        "Invalid filesystem response: conflict decisions are malformed.",
+      );
+    }
+    const decisions = value.decisions.map((decision) => {
+      if (
+        decision !== "keepBoth" &&
+        decision !== "skip" &&
+        decision !== "cancel"
+      ) {
+        throw new Error(
+          "Invalid filesystem response: conflict decision is unsupported.",
+        );
+      }
+      return decision;
+    });
+    if (
+      decisions.length !== new Set(decisions).size ||
+      !decisions.includes("cancel") ||
+      decisions.length === 0
+    ) {
+      throw new Error(
+        "Invalid filesystem response: conflict decisions are malformed.",
+      );
+    }
+    return {
+      id: requireString(value, "id"),
+      kind: "moveConflict",
+      title: requireString(value, "title"),
+      message: requireString(value, "message"),
+      targetName: requireString(value, "targetName"),
+      destinationName: requireString(value, "destinationName"),
+      decisions,
+    };
+  }
+  throw new Error("Invalid filesystem response: operation prompt is unknown.");
 };
 
 const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
@@ -449,6 +501,45 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
   }
   if (value.kind === "renamed") {
     return { kind: "renamed", entry: parseEntry(value.entry) };
+  }
+  if (value.kind === "moved") {
+    if (!Array.isArray(value.rebasedEntryIds)) {
+      throw new Error(
+        "Invalid filesystem response: rebased entry references are malformed.",
+      );
+    }
+    const rebasedEntryIds = value.rebasedEntryIds.map((id: unknown) => {
+      if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+        throw new Error(
+          "Invalid filesystem response: rebased entry references are malformed.",
+        );
+      }
+      return id;
+    });
+    const entry = parseEntry(value.entry);
+    if (
+      rebasedEntryIds.length === 0 ||
+      rebasedEntryIds.length > 100_000 ||
+      !rebasedEntryIds.includes(entry.reference.id)
+    ) {
+      throw new Error(
+        "Invalid filesystem response: rebased entry references are malformed.",
+      );
+    }
+    return {
+      kind: "moved",
+      entry,
+      sourceParent: parseDirectoryRef(value.sourceParent),
+      destination: parseDirectoryRef(value.destination),
+      rebasedEntryIds: [...new Set(rebasedEntryIds)],
+    };
+  }
+  if (value.kind === "moveSkipped") {
+    return {
+      kind: "moveSkipped",
+      entry: parseEntryRef(value.entry),
+      name: requireString(value, "name"),
+    };
   }
   if (value.kind !== "trashed" && value.kind !== "deletedPermanently") {
     throw new Error(
@@ -1082,9 +1173,9 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       { kind: "rename", newName },
       {
         signal,
-        onConfirmation: () => {
+        onPrompt: () => {
           throw new Error(
-            "Invalid filesystem response: rename requested confirmation.",
+            "Invalid filesystem response: rename requested a prompt.",
           );
         },
       },
@@ -1095,6 +1186,24 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       );
     }
     return outcome.entry;
+  }
+
+  async moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult> {
+    const outcome = await this.runFileOperation(
+      entry,
+      { kind: "move", destination },
+      options,
+    );
+    if (outcome.kind !== "moved" && outcome.kind !== "moveSkipped") {
+      throw new Error(
+        "Invalid filesystem response: move returned the wrong outcome.",
+      );
+    }
+    return outcome;
   }
 
   async trashEntry(
@@ -1134,7 +1243,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
   private async runFileOperation(
     entry: FileEntrySummary,
     action: FileOperationAction,
-    { signal, onConfirmation }: RemoveEntryOptions,
+    { signal, onPrompt }: FileOperationOptions,
   ): Promise<FileOperationOutcome> {
     if (signal.aborted) throw abortError();
 
@@ -1196,20 +1305,31 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
         parseOperationProgress(payload);
 
         if (payload.event === "queued" || payload.event === "running") return;
-        if (payload.event === "awaitingConfirmation") {
-          const confirmation = parseOperationConfirmation(payload.prompt);
+        if (
+          payload.event === "awaitingConfirmation" ||
+          payload.event === "awaitingConflict"
+        ) {
+          const prompt = parseOperationPrompt(payload.prompt);
+          if (
+            (payload.event === "awaitingConfirmation" &&
+              prompt.kind !== "permanentDelete") ||
+            (payload.event === "awaitingConflict" &&
+              prompt.kind !== "moveConflict")
+          ) {
+            throw new Error(
+              "Invalid filesystem response: operation prompt state is inconsistent.",
+            );
+          }
           let responded = false;
-          onConfirmation(confirmation, async (response) => {
+          onPrompt(prompt, async (response) => {
             if (responded) {
-              throw new Error(
-                "This filesystem confirmation was already answered.",
-              );
+              throw new Error("This filesystem decision was already answered.");
             }
             responded = true;
             try {
               await invoke("respond_file_operation", {
                 operationId: eventOperationId,
-                promptId: confirmation.id,
+                promptId: prompt.id,
                 response,
               });
             } catch (error) {

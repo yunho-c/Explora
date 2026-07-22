@@ -58,8 +58,8 @@ and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ss
 for the authorization, trust, and credential-handling model.
 
 The SSH filesystem backend remains deliberately read-only, while the local
-backend currently exposes safe single-entry rename, native Trash, and explicitly
-confirmed permanent deletion. SSH authentication
+backend currently exposes safe single-entry rename and same-location move,
+native Trash, and explicitly confirmed permanent deletion. SSH authentication
 supports agents, standard or configured identity files, encrypted-key
 passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
 `known_hosts` files, requires confirmation for unknown keys, and blocks changed
@@ -71,8 +71,8 @@ folder without changing navigation history. Mounted local volumes are discovered
 in the Rust boundary and updated through native platform notifications with a
 bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
 target visibility persist as versioned local preferences. File watching,
-hidden-file controls, move, remote mutations, remote content previews, and
-additional preview formats remain later vertical slices. See
+hidden-file controls, transfer-based move, remote mutations, remote content
+previews, and additional preview formats remain later vertical slices. See
 [`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
 and
 [`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)

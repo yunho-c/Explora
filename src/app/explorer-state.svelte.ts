@@ -3,6 +3,7 @@ import type {
   DirectoryRef,
   ExplorerTab,
   FileEntrySummary,
+  FileMoveResult,
   FileRemovalResult,
   ImagePreviewMode,
   LocationSummary,
@@ -942,6 +943,27 @@ export class ExplorerState {
     );
   }
 
+  async openMoveSelected(entryId = this.selectedEntryId): Promise<void> {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    const sourceParent = this.activeDirectory;
+    if (!entry?.capabilities.move || !sourceParent) return;
+    this.cancelRename();
+    this.closePreview();
+    await this.fileOperations.openMoveChooser(
+      entry,
+      sourceParent,
+      this.locations,
+    );
+  }
+
+  async confirmMoveSelected(): Promise<void> {
+    await this.fileOperations.confirmMove((result) =>
+      this.reconcileMovedEntry(result),
+    );
+  }
+
   async deleteSelectedPermanently(
     entryId = this.selectedEntryId,
   ): Promise<void> {
@@ -1028,6 +1050,70 @@ export class ExplorerState {
         });
       }
     }
+  }
+
+  private async reconcileMovedEntry(result: FileMoveResult): Promise<void> {
+    if (result.kind === "moveSkipped") return;
+
+    const activeDirectory = this.activeDirectory;
+    const activeTab = this.activeTab;
+    const rebased = new SvelteSet(result.rebasedEntryIds);
+    const sourceIndex = this.visibleEntries.findIndex(
+      ({ reference }) => reference.id === result.entry.reference.id,
+    );
+    const sourceRemaining = this.visibleEntries.filter(
+      ({ reference }) => reference.id !== result.entry.reference.id,
+    );
+    let desiredSelection = this.selectedEntryId;
+
+    if (activeDirectory?.id === result.sourceParent.id) {
+      this.entries = this.entries.filter(
+        ({ reference }) => reference.id !== result.entry.reference.id,
+      );
+      desiredSelection =
+        sourceRemaining[
+          Math.min(Math.max(sourceIndex, 0), sourceRemaining.length - 1)
+        ]?.reference.id ?? null;
+    } else if (activeDirectory?.id === result.destination.id) {
+      this.entries = [
+        ...this.entries.filter(
+          ({ reference }) => reference.id !== result.entry.reference.id,
+        ),
+        result.entry,
+      ];
+      desiredSelection = result.entry.reference.id;
+    }
+
+    this.replaceKnownDirectoryReference(result.entry);
+    if (this.preview?.entryId === result.entry.reference.id) {
+      this.preview = {
+        ...this.preview,
+        title: result.entry.name,
+        accessibilityDescription: result.entry.displayPath,
+      };
+    }
+
+    const activeDirectoryNeedsRefresh = Boolean(
+      activeDirectory &&
+      (activeDirectory.id === result.sourceParent.id ||
+        activeDirectory.id === result.destination.id ||
+        rebased.has(activeDirectory.id)),
+    );
+    if (!activeDirectoryNeedsRefresh || !activeDirectory || !activeTab) {
+      this.selectedEntryId = desiredSelection;
+      return;
+    }
+
+    await this.loadDirectory(activeDirectory, (directory) => {
+      activeTab.directory = directory;
+      activeTab.history[activeTab.historyIndex] = directory;
+      activeTab.title = directory.name;
+    });
+    this.selectedEntryId = this.entries.some(
+      ({ reference }) => reference.id === desiredSelection,
+    )
+      ? desiredSelection
+      : null;
   }
 
   private replaceKnownDirectoryReference(renamed: FileEntrySummary): void {

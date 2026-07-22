@@ -13,9 +13,12 @@ use uuid::Uuid;
 
 use crate::{
     filesystem::{
-        EntryRefDto, ExplorerError, ExplorerErrorDto, FileEntrySummaryDto, PROMPT_TIMEOUT,
+        DirectoryRefDto, EntryRefDto, ExplorerError, ExplorerErrorDto, FileEntrySummaryDto,
+        PROMPT_TIMEOUT,
     },
-    local_filesystem::{LocalFilesystem, RemovedLocalEntry},
+    local_filesystem::{
+        LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, RemovedLocalEntry,
+    },
     platform_trash::{PlatformTrash, SystemPlatformTrash},
 };
 
@@ -38,6 +41,7 @@ pub struct FileOperationRequestDto {
 )]
 pub enum FileOperationActionDto {
     Rename { new_name: String },
+    Move { destination: DirectoryRefDto },
     Trash {},
     DeletePermanently {},
 }
@@ -46,6 +50,7 @@ impl FileOperationActionDto {
     fn kind(&self) -> FileOperationKindDto {
         match self {
             Self::Rename { .. } => FileOperationKindDto::Rename,
+            Self::Move { .. } => FileOperationKindDto::Move,
             Self::Trash {} => FileOperationKindDto::Trash,
             Self::DeletePermanently {} => FileOperationKindDto::DeletePermanently,
         }
@@ -56,33 +61,43 @@ impl FileOperationActionDto {
 #[serde(rename_all = "camelCase")]
 pub enum FileOperationKindDto {
     Rename,
+    Move,
     Trash,
     DeletePermanently,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FileOperationPromptResponseDto {
     Confirm,
+    KeepBoth,
+    Skip,
     Cancel,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct FileOperationPromptDto {
-    pub id: String,
-    pub kind: FileOperationPromptKindDto,
-    pub title: String,
-    pub message: String,
-    pub target_name: String,
-    pub location_name: String,
-    pub confirm_label: &'static str,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum FileOperationPromptKindDto {
-    PermanentDelete,
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FileOperationPromptDto {
+    PermanentDelete {
+        id: String,
+        title: String,
+        message: String,
+        target_name: String,
+        location_name: String,
+        confirm_label: &'static str,
+    },
+    MoveConflict {
+        id: String,
+        title: String,
+        message: String,
+        target_name: String,
+        destination_name: String,
+        decisions: Vec<FileOperationPromptResponseDto>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -94,6 +109,16 @@ pub enum FileOperationPromptKindDto {
 pub enum FileOperationOutcomeDto {
     Renamed {
         entry: Box<FileEntrySummaryDto>,
+    },
+    Moved {
+        entry: Box<FileEntrySummaryDto>,
+        source_parent: DirectoryRefDto,
+        destination: DirectoryRefDto,
+        rebased_entry_ids: Vec<String>,
+    },
+    MoveSkipped {
+        entry: EntryRefDto,
+        name: String,
     },
     Trashed {
         entry: EntryRefDto,
@@ -136,6 +161,14 @@ pub enum FileOperationEventDto {
         total_items: u64,
         prompt: FileOperationPromptDto,
     },
+    AwaitingConflict {
+        operation_id: String,
+        sequence: u64,
+        action: FileOperationKindDto,
+        completed_items: u64,
+        total_items: u64,
+        prompt: FileOperationPromptDto,
+    },
     Completed {
         operation_id: String,
         sequence: u64,
@@ -163,6 +196,7 @@ pub enum FileOperationEventDto {
 
 struct PendingPrompt {
     id: String,
+    allowed_responses: Vec<FileOperationPromptResponseDto>,
     response: mpsc::Sender<FileOperationPromptResponseDto>,
 }
 
@@ -185,9 +219,10 @@ impl ActiveOperation {
         }
     }
 
-    fn begin_confirmation(
+    fn begin_prompt(
         &self,
         prompt_id: String,
+        allowed_responses: Vec<FileOperationPromptResponseDto>,
     ) -> Result<mpsc::Receiver<FileOperationPromptResponseDto>, ExplorerError> {
         let (sender, receiver) = mpsc::channel();
         {
@@ -200,13 +235,14 @@ impl ActiveOperation {
             }
             *prompt = Some(PendingPrompt {
                 id: prompt_id,
+                allowed_responses,
                 response: sender,
             });
         }
         Ok(receiver)
     }
 
-    fn await_confirmation(
+    fn await_prompt(
         &self,
         receiver: mpsc::Receiver<FileOperationPromptResponseDto>,
     ) -> Result<FileOperationPromptResponseDto, ExplorerError> {
@@ -242,6 +278,14 @@ impl ActiveOperation {
             .map_err(|_| ExplorerError::StateUnavailable)?;
         if pending.as_ref().map(|prompt| prompt.id.as_str()) != Some(prompt_id) {
             return Err(ExplorerError::InvalidReference);
+        }
+        if !pending
+            .as_ref()
+            .is_some_and(|prompt| prompt.allowed_responses.contains(&response))
+        {
+            return Err(ExplorerError::InvalidConfiguration(
+                "That response is not available for this filesystem decision.".to_owned(),
+            ));
         }
         let prompt = pending.take().ok_or(ExplorerError::InvalidReference)?;
         drop(pending);
@@ -292,6 +336,20 @@ impl OperationEventEmitter {
         let sequence = self.next_sequence();
         self.channel
             .send(FileOperationEventDto::AwaitingConfirmation {
+                operation_id: self.operation_id.clone(),
+                sequence,
+                action: self.action,
+                completed_items: 0,
+                total_items: 1,
+                prompt,
+            })
+            .map_err(|_| ExplorerError::ChannelClosed)
+    }
+
+    fn awaiting_conflict(&mut self, prompt: FileOperationPromptDto) -> Result<(), ExplorerError> {
+        let sequence = self.next_sequence();
+        self.channel
+            .send(FileOperationEventDto::AwaitingConflict {
                 operation_id: self.operation_id.clone(),
                 sequence,
                 action: self.action,
@@ -436,30 +494,95 @@ impl FileOperationCoordinator {
         active: &ActiveOperation,
         events: &mut OperationEventEmitter,
     ) -> Result<FileOperationOutcomeDto, ExplorerError> {
-        let _guard = self
-            .execution_guard
-            .lock()
-            .map_err(|_| ExplorerError::StateUnavailable)?;
         active.ensure_not_cancelled()?;
         events.running()?;
 
         let source = &request.sources[0];
         match &request.action {
-            FileOperationActionDto::Rename { new_name } => local
-                .rename_entry(source, new_name, &active.cancelled)
+            FileOperationActionDto::Rename { new_name } => self
+                .with_execution_guard(|| local.rename_entry(source, new_name, &active.cancelled))
                 .map(|entry| FileOperationOutcomeDto::Renamed {
                     entry: Box::new(entry),
                 }),
-            FileOperationActionDto::Trash {} => local
-                .trash_entry(source, &active.cancelled, self.platform_trash.as_ref())
+            FileOperationActionDto::Move { destination } => {
+                match self.with_execution_guard(|| {
+                    local.move_entry(
+                        source,
+                        destination,
+                        LocalMoveConflictPolicy::Fail,
+                        &active.cancelled,
+                    )
+                }) {
+                    Ok(moved) => Ok(moved_outcome(moved)),
+                    Err(ExplorerError::Conflict) => {
+                        let (target_name, destination_name) =
+                            local.describe_move_conflict(source, destination)?;
+                        let prompt_id = Uuid::new_v4().to_string();
+                        let decisions = vec![
+                            FileOperationPromptResponseDto::KeepBoth,
+                            FileOperationPromptResponseDto::Skip,
+                            FileOperationPromptResponseDto::Cancel,
+                        ];
+                        let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                        events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                            id: prompt_id,
+                            title: format!("“{target_name}” already exists"),
+                            message: format!(
+                                "Choose how to handle the existing item in “{destination_name}”. Nothing will be replaced."
+                            ),
+                            target_name: target_name.clone(),
+                            destination_name,
+                            decisions,
+                        })?;
+                        match active.await_prompt(response)? {
+                            FileOperationPromptResponseDto::KeepBoth => {
+                                events.running()?;
+                                active.ensure_not_cancelled()?;
+                                self.with_execution_guard(|| {
+                                    local.move_entry(
+                                        source,
+                                        destination,
+                                        LocalMoveConflictPolicy::KeepBoth,
+                                        &active.cancelled,
+                                    )
+                                })
+                                .map(moved_outcome)
+                            }
+                            FileOperationPromptResponseDto::Skip => {
+                                events.running()?;
+                                Ok(FileOperationOutcomeDto::MoveSkipped {
+                                    entry: source.clone(),
+                                    name: target_name,
+                                })
+                            }
+                            FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                            FileOperationPromptResponseDto::Confirm => {
+                                Err(ExplorerError::InvalidConfiguration(
+                                    "That response is not valid for a move conflict.".to_owned(),
+                                ))
+                            }
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            FileOperationActionDto::Trash {} => self
+                .with_execution_guard(|| {
+                    local.trash_entry(source, &active.cancelled, self.platform_trash.as_ref())
+                })
                 .map(trashed_outcome),
             FileOperationActionDto::DeletePermanently {} => {
                 let (target_name, location_name) = local.describe_operation_target(source)?;
                 let prompt_id = Uuid::new_v4().to_string();
-                let response = active.begin_confirmation(prompt_id.clone())?;
-                events.awaiting_confirmation(FileOperationPromptDto {
-                    id: prompt_id.clone(),
-                    kind: FileOperationPromptKindDto::PermanentDelete,
+                let response = active.begin_prompt(
+                    prompt_id.clone(),
+                    vec![
+                        FileOperationPromptResponseDto::Confirm,
+                        FileOperationPromptResponseDto::Cancel,
+                    ],
+                )?;
+                events.awaiting_confirmation(FileOperationPromptDto::PermanentDelete {
+                    id: prompt_id,
                     title: format!("Delete “{target_name}” permanently?"),
                     message:
                         "This item will be removed immediately and cannot be recovered from Trash."
@@ -468,16 +591,35 @@ impl FileOperationCoordinator {
                     location_name,
                     confirm_label: "Delete Permanently",
                 })?;
-                match active.await_confirmation(response)? {
+                match active.await_prompt(response)? {
                     FileOperationPromptResponseDto::Confirm => {}
                     FileOperationPromptResponseDto::Cancel => return Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::KeepBoth
+                    | FileOperationPromptResponseDto::Skip => {
+                        return Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for permanent deletion.".to_owned(),
+                        ));
+                    }
                 }
+                events.running()?;
                 active.ensure_not_cancelled()?;
-                local
-                    .permanently_delete_entry(source, &active.cancelled)
-                    .map(deleted_outcome)
+                self.with_execution_guard(|| {
+                    local.permanently_delete_entry(source, &active.cancelled)
+                })
+                .map(deleted_outcome)
             }
         }
+    }
+
+    fn with_execution_guard<T>(
+        &self,
+        execute: impl FnOnce() -> Result<T, ExplorerError>,
+    ) -> Result<T, ExplorerError> {
+        let _guard = self
+            .execution_guard
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        execute()
     }
 
     fn finish(&self, operation_id: &str) {
@@ -506,7 +648,27 @@ fn validate_request(request: &FileOperationRequestDto) -> Result<(), ExplorerErr
             "Remote filesystem actions are not available yet.".to_owned(),
         ));
     }
+    if let FileOperationActionDto::Move { destination } = &request.action {
+        if destination.id.is_empty()
+            || destination.id.len() > 256
+            || destination.location_id.is_empty()
+            || destination.location_id.len() > 256
+            || destination.name.len() > 1_024
+            || destination.display_path.len() > 4_096
+        {
+            return Err(ExplorerError::InvalidReference);
+        }
+    }
     Ok(())
+}
+
+fn moved_outcome(entry: MovedLocalEntry) -> FileOperationOutcomeDto {
+    FileOperationOutcomeDto::Moved {
+        entry: Box::new(entry.entry),
+        source_parent: entry.source_parent,
+        destination: entry.destination,
+        rebased_entry_ids: entry.rebased_entry_ids,
+    }
 }
 
 fn trashed_outcome(entry: RemovedLocalEntry) -> FileOperationOutcomeDto {
@@ -610,6 +772,51 @@ mod tests {
         })
     }
 
+    fn destination_fixture(temp: &TempDir, local: &LocalFilesystem, name: &str) -> DirectoryRefDto {
+        fs::create_dir(temp.path().join(name)).expect("destination fixture");
+        let root = local.locations().expect("locations")[0].root.clone();
+        let mut destination = None;
+        local
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        destination = entries
+                            .into_iter()
+                            .find(|entry| entry.name == name)
+                            .and_then(|entry| entry.directory);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+        destination.expect("destination directory")
+    }
+
+    fn listed_entry_ref(local: &LocalFilesystem, name: &str) -> EntryRefDto {
+        let root = local.locations().expect("locations")[0].root.clone();
+        let mut source = None;
+        local
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        source = entries
+                            .into_iter()
+                            .find(|entry| entry.name == name)
+                            .map(|entry| entry.reference);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+        source.expect("listed entry")
+    }
+
     async fn wait_for_event(events: &Arc<StdMutex<Vec<Value>>>, expected: &str) {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -647,6 +854,24 @@ mod tests {
         }))
         .expect("valid request");
         assert_eq!(delete.action, FileOperationActionDto::DeletePermanently {});
+        let move_request: FileOperationRequestDto = serde_json::from_value(json!({
+            "sources": [{ "id": "entry", "locationId": "home" }],
+            "action": {
+                "kind": "move",
+                "destination": {
+                    "id": "folder",
+                    "locationId": "home",
+                    "name": "Folder",
+                    "displayPath": "/untrusted/presentation",
+                    "capabilities": { "acceptMove": true, "atomicReplace": false }
+                }
+            }
+        }))
+        .expect("valid move request");
+        assert!(matches!(
+            move_request.action,
+            FileOperationActionDto::Move { .. }
+        ));
 
         assert!(serde_json::from_value::<FileOperationRequestDto>(json!({
             "sources": [{ "id": "entry", "locationId": "home" }],
@@ -745,6 +970,190 @@ mod tests {
             .expect("events")
             .iter()
             .any(|event| event["event"] == "awaitingConfirmation"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_moves_locally_with_a_typed_terminal_result() {
+        let (temp, local, source) = fixture();
+        let destination = destination_fixture(&temp, &local, "destination");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move {
+                        destination: destination.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start move");
+        wait_for_event(&events, "completed").await;
+
+        let events = events.lock().expect("events");
+        assert_eq!(events[2]["action"], "move");
+        assert_eq!(events[2]["outcome"]["kind"], "moved");
+        assert_eq!(events[2]["outcome"]["destination"]["id"], destination.id);
+        assert!(temp.path().join("destination/notes.md").is_file());
+        assert!(!temp.path().join("notes.md").exists());
+    }
+
+    #[tokio::test]
+    async fn move_conflict_allows_only_matching_keep_both_skip_or_cancel_responses() {
+        let (temp, local, source) = fixture();
+        let destination = destination_fixture(&temp, &local, "destination");
+        fs::write(temp.path().join("destination/notes.md"), b"existing").expect("conflict fixture");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move { destination },
+                },
+                channel(events.clone()),
+            )
+            .expect("start move");
+        wait_for_event(&events, "awaitingConflict").await;
+        let prompt_id = events.lock().expect("events")[2]["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        assert_eq!(
+            events.lock().expect("events")[2]["prompt"]["decisions"],
+            json!(["keepBoth", "skip", "cancel"])
+        );
+        assert!(matches!(
+            coordinator.respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::Confirm
+            ),
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+        coordinator
+            .respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::KeepBoth,
+            )
+            .expect("keep both response");
+        wait_for_event(&events, "completed").await;
+
+        let events = events.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence"].as_u64().expect("sequence"))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(events[4]["outcome"]["entry"]["name"], "notes copy.md");
+        assert_eq!(
+            fs::read(temp.path().join("destination/notes.md")).expect("existing target"),
+            b"existing"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("destination/notes copy.md")).expect("moved source"),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn skipping_a_move_conflict_preserves_the_source() {
+        let (temp, local, source) = fixture();
+        let destination = destination_fixture(&temp, &local, "destination");
+        fs::write(temp.path().join("destination/notes.md"), b"existing").expect("conflict fixture");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move { destination },
+                },
+                channel(events.clone()),
+            )
+            .expect("start move");
+        wait_for_event(&events, "awaitingConflict").await;
+        let prompt_id = events.lock().expect("events")[2]["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        coordinator
+            .respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::Skip,
+            )
+            .expect("skip response");
+        wait_for_event(&events, "completed").await;
+
+        assert!(temp.path().join("notes.md").is_file());
+        assert_eq!(
+            events
+                .lock()
+                .expect("events")
+                .last()
+                .expect("terminal event")["outcome"]["kind"],
+            "moveSkipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_prompt_does_not_block_an_unrelated_quick_operation() {
+        let (temp, local, source) = fixture();
+        let destination = destination_fixture(&temp, &local, "destination");
+        fs::write(temp.path().join("destination/notes.md"), b"existing").expect("conflict fixture");
+        fs::write(temp.path().join("other.txt"), b"other").expect("unrelated fixture");
+        let unrelated = listed_entry_ref(&local, "other.txt");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let move_events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let move_operation_id = coordinator
+            .start(
+                local.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move { destination },
+                },
+                channel(move_events.clone()),
+            )
+            .expect("start move");
+        wait_for_event(&move_events, "awaitingConflict").await;
+
+        let rename_events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![unrelated],
+                    action: FileOperationActionDto::Rename {
+                        new_name: "renamed-other.txt".to_owned(),
+                    },
+                },
+                channel(rename_events.clone()),
+            )
+            .expect("start unrelated rename");
+        wait_for_event(&rename_events, "completed").await;
+        assert!(temp.path().join("renamed-other.txt").is_file());
+
+        let prompt_id = move_events.lock().expect("events")[2]["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        coordinator
+            .respond(
+                &move_operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::Cancel,
+            )
+            .expect("cancel move prompt");
+        wait_for_event(&move_events, "cancelled").await;
     }
 
     #[tokio::test]

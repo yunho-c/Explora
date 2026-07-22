@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -13,13 +13,16 @@ use std::{
 use uuid::Uuid;
 
 use crate::filesystem::{
-    BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryCapabilitiesDto,
-    EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole, LocationSummaryDto,
-    LISTING_BATCH_SIZE,
+    BreadcrumbSegmentDto, DirectoryCapabilitiesDto, DirectoryListingEvent, DirectoryRefDto,
+    EntryCapabilitiesDto, EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole,
+    LocationSummaryDto, LISTING_BATCH_SIZE,
 };
+use crate::local_relocate::relocate_no_replace;
 use crate::platform_trash::PlatformTrash;
 
 const MAX_PERMANENT_DELETE_ENTRIES: usize = 1_000_000;
+const MAX_KEEP_BOTH_ATTEMPTS: u32 = 10_000;
+const MAX_LOCAL_NAME_UNITS: usize = 255;
 
 #[derive(Debug, Clone)]
 pub struct LocalRoot {
@@ -148,7 +151,7 @@ impl PathRegistry {
         location_id: &str,
         old_path: &Path,
         new_path: &Path,
-    ) -> Result<(), ExplorerError> {
+    ) -> Result<Vec<String>, ExplorerError> {
         let mut inner = self
             .inner
             .lock()
@@ -169,7 +172,7 @@ impl PathRegistry {
 
         let rebased_ids = rebased
             .iter()
-            .map(|(id, _, _)| id.as_str())
+            .map(|(id, _, _)| id.clone())
             .collect::<Vec<_>>();
         let stale_destination_ids = inner
             .ids_by_path
@@ -177,7 +180,7 @@ impl PathRegistry {
             .filter_map(|((registered_location, path), id)| {
                 (registered_location == location_id
                     && path.starts_with(new_path)
-                    && !rebased_ids.contains(&id.as_str()))
+                    && !rebased_ids.contains(id))
                 .then_some(id.clone())
             })
             .collect::<Vec<_>>();
@@ -200,7 +203,7 @@ impl PathRegistry {
                 .ids_by_path
                 .insert((location_id.to_owned(), new_registered_path), id);
         }
-        Ok(())
+        Ok(rebased_ids)
     }
 
     fn invalidate_subtree(
@@ -244,6 +247,20 @@ pub struct RemovedLocalEntry {
     pub reference: EntryRefDto,
     pub name: String,
     pub invalidated_entry_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalMoveConflictPolicy {
+    Fail,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MovedLocalEntry {
+    pub entry: FileEntrySummaryDto,
+    pub source_parent: DirectoryRefDto,
+    pub destination: DirectoryRefDto,
+    pub rebased_entry_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,15 +434,145 @@ impl LocalFilesystem {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 ensure_not_cancelled(cancelled)?;
-                fs::rename(&source_path, &destination_path)
-                    .map_err(|error| ExplorerError::io("rename", &source_path, error))?;
+                relocate_no_replace(&source_path, &destination_path).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        ExplorerError::Conflict
+                    } else {
+                        ExplorerError::io("rename", &source_path, error)
+                    }
+                })?;
             }
             Err(error) => return Err(ExplorerError::io("inspect", &destination_path, error)),
         }
 
-        self.registry
-            .rebase_subtree(&entry.location_id, &source_path, &destination_path)?;
+        if self
+            .registry
+            .rebase_subtree(&entry.location_id, &source_path, &destination_path)
+            .is_err()
+        {
+            // A successful filesystem mutation must never leave authoritative
+            // tokens pointing at their old paths.
+            let _ = self.registry.remove_location(&entry.location_id);
+            return Err(ExplorerError::StateUnavailable);
+        }
         self.describe_path(destination_path, &entry.location_id)
+    }
+
+    pub fn move_entry(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: LocalMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<MovedLocalEntry, ExplorerError> {
+        ensure_not_cancelled(cancelled)?;
+        let (source_path, _) = self.resolve_mutation_source(entry)?;
+        let destination_path = self.resolve_move_destination(entry, destination, &source_path)?;
+        let source_parent_path = source_path
+            .parent()
+            .ok_or(ExplorerError::InvalidReference)?
+            .to_path_buf();
+        let source_parent = directory_ref(
+            &self.registry,
+            &source_parent_path,
+            &entry.location_id,
+            None,
+        )?;
+
+        if source_parent_path == destination_path {
+            return Ok(MovedLocalEntry {
+                entry: self.describe_path(source_path, &entry.location_id)?,
+                source_parent,
+                destination: directory_ref(
+                    &self.registry,
+                    &destination_path,
+                    &entry.location_id,
+                    None,
+                )?,
+                rebased_entry_ids: vec![entry.id.clone()],
+            });
+        }
+
+        let original_name = source_path
+            .file_name()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let source_is_directory = fs::symlink_metadata(&source_path)
+            .map_err(|error| ExplorerError::io("inspect", &source_path, error))?
+            .file_type()
+            .is_dir();
+        let preferred_destination = destination_path.join(original_name);
+        ensure_not_cancelled(cancelled)?;
+        let final_destination = match fs::symlink_metadata(&preferred_destination) {
+            Ok(_) if conflict_policy == LocalMoveConflictPolicy::Fail => {
+                return Err(ExplorerError::Conflict)
+            }
+            Ok(_) => relocate_keep_both(
+                &source_path,
+                &destination_path,
+                original_name,
+                source_is_directory,
+                cancelled,
+            )?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match relocate_no_replace(&source_path, &preferred_destination) {
+                    Ok(()) => preferred_destination,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::AlreadyExists
+                            && conflict_policy == LocalMoveConflictPolicy::KeepBoth =>
+                    {
+                        relocate_keep_both(
+                            &source_path,
+                            &destination_path,
+                            original_name,
+                            source_is_directory,
+                            cancelled,
+                        )?
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(ExplorerError::Conflict)
+                    }
+                    Err(error) => {
+                        return Err(ExplorerError::io("move", &source_path, error));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(ExplorerError::io("inspect", &preferred_destination, error));
+            }
+        };
+
+        let rebased_entry_ids =
+            match self
+                .registry
+                .rebase_subtree(&entry.location_id, &source_path, &final_destination)
+            {
+                Ok(ids) => ids,
+                Err(_) => {
+                    let _ = self.registry.remove_location(&entry.location_id);
+                    return Err(ExplorerError::StateUnavailable);
+                }
+            };
+        Ok(MovedLocalEntry {
+            entry: self.describe_path(final_destination, &entry.location_id)?,
+            source_parent,
+            destination: directory_ref(
+                &self.registry,
+                &destination_path,
+                &entry.location_id,
+                None,
+            )?,
+            rebased_entry_ids,
+        })
+    }
+
+    pub fn describe_move_conflict(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+    ) -> Result<(String, String), ExplorerError> {
+        let (source_path, source_name) = self.resolve_mutation_source(entry)?;
+        let destination_path = self.resolve_move_destination(entry, destination, &source_path)?;
+        Ok((source_name, directory_name(&destination_path)))
     }
 
     pub fn trash_entry(
@@ -554,8 +701,8 @@ impl LocalFilesystem {
         )?;
 
         emit(DirectoryListingEvent::Started {
-            directory,
-            parent,
+            directory: Box::new(directory),
+            parent: parent.map(Box::new),
             breadcrumbs,
         })?;
 
@@ -636,6 +783,14 @@ impl LocalFilesystem {
             location_id: location_id.to_owned(),
             name: name.clone(),
             display_path: display_path(&path),
+            capabilities: if file_type.is_dir() {
+                DirectoryCapabilitiesDto::LOCAL
+            } else {
+                // Directory symlinks remain navigable, but are not accepted as
+                // mutation destinations because following them could escape the
+                // authorized location root.
+                DirectoryCapabilitiesDto::READ_ONLY
+            },
         });
         let kind = if file_type.is_dir() {
             "directory"
@@ -696,6 +851,73 @@ impl LocalFilesystem {
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or(ExplorerError::InvalidReference)?;
         Ok((source_path, name))
+    }
+
+    fn resolve_move_destination(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        source_path: &Path,
+    ) -> Result<PathBuf, ExplorerError> {
+        if destination.location_id != entry.location_id {
+            return Err(ExplorerError::Unsupported(
+                "Moving between locations requires a transfer, which is not available yet."
+                    .to_owned(),
+            ));
+        }
+        let location = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == destination.location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self
+            .registry
+            .resolve(&destination.location_id, &location.root.id)?;
+        let destination_path = self
+            .registry
+            .resolve_for_operation(&destination.location_id, &destination.id)?;
+        if !destination_path.starts_with(&root_path) {
+            return Err(ExplorerError::InvalidReference);
+        }
+
+        let destination_metadata = fs::symlink_metadata(&destination_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExplorerError::DestinationUnavailable(
+                    "The destination folder is no longer available.".to_owned(),
+                )
+            } else {
+                ExplorerError::io("inspect", &destination_path, error)
+            }
+        })?;
+        if !destination_metadata.file_type().is_dir() {
+            return Err(ExplorerError::DestinationUnavailable(
+                "Choose a folder that can accept moved items.".to_owned(),
+            ));
+        }
+        let source_metadata = fs::symlink_metadata(source_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ExplorerError::SourceChanged
+            } else {
+                ExplorerError::io("inspect", source_path, error)
+            }
+        })?;
+        if metadata_identity(&source_metadata).map(|identity| identity.volume)
+            != metadata_identity(&destination_metadata).map(|identity| identity.volume)
+        {
+            return Err(ExplorerError::Unsupported(
+                "Moving between filesystems requires a verified transfer, which is not available yet."
+                    .to_owned(),
+            ));
+        }
+        if source_metadata.file_type().is_dir() && destination_path.starts_with(source_path) {
+            return Err(ExplorerError::DestinationUnavailable(
+                "A folder cannot be moved into itself or one of its subfolders.".to_owned(),
+            ));
+        }
+        Ok(destination_path)
     }
 }
 
@@ -826,21 +1048,140 @@ fn same_entry(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     metadata_identity(left).is_some() && metadata_identity(left) == metadata_identity(right)
 }
 
+fn relocate_keep_both(
+    source: &Path,
+    destination_directory: &Path,
+    original_name: &OsStr,
+    is_directory: bool,
+    cancelled: &AtomicBool,
+) -> Result<PathBuf, ExplorerError> {
+    for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+        ensure_not_cancelled(cancelled)?;
+        let candidate =
+            destination_directory.join(keep_both_name(original_name, is_directory, attempt));
+        match relocate_no_replace(source, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ExplorerError::io("move", source, error)),
+        }
+    }
+    Err(ExplorerError::Conflict)
+}
+
+fn keep_both_name(original: &OsStr, is_directory: bool, attempt: u32) -> OsString {
+    let suffix = if attempt == 1 {
+        " copy".to_owned()
+    } else {
+        format!(" copy {attempt}")
+    };
+    let original_path = Path::new(original);
+    let stem = if is_directory {
+        original
+    } else {
+        original_path.file_stem().unwrap_or(original)
+    };
+    let extension = (!is_directory)
+        .then(|| original_path.extension())
+        .flatten()
+        .filter(|extension| !extension.is_empty());
+    let mut extension_segment = OsString::new();
+    if let Some(extension) = extension {
+        extension_segment.push(".");
+        extension_segment.push(extension);
+    }
+    if os_name_len(&extension_segment).saturating_add(suffix.len()) >= MAX_LOCAL_NAME_UNITS {
+        extension_segment.clear();
+    }
+    let stem_limit = MAX_LOCAL_NAME_UNITS
+        .saturating_sub(suffix.len())
+        .saturating_sub(os_name_len(&extension_segment));
+    let mut candidate = truncate_os_name(stem, stem_limit);
+    if candidate.is_empty() {
+        candidate.push("item");
+    }
+    candidate.push(suffix);
+    candidate.push(extension_segment);
+    candidate
+}
+
+#[cfg(unix)]
+fn os_name_len(value: &OsStr) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+
+    value.as_bytes().len()
+}
+
+#[cfg(windows)]
+fn os_name_len(value: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+
+    value.encode_wide().count()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn os_name_len(value: &OsStr) -> usize {
+    value.to_string_lossy().len()
+}
+
+#[cfg(unix)]
+fn truncate_os_name(value: &OsStr, max_len: usize) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bytes = value.as_bytes();
+    if bytes.len() <= max_len {
+        return value.to_owned();
+    }
+    if let Some(text) = value.to_str() {
+        let mut end = max_len.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        return OsString::from(&text[..end]);
+    }
+    OsString::from_vec(bytes[..max_len.min(bytes.len())].to_vec())
+}
+
+#[cfg(windows)]
+fn truncate_os_name(value: &OsStr, max_len: usize) -> OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    let mut units = value.encode_wide().take(max_len).collect::<Vec<_>>();
+    if units
+        .last()
+        .is_some_and(|unit| (0xD800..=0xDBFF).contains(unit))
+    {
+        units.pop();
+    }
+    OsString::from_wide(&units)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn truncate_os_name(value: &OsStr, max_len: usize) -> OsString {
+    value.to_string_lossy().chars().take(max_len).collect()
+}
+
 fn rename_case_only(source: &Path, destination: &Path) -> Result<(), ExplorerError> {
     let parent = source.parent().ok_or(ExplorerError::InvalidReference)?;
-    let intermediate = (0..16)
-        .map(|_| parent.join(format!(".explora-rename-{}", Uuid::new_v4())))
-        .find(|candidate| !candidate.exists())
-        .ok_or_else(|| {
-            ExplorerError::Unexpected(
-                "Explora could not reserve an intermediate rename path.".to_owned(),
-            )
-        })?;
+    let mut intermediate = None;
+    for _ in 0..16 {
+        let candidate = parent.join(format!(".explora-rename-{}", Uuid::new_v4()));
+        match relocate_no_replace(source, &candidate) {
+            Ok(()) => {
+                intermediate = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ExplorerError::io("rename", source, error)),
+        }
+    }
+    let intermediate = intermediate.ok_or_else(|| {
+        ExplorerError::Unexpected(
+            "Explora could not reserve an intermediate rename path.".to_owned(),
+        )
+    })?;
 
-    fs::rename(source, &intermediate)
-        .map_err(|error| ExplorerError::io("rename", source, error))?;
-    if let Err(error) = fs::rename(&intermediate, destination) {
-        if let Err(rollback_error) = fs::rename(&intermediate, source) {
+    if let Err(error) = relocate_no_replace(&intermediate, destination) {
+        if let Err(rollback_error) = relocate_no_replace(&intermediate, source) {
             return Err(ExplorerError::Unexpected(format!(
                 "The rename failed and Explora could not restore the original name: {rollback_error}"
             )));
@@ -871,6 +1212,7 @@ fn directory_ref(
             .map(str::to_owned)
             .unwrap_or_else(|| directory_name(path)),
         display_path: display_path(path),
+        capabilities: DirectoryCapabilitiesDto::LOCAL,
     })
 }
 
@@ -1029,7 +1371,7 @@ mod tests {
         assert_eq!(file.size.as_deref(), Some("5"));
         assert_eq!(file.content_kind, "document");
         assert!(file.capabilities.rename);
-        assert!(!file.capabilities.move_entry);
+        assert!(file.capabilities.move_entry);
         assert!(file.capabilities.trash);
         assert!(file.capabilities.delete_permanently);
         assert!(!file.reference.id.contains("notes.md"));
@@ -1160,6 +1502,203 @@ mod tests {
         ));
         assert!(temp.path().join("notes.md").exists());
         assert!(!temp.path().join("new.md").exists());
+    }
+
+    #[test]
+    fn moves_a_file_without_replacing_and_preserves_its_opaque_identity() {
+        let (temp, filesystem, root) = fixture();
+        let entries = listed_entries(&filesystem, &root);
+        let source = entries
+            .iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("source entry");
+        let destination = entries
+            .iter()
+            .find(|entry| entry.name == "folder")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("destination directory");
+
+        let moved = filesystem
+            .move_entry(
+                &source.reference,
+                destination,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+            )
+            .expect("move file");
+
+        assert_eq!(moved.entry.reference, source.reference);
+        assert_eq!(moved.source_parent.id, root.id);
+        assert_eq!(moved.destination.id, destination.id);
+        assert!(moved.rebased_entry_ids.contains(&source.reference.id));
+        assert!(!temp.path().join("notes.md").exists());
+        assert_eq!(
+            fs::read(temp.path().join("folder/notes.md")).expect("moved file"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn move_rebases_registered_directory_descendants() {
+        let (temp, filesystem, root) = fixture();
+        fs::create_dir(temp.path().join("destination")).expect("destination fixture");
+        fs::write(temp.path().join("folder/child.txt"), b"child").expect("child fixture");
+        let entries = listed_entries(&filesystem, &root);
+        let source = entries
+            .iter()
+            .find(|entry| entry.name == "folder")
+            .expect("source directory");
+        let child = listed_entries(
+            &filesystem,
+            source.directory.as_ref().expect("source directory ref"),
+        )
+        .into_iter()
+        .find(|entry| entry.name == "child.txt")
+        .expect("child entry");
+        let destination = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "destination")
+            .and_then(|entry| entry.directory)
+            .expect("destination directory");
+
+        let moved = filesystem
+            .move_entry(
+                &source.reference,
+                &destination,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+            )
+            .expect("move directory");
+
+        assert!(moved.rebased_entry_ids.contains(&source.reference.id));
+        assert!(moved.rebased_entry_ids.contains(&child.reference.id));
+        assert_eq!(
+            filesystem
+                .resolve_preview_path(&child.reference.id, &child.reference.location_id)
+                .expect("rebased child"),
+            temp.path().join("destination/folder/child.txt")
+        );
+    }
+
+    #[test]
+    fn move_conflicts_preserve_both_sources_until_keep_both_is_selected() {
+        let (temp, filesystem, root) = fixture();
+        fs::write(temp.path().join("folder/notes.md"), b"existing").expect("conflict fixture");
+        let entries = listed_entries(&filesystem, &root);
+        let source = entries
+            .iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("source entry");
+        let destination = entries
+            .iter()
+            .find(|entry| entry.name == "folder")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("destination directory");
+
+        assert!(matches!(
+            filesystem.move_entry(
+                &source.reference,
+                destination,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+            ),
+            Err(ExplorerError::Conflict)
+        ));
+        assert_eq!(fs::read(temp.path().join("notes.md")).unwrap(), b"hello");
+        assert_eq!(
+            fs::read(temp.path().join("folder/notes.md")).unwrap(),
+            b"existing"
+        );
+
+        let moved = filesystem
+            .move_entry(
+                &source.reference,
+                destination,
+                LocalMoveConflictPolicy::KeepBoth,
+                &AtomicBool::new(false),
+            )
+            .expect("keep both move");
+        assert_eq!(moved.entry.name, "notes copy.md");
+        assert_eq!(
+            fs::read(temp.path().join("folder/notes copy.md")).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            fs::read(temp.path().join("folder/notes.md")).unwrap(),
+            b"existing"
+        );
+    }
+
+    #[test]
+    fn move_rejects_a_directory_descendant_and_honors_early_cancellation() {
+        let (temp, filesystem, root) = fixture();
+        fs::create_dir(temp.path().join("folder/child")).expect("child directory fixture");
+        let folder = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "folder")
+            .expect("folder entry");
+        let child = listed_entries(
+            &filesystem,
+            folder.directory.as_ref().expect("folder directory"),
+        )
+        .into_iter()
+        .find(|entry| entry.name == "child")
+        .and_then(|entry| entry.directory)
+        .expect("child directory");
+
+        assert!(matches!(
+            filesystem.move_entry(
+                &folder.reference,
+                &child,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+            ),
+            Err(ExplorerError::DestinationUnavailable(_))
+        ));
+        let cancelled = AtomicBool::new(true);
+        assert!(matches!(
+            filesystem.move_entry(
+                &folder.reference,
+                &root,
+                LocalMoveConflictPolicy::Fail,
+                &cancelled,
+            ),
+            Err(ExplorerError::Cancelled)
+        ));
+        assert!(temp.path().join("folder/child").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_does_not_follow_a_directory_symlink_destination() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, filesystem, root) = fixture();
+        let external = temp.path().join("external");
+        fs::create_dir(&external).expect("external directory");
+        symlink(&external, temp.path().join("external-link")).expect("directory symlink");
+        let source = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("source entry");
+        let destination = listed_entries(&filesystem, &root)
+            .into_iter()
+            .find(|entry| entry.name == "external-link")
+            .and_then(|entry| entry.directory)
+            .expect("navigable symlink");
+
+        assert!(!destination.capabilities.accept_move);
+        assert!(matches!(
+            filesystem.move_entry(
+                &source.reference,
+                &destination,
+                LocalMoveConflictPolicy::Fail,
+                &AtomicBool::new(false),
+            ),
+            Err(ExplorerError::DestinationUnavailable(_))
+        ));
+        assert!(temp.path().join("notes.md").is_file());
+        assert!(!external.join("notes.md").exists());
     }
 
     #[test]

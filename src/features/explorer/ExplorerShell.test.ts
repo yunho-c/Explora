@@ -170,6 +170,57 @@ describe("ExplorerShell", () => {
     expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
   });
 
+  it("provides a keyboard-accessible destination chooser for local moves", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.contextMenu(row!);
+    await fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Move…" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Move “explora-notes.md”",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Workspace" }),
+    ).toBeDisabled();
+    expect(
+      within(dialog).getByRole("button", { name: "staging-box" }),
+    ).toBeDisabled();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    expect(
+      within(dialog).getByRole("button", { name: "Move Here" }),
+    ).toBeDisabled();
+
+    await fireEvent.click(
+      await within(dialog).findByRole("button", { name: "Projects" }),
+    );
+    await waitFor(() =>
+      expect(
+        within(dialog).getByText("Destination: Home/Projects"),
+      ).toBeInTheDocument(),
+    );
+    const moveHere = within(dialog).getByRole("button", {
+      name: "Move Here",
+    });
+    await waitFor(() => expect(moveHere).toBeEnabled());
+    await fireEvent.click(moveHere);
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument(),
+    );
+  });
+
   it("uses distinct semantic icons for default favorite folders", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

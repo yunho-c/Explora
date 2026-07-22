@@ -2,7 +2,9 @@ import type {
   ContentKind,
   DirectoryRef,
   FileEntrySummary,
+  FileMoveResult,
   FileOperationConfirmation,
+  FileOperationPrompt,
   FileOperationPromptResponse,
   FileRemovalResult,
   LocationSummary,
@@ -15,6 +17,7 @@ import { createDemoPdf } from "./demo-pdf";
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
+  FileOperationOptions,
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
@@ -22,66 +25,86 @@ import type {
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 
+const localDirectoryCapabilities = {
+  acceptMove: true,
+  atomicReplace: false,
+} as const;
+
+const readOnlyDirectoryCapabilities = {
+  acceptMove: false,
+  atomicReplace: false,
+} as const;
+
 const roots: Readonly<Record<string, DirectoryRef>> = {
   home: {
     id: "home",
     locationId: "home",
     name: "Home",
     displayPath: "Home",
+    capabilities: localDirectoryCapabilities,
   },
   desktop: {
     id: "desktop",
     locationId: "desktop",
     name: "Desktop",
     displayPath: "Home/Desktop",
+    capabilities: localDirectoryCapabilities,
   },
   documents: {
     id: "documents",
     locationId: "documents",
     name: "Documents",
     displayPath: "Home/Documents",
+    capabilities: localDirectoryCapabilities,
   },
   downloads: {
     id: "downloads",
     locationId: "downloads",
     name: "Downloads",
     displayPath: "Home/Downloads",
+    capabilities: localDirectoryCapabilities,
   },
   pictures: {
     id: "pictures",
     locationId: "pictures",
     name: "Pictures",
     displayPath: "Home/Pictures",
+    capabilities: localDirectoryCapabilities,
   },
   music: {
     id: "music",
     locationId: "music",
     name: "Music",
     displayPath: "Home/Music",
+    capabilities: localDirectoryCapabilities,
   },
   videos: {
     id: "videos",
     locationId: "videos",
     name: "Movies",
     displayPath: "Home/Movies",
+    capabilities: localDirectoryCapabilities,
   },
   workspace: {
     id: "workspace",
     locationId: "workspace",
     name: "Workspace",
     displayPath: "Workspace",
+    capabilities: localDirectoryCapabilities,
   },
   "staging-box": {
     id: "staging-box",
     locationId: "staging-box",
     name: "staging-box",
     displayPath: "staging-box:~/projects",
+    capabilities: readOnlyDirectoryCapabilities,
   },
   "render-node": {
     id: "render-node",
     locationId: "render-node",
     name: "render-node",
     displayPath: "render-node:~",
+    capabilities: readOnlyDirectoryCapabilities,
   },
 };
 
@@ -215,12 +238,15 @@ const makeEntry = (
             locationId,
             name,
             displayPath: `${roots[locationId].displayPath}/${name}`,
+            capabilities: mutable
+              ? localDirectoryCapabilities
+              : readOnlyDirectoryCapabilities,
           }
         : null,
     detail,
     capabilities: {
       rename: mutable,
-      move: false,
+      move: mutable,
       trash: mutable,
       deletePermanently: mutable,
     },
@@ -510,6 +536,7 @@ const wait = (duration: number, signal: AbortSignal) =>
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
   private readonly renamedEntries = new Map<string, FileEntrySummary>();
+  private readonly movedParentIds = new Map<string, string>();
   private readonly removedEntryIds = new Set<string>();
   private sshTargets: SshTargetSummary[] = [
     {
@@ -643,6 +670,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         locationId,
         name: target.name,
         displayPath: `${target.name}:~`,
+        capabilities: readOnlyDirectoryCapabilities,
       };
       location = {
         id: locationId,
@@ -695,14 +723,25 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     const isKnownChild = Object.values(entriesByLocation)
       .flat()
       .some((entry) => entry.directory?.id === directory.id);
-    const entries = (
-      rootEntries ??
-      (this.dynamicRoots.has(directory.locationId) || isKnownChild
-        ? []
-        : undefined)
-    )
-      ?.filter((entry) => !this.removedEntryIds.has(entry.reference.id))
-      .map((entry) => this.renamedEntries.get(entry.reference.id) ?? entry);
+    const knownDirectory =
+      rootEntries !== undefined ||
+      this.dynamicRoots.has(directory.locationId) ||
+      isKnownChild;
+    const entries = knownDirectory
+      ? Object.entries(entriesByLocation)
+          .flatMap(([parentId, entries]) =>
+            entries.map((entry) => ({ entry, parentId })),
+          )
+          .filter(
+            ({ entry, parentId }) =>
+              !this.removedEntryIds.has(entry.reference.id) &&
+              (this.movedParentIds.get(entry.reference.id) ?? parentId) ===
+                directory.id,
+          )
+          .map(
+            ({ entry }) => this.renamedEntries.get(entry.reference.id) ?? entry,
+          )
+      : undefined;
 
     if (!entries || !root) {
       throw new Error(`Unknown demo directory: ${directory.id}`);
@@ -787,6 +826,116 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     return renamed;
   }
 
+  async moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult> {
+    await wait(40, options.signal);
+    if (!entry.capabilities.move || !destination.capabilities.acceptMove) {
+      throw new Error("This item cannot be moved to that folder.");
+    }
+    if (entry.reference.locationId !== destination.locationId) {
+      throw new Error(
+        "Moving between locations requires a transfer, which is not available yet.",
+      );
+    }
+    if (
+      entry.directory &&
+      (entry.directory.id === destination.id ||
+        destination.displayPath.startsWith(`${entry.displayPath}/`))
+    ) {
+      throw new Error(
+        "A folder cannot be moved into itself or one of its subfolders.",
+      );
+    }
+
+    const sourceParentId =
+      this.movedParentIds.get(entry.reference.id) ??
+      Object.entries(entriesByLocation).find(([, entries]) =>
+        entries.some(
+          (candidate) => candidate.reference.id === entry.reference.id,
+        ),
+      )?.[0];
+    if (!sourceParentId) throw new Error("The source is no longer available.");
+    const sourceParent = this.findDemoDirectory(sourceParentId);
+    if (!sourceParent) throw new Error("The source folder is unavailable.");
+    if (sourceParent.id === destination.id) {
+      return {
+        kind: "moved",
+        entry,
+        sourceParent,
+        destination,
+        rebasedEntryIds: [entry.reference.id],
+      };
+    }
+
+    const destinationEntries = Object.entries(entriesByLocation)
+      .flatMap(([parentId, entries]) =>
+        entries.map((candidate) => ({ candidate, parentId })),
+      )
+      .filter(
+        ({ candidate, parentId }) =>
+          !this.removedEntryIds.has(candidate.reference.id) &&
+          (this.movedParentIds.get(candidate.reference.id) ?? parentId) ===
+            destination.id,
+      )
+      .map(
+        ({ candidate }) =>
+          this.renamedEntries.get(candidate.reference.id) ?? candidate,
+      );
+    let name = entry.name;
+    if (destinationEntries.some((candidate) => candidate.name === name)) {
+      const response = await this.awaitMoveConflict(
+        entry,
+        destination,
+        options,
+      );
+      if (response === "cancel") throw abortError();
+      if (response === "skip") {
+        return {
+          kind: "moveSkipped",
+          entry: entry.reference,
+          name: entry.name,
+        };
+      }
+      if (response !== "keepBoth") {
+        throw new Error("The move conflict response was not valid.");
+      }
+      let attempt = 1;
+      do {
+        const suffix = attempt === 1 ? " copy" : ` copy ${attempt}`;
+        const dot =
+          entry.kind === "directory" ? -1 : entry.name.lastIndexOf(".");
+        name =
+          dot > 0
+            ? `${entry.name.slice(0, dot)}${suffix}${entry.name.slice(dot)}`
+            : `${entry.name}${suffix}`;
+        attempt += 1;
+      } while (destinationEntries.some((candidate) => candidate.name === name));
+    }
+
+    await wait(40, options.signal);
+    const displayPath = `${destination.displayPath}/${name}`;
+    const moved: FileEntrySummary = {
+      ...entry,
+      name,
+      displayPath,
+      directory: entry.directory
+        ? { ...entry.directory, name, displayPath }
+        : null,
+    };
+    this.renamedEntries.set(entry.reference.id, moved);
+    this.movedParentIds.set(entry.reference.id, destination.id);
+    return {
+      kind: "moved",
+      entry: moved,
+      sourceParent,
+      destination,
+      rebasedEntryIds: [entry.reference.id],
+    };
+  }
+
   async trashEntry(
     entry: FileEntrySummary,
     { signal }: RemoveEntryOptions,
@@ -829,6 +978,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     for (const id of invalidatedEntryIds) {
       this.removedEntryIds.add(id);
       this.renamedEntries.delete(id);
+      this.movedParentIds.delete(id);
     }
     return {
       kind,
@@ -840,7 +990,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
 
   private awaitDeleteConfirmation(
     entry: FileEntrySummary,
-    { signal, onConfirmation }: RemoveEntryOptions,
+    { signal, onPrompt }: RemoveEntryOptions,
   ): Promise<FileOperationPromptResponse> {
     return new Promise((resolve, reject) => {
       if (signal.aborted) {
@@ -866,9 +1016,56 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
           "Local files",
         confirmLabel: "Delete Permanently",
       };
-      onConfirmation(confirmation, async (response) => {
+      onPrompt(confirmation, async (response) => {
         if (answered) {
           throw new Error("This filesystem confirmation was already answered.");
+        }
+        answered = true;
+        signal.removeEventListener("abort", abort);
+        resolve(response);
+      });
+    });
+  }
+
+  private findDemoDirectory(id: string): DirectoryRef | undefined {
+    return (
+      Object.values(roots).find((directory) => directory.id === id) ??
+      Object.values(entriesByLocation)
+        .flat()
+        .find((entry) => entry.directory?.id === id)?.directory ??
+      [...this.dynamicRoots.values()].find((directory) => directory.id === id)
+    );
+  }
+
+  private awaitMoveConflict(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    { signal, onPrompt }: FileOperationOptions,
+  ): Promise<FileOperationPromptResponse> {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      let answered = false;
+      const abort = () => {
+        if (answered) return;
+        answered = true;
+        reject(abortError());
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      const prompt: FileOperationPrompt = {
+        id: `demo-move-${entry.reference.id}`,
+        kind: "moveConflict",
+        title: `“${entry.name}” already exists`,
+        message: `Choose how to handle the existing item in “${destination.name}”. Nothing will be replaced.`,
+        targetName: entry.name,
+        destinationName: destination.name,
+        decisions: ["keepBoth", "skip", "cancel"],
+      };
+      onPrompt(prompt, async (response) => {
+        if (answered) {
+          throw new Error("This filesystem decision was already answered.");
         }
         answered = true;
         signal.removeEventListener("abort", abort);

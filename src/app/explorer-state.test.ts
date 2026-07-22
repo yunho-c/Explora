@@ -48,6 +48,7 @@ class StaleResultDataSource extends DemoExplorerDataSource {
         locationId: "home",
         name: "Home",
         displayPath: "Home",
+        capabilities: { acceptMove: true, atomicReplace: false },
       },
       breadcrumbs: [{ label: directory.name, directory }],
     });
@@ -231,8 +232,52 @@ describe("ExplorerState", () => {
     ).toBe(false);
     expect(state.selectedEntryId).not.toBe(entry!.reference.id);
     expect(state.previewOpen).toBe(false);
-    expect(state.fileOperations.pendingConfirmation).toBeNull();
+    expect(state.fileOperations.pendingPrompt).toBeNull();
     expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("moves a local entry through the destination chooser and refreshes both folders", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(entry).toBeDefined();
+    expect(projects?.directory).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    await state.openMoveSelected();
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Home");
+    expect(state.fileOperations.canConfirmMove).toBe(false);
+    await state.fileOperations.browseMoveDestination(projects!.directory!);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Projects");
+    expect(state.fileOperations.canConfirmMove).toBe(true);
+
+    await state.confirmMoveSelected();
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      false,
+    );
+    expect(state.selectedEntryId).not.toBe(entry!.reference.id);
+    expect(state.fileOperations.errorMessage).toBeNull();
+
+    await state.openDirectory(projects!.directory!);
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      true,
+    );
+  });
+
+  it("does not allow a directory to be chosen as its own move destination", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(projects?.directory).toBeDefined();
+    state.selectEntry(projects!.reference.id);
+
+    await state.openMoveSelected();
+    expect(
+      state.fileOperations.isCompatibleDestination(projects!.directory!),
+    ).toBe(false);
+    await state.fileOperations.browseMoveDestination(projects!.directory!);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Home");
+    expect(state.fileOperations.canConfirmMove).toBe(false);
+    state.fileOperations.closeMoveChooser();
   });
 
   it("cancels permanent deletion without changing the source", async () => {
@@ -243,14 +288,12 @@ describe("ExplorerState", () => {
 
     const deletion = state.deleteSelectedPermanently();
     await vi.waitFor(() =>
-      expect(
-        state.fileOperations.pendingConfirmation?.confirmation,
-      ).toMatchObject({
+      expect(state.fileOperations.pendingPrompt?.prompt).toMatchObject({
         targetName: "explora-notes.md",
         locationName: "Home",
       }),
     );
-    await state.fileOperations.answerConfirmation("cancel");
+    await state.fileOperations.answerPrompt("cancel");
     await deletion;
 
     expect(
@@ -258,7 +301,7 @@ describe("ExplorerState", () => {
         ({ reference }) => reference.id === entry!.reference.id,
       ),
     ).toBe(true);
-    expect(state.fileOperations.pendingConfirmation).toBeNull();
+    expect(state.fileOperations.pendingPrompt).toBeNull();
     expect(state.fileOperations.errorMessage).toBeNull();
   });
 
@@ -275,9 +318,9 @@ describe("ExplorerState", () => {
 
     const deletion = state.deleteSelectedPermanently();
     await vi.waitFor(() =>
-      expect(state.fileOperations.pendingConfirmation).not.toBeNull(),
+      expect(state.fileOperations.pendingPrompt).not.toBeNull(),
     );
-    await state.fileOperations.answerConfirmation("confirm");
+    await state.fileOperations.answerPrompt("confirm");
     await deletion;
 
     expect(state.entries.some(({ name }) => name === "Projects")).toBe(false);
@@ -520,6 +563,7 @@ describe("ExplorerState", () => {
       locationId: "home",
       name: "Missing",
       displayPath: "Home/Missing",
+      capabilities: { acceptMove: true, atomicReplace: false },
     });
 
     expect(state.activeDirectory?.name).toBe("Home");

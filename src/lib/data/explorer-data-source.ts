@@ -2,7 +2,8 @@ import type {
   BreadcrumbSegment,
   DirectoryRef,
   FileEntrySummary,
-  FileOperationConfirmation,
+  FileMoveResult,
+  FileOperationPrompt,
   FileOperationPromptResponse,
   FileRemovalResult,
   ImagePreviewMode,
@@ -60,13 +61,15 @@ export interface WatchVolumesOptions {
   onSnapshot: (snapshot: VolumeSnapshot) => void;
 }
 
-export interface RemoveEntryOptions {
+export interface FileOperationOptions {
   signal: AbortSignal;
-  onConfirmation: (
-    confirmation: FileOperationConfirmation,
+  onPrompt: (
+    prompt: FileOperationPrompt,
     respond: (response: FileOperationPromptResponse) => Promise<void>,
   ) => void;
 }
+
+export type RemoveEntryOptions = FileOperationOptions;
 
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
@@ -96,6 +99,11 @@ export interface ExplorerDataSource {
     newName: string,
     signal: AbortSignal,
   ): Promise<FileEntrySummary>;
+  moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult>;
   trashEntry(
     entry: FileEntrySummary,
     options: RemoveEntryOptions,

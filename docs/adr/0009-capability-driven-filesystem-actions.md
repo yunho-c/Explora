@@ -113,6 +113,37 @@ The adapter is covered through an injected fake in contract tests so automated
 tests do not pollute a developer's real Trash. Packaged native validation is
 required separately on macOS, Linux, and Windows.
 
+## Third vertical slice
+
+The third implementation enables single-entry moves within one local location:
+
+- Directory references advertise `acceptMove` and `atomicReplace` separately
+  from entry capabilities. The frontend uses them for presentation while Rust
+  resolves and revalidates every opaque reference.
+- Local relocation uses an exclusive, no-replace operating-system primitive:
+  `renameat2`/`renameatx_np` through `rustix` on Linux and macOS, and `MoveFileW`
+  on Windows. This closes the time-of-check/time-of-use overwrite race in both
+  move and the earlier rename implementation.
+- Move rejects roots, stale identities, cross-location references, unavailable
+  filesystems, symlink destinations, and a directory's own subtree. It never
+  follows a destination symlink or silently falls back to copy and delete.
+- Conflicts are Rust-authoritative and permit only Keep Both, Skip, or Cancel.
+  Keep Both chooses a bounded platform-safe name and repeats the exclusive
+  relocation, so a concurrent creator is preserved rather than overwritten.
+- Prompt waits do not hold the filesystem execution guard. The chosen operation
+  reacquires the guard and revalidates its references before mutation, allowing
+  unrelated operations to continue while a user decides.
+- Successful directory moves rebase registered descendants and return their
+  opaque IDs. The frontend refreshes affected source, destination, tabs, and
+  previews without round-tripping display paths.
+- The destination chooser navigates only typed directory references, disables
+  incompatible locations, and keeps the final command unavailable until the
+  destination capability and relationship checks pass.
+
+Cross-location and cross-volume moves remain Phase 6 transfer operations. They
+must allocate new identities, copy to an owned partial target, verify and
+finalize it, and only then remove the source.
+
 ## Security review
 
 - Mutation commands accept no local path, remote path, shell text, or generic
@@ -125,6 +156,8 @@ required separately on macOS, Linux, and Windows.
   rename. Missing and replaced sources are reported as changed rather than
   applying the user's intent to a different item.
 - Destination existence produces a conflict and never an implicit overwrite.
+  Exclusive relocation preserves that invariant even when another process
+  creates the destination after preflight validation.
 - The case-only intermediate path is random, owned by the operation, and restored
   to the original path if finalization fails.
 - Transfer and SFTP phases still require focused review of their platform
@@ -139,7 +172,7 @@ required separately on macOS, Linux, and Windows.
   to bypass Rust authorization or execution-time validation.
 - Registered tabs and histories can remain valid through same-backend directory
   relocation.
-- Remote and move actions remain visibly unavailable rather than silently
-  degrading.
+- Remote mutations and transfer-based moves remain visibly unavailable rather
+  than silently degrading.
 - Each subsequent phase must add backend contract coverage and native validation
   before enabling its capability.

@@ -38,6 +38,12 @@ export interface EntryRef {
 export interface DirectoryRef extends EntryRef {
   name: string;
   displayPath: string;
+  capabilities: DirectoryCapabilities;
+}
+
+export interface DirectoryCapabilities {
+  acceptMove: boolean;
+  atomicReplace: boolean;
 }
 
 export interface BreadcrumbSegment {
@@ -141,17 +147,50 @@ export interface FileEntrySummary {
   capabilities: EntryCapabilities;
 }
 
-export interface FileOperationConfirmation {
-  id: string;
-  kind: "permanentDelete";
-  title: string;
-  message: string;
-  targetName: string;
-  locationName: string;
-  confirmLabel: string;
-}
+export type FileOperationPrompt =
+  | {
+      id: string;
+      kind: "permanentDelete";
+      title: string;
+      message: string;
+      targetName: string;
+      locationName: string;
+      confirmLabel: string;
+    }
+  | {
+      id: string;
+      kind: "moveConflict";
+      title: string;
+      message: string;
+      targetName: string;
+      destinationName: string;
+      decisions: readonly Extract<
+        FileOperationPromptResponse,
+        "keepBoth" | "skip" | "cancel"
+      >[];
+    };
 
-export type FileOperationPromptResponse = "confirm" | "cancel";
+export type FileOperationConfirmation = Extract<
+  FileOperationPrompt,
+  { kind: "permanentDelete" }
+>;
+
+export type FileOperationPromptResponse =
+  "confirm" | "keepBoth" | "skip" | "cancel";
+
+export type FileMoveResult =
+  | {
+      kind: "moved";
+      entry: FileEntrySummary;
+      sourceParent: DirectoryRef;
+      destination: DirectoryRef;
+      rebasedEntryIds: readonly string[];
+    }
+  | {
+      kind: "moveSkipped";
+      entry: EntryRef;
+      name: string;
+    };
 
 export interface FileRemovalResult {
   kind: "trashed" | "deletedPermanently";

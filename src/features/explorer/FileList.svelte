@@ -140,6 +140,11 @@
       onclick={() => state.startRename()}>Rename</ContextMenu.Item
     >
     <ContextMenu.Item
+      disabled={!state.selectedEntry?.capabilities.move ||
+        state.fileOperations.activeEntryId !== null}
+      onclick={() => void state.openMoveSelected()}>Move…</ContextMenu.Item
+    >
+    <ContextMenu.Item
       disabled={!state.selectedEntry?.capabilities.trash ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => void state.moveSelectedToTrash()}

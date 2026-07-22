@@ -56,6 +56,29 @@ test("renames a selected local entry inline", async ({ page }) => {
   await expect(editor).toBeHidden();
 });
 
+test("moves a local entry with the destination chooser", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("explora-notes.md").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Move…" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("heading", { name: "Move “explora-notes.md”" }),
+  ).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await expect(
+    dialog.getByRole("button", { name: "Move Here" }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Projects" }).click();
+  await expect(dialog.getByText("Destination: Home/Projects")).toBeVisible();
+  await dialog.getByRole("button", { name: "Move Here" }).click();
+
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+  await page.getByText("Projects").dblclick();
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+});
+
 test("trashes locally and confirms permanent deletion with platform shortcuts", async ({
   page,
 }) => {

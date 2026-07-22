@@ -29,10 +29,10 @@ use zeroize::Zeroize;
 
 use crate::{
     filesystem::{
-        BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryCapabilitiesDto,
-        EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole, LocationSummaryDto,
-        CONNECTION_TIMEOUT, LISTING_BATCH_SIZE, PROMPT_TIMEOUT, SFTP_REQUEST_TIMEOUT_SECONDS,
-        SSH_KEEPALIVE_INTERVAL, SSH_KEEPALIVE_MAX,
+        BreadcrumbSegmentDto, DirectoryCapabilitiesDto, DirectoryListingEvent, DirectoryRefDto,
+        EntryCapabilitiesDto, EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole,
+        LocationSummaryDto, CONNECTION_TIMEOUT, LISTING_BATCH_SIZE, PROMPT_TIMEOUT,
+        SFTP_REQUEST_TIMEOUT_SECONDS, SSH_KEEPALIVE_INTERVAL, SSH_KEEPALIVE_MAX,
     },
     ssh_targets::{location_id, ResolvedSshTarget, SshTargetSummaryDto},
 };
@@ -363,6 +363,7 @@ impl SshSession {
             location_id: self.location_id.clone(),
             name: name.unwrap_or_else(|| remote_name(path)),
             display_path: format!("{}:{path}", self.target.name),
+            capabilities: DirectoryCapabilitiesDto::READ_ONLY,
         })
     }
 
@@ -383,8 +384,8 @@ impl SshSession {
             .transpose()?;
         let breadcrumbs = remote_breadcrumbs(self, &path)?;
         emit(DirectoryListingEvent::Started {
-            directory,
-            parent,
+            directory: Box::new(directory),
+            parent: parent.map(Box::new),
             breadcrumbs,
         })?;
 
@@ -668,6 +669,7 @@ impl SshConnectionManager {
             location_id: location_id.clone(),
             name: target.name.clone(),
             display_path: format!("{}:{initial_path}", target.name),
+            capabilities: DirectoryCapabilitiesDto::READ_ONLY,
         };
         let target_id = target.id.clone();
         let session = Arc::new(SshSession {

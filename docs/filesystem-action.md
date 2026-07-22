@@ -70,41 +70,42 @@ following are deferred:
 
 ## Current implementation
 
-Phases 1 and 2 are complete, and Phase 3 is implemented pending packaged
-cross-platform validation:
+Phases 1 through 4 are implemented for the local backend. Native Trash and move
+still require packaged validation on every supported platform:
 
 - Local and remote paths are represented by opaque, location-scoped tokens.
 - Directory listings already use typed incremental events and cancellation.
 - A Rust-owned operation coordinator emits queued, running, confirmation, and
   typed terminal events with monotonic sequences and single-item progress.
-- Local entries advertise rename, native trash, and permanent-delete
-  capabilities; SSH/SFTP remains read-only.
+- Local entries advertise rename, move, native trash, and permanent-delete
+  capabilities; directories separately advertise whether they accept moves.
+  SSH/SFTP remains read-only.
 - Rename preserves opaque identity and rebases registered descendants.
 - Successful trash and permanent deletion invalidate registered descendants;
   frontend selection, previews, tabs, and histories reconcile those references.
 - Native trash is implemented through a narrow, injectable platform adapter.
   Permanent deletion requires a single-use, Rust-authoritative confirmation.
+- Same-location local moves use an operating-system no-replace primitive, reject
+  symlink and descendant destinations, preserve registered identities, and offer
+  Keep Both, Skip, or Cancel when a destination exists.
+- The accessible destination chooser consumes opaque directory references and
+  capability data. Cross-location destinations remain visibly unavailable until
+  transfer-based moves are implemented.
 - The frontend validates IPC responses through a replaceable data-source
   boundary.
 - List and grid views expose capability-gated context and platform-keyboard
-  actions with an accessible blocking dialog only for permanent deletion.
+  actions with accessible blocking dialogs for permanent deletion and move
+  conflicts.
 - Disposable SSH/SFTP tests cover real authentication, trust, listing,
   cancellation, disconnect, and reconnect behavior.
 
-Packaged native trash must still be exercised on macOS, Linux, and Windows before
-Phase 3 is considered complete across all supported targets.
+Packaged native trash and same-filesystem move must still be exercised on macOS,
+Linux, and Windows before those phases are considered complete across all
+supported targets.
 
-The mutation work cannot be safely implemented as a few additional blocking
-commands. The current design lacks:
-
-- A filesystem capability model.
-- A shared mutation contract for local and SFTP backends.
-- Operation IDs, progress, conflicts, cancellation, and structured results.
-- Mutation-aware rebasing and invalidation in the path registries.
-- Native trash adapters.
-- Destination selection and conflict UI.
-- Error categories for conflicts, changed sources, partial completion, and
-  uncertain remote outcomes.
+The remaining work is the backend-neutral mutation contract for SFTP,
+transfer-based moves with verified finalization, multi-selection and collision
+planning, undo, and the corresponding cross-platform/native validation.
 
 ## Architecture
 
@@ -514,6 +515,11 @@ and native validation where applicable.
 - Implement atomic relocation, descendant checks, conflict prompts, and keep-both
   naming.
 - Refresh source and destination views and reconcile open tabs and previews.
+
+Implemented for single-entry moves within one local location. Moving between
+location roots, volumes, or backends is deliberately deferred to Phase 6 because
+those operations require a new destination identity and verified transfer rather
+than an in-place registry rebase.
 
 ### Phase 5: SFTP mutations
 
