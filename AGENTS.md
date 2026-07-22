@@ -64,12 +64,16 @@ cross-platform behavior.
 
 The initial stable release includes polished navigation, tabs, favorites, core
 file operations, search, previews, SSH/SFTP locations, transfer progress, and
-platform packaging.
+platform packaging. It may also discover and browse folders already managed by
+the operating system or an installed sync client, such as iCloud Drive,
+OneDrive, and Google Drive. Explora does not own synchronization for those
+locations.
 
 The following are out of scope unless a later decision explicitly adds them:
 
 - Tags, comments, saved smart folders, and Finder-class metadata workflows.
-- Cloud-provider-specific integrations or file synchronization.
+- Direct cloud-provider APIs, in-app cloud authentication, or application-owned
+  file synchronization.
 - A terminal emulator, remote shell, text editor, or general-purpose SSH client.
 - Third-party plugins or preview-provider APIs.
 - Archive creation/extraction beyond what is deliberately added and tested.

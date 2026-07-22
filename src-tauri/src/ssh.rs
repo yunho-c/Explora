@@ -344,12 +344,14 @@ impl SshSession {
         LocationSummaryDto {
             id: self.location_id.clone(),
             name: self.target.name.clone(),
+            backend: crate::filesystem::LocationBackend::Ssh,
             kind: "ssh",
             role: LocationRole::Ssh,
             status: "connected",
             display_path: self.root.display_path.clone(),
             detail: format!("SSH · {}", endpoint(&self.target)),
             root: self.root.clone(),
+            synced_folder: None,
         }
     }
 
@@ -436,6 +438,7 @@ impl SshSession {
                 modified_at: metadata.mtime.map(|seconds| u64::from(seconds) * 1000),
                 display_path: format!("{}:{entry_path}", self.target.name),
                 directory,
+                availability: "unknown",
                 detail: None,
             });
             if batch.len() == LISTING_BATCH_SIZE {
@@ -491,6 +494,18 @@ impl SshConnectionManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    pub fn contains_location(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions.values().any(|session| {
+                    session.location_id == location_id
+                        && session.lifecycle.load(Ordering::SeqCst) == SESSION_ACTIVE
+                })
+            })
+            .map_err(|_| ExplorerError::StateUnavailable)
     }
 
     pub fn apply_statuses(&self, targets: &mut [SshTargetSummaryDto]) {

@@ -10,7 +10,9 @@ use tempfile::NamedTempFile;
 
 use crate::filesystem::ExplorerError;
 
-const PREFERENCES_FILE_VERSION: u32 = 3;
+const PREFERENCES_FILE_VERSION: u32 = 4;
+const MAX_HIDDEN_SYNCED_FOLDERS: usize = 512;
+const MAX_SYNCED_FOLDER_ID_LENGTH: usize = 512;
 const MAX_HIDDEN_SSH_TARGETS: usize = 512;
 const MAX_SSH_TARGET_ID_LENGTH: usize = 512;
 
@@ -75,6 +77,7 @@ pub struct LayoutPreferencesDto {
     pub view_mode: ViewMode,
     pub sort: SortDescriptorDto,
     pub favorite_roles: Vec<FavoriteRole>,
+    pub hidden_synced_folder_ids: Vec<String>,
     pub hidden_ssh_target_ids: Vec<String>,
 }
 
@@ -85,6 +88,7 @@ impl Default for LayoutPreferencesDto {
             view_mode: ViewMode::default(),
             sort: SortDescriptorDto::default(),
             favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+            hidden_synced_folder_ids: Vec::new(),
             hidden_ssh_target_ids: Vec::new(),
         }
     }
@@ -103,6 +107,7 @@ pub struct LayoutPreferencesPatchDto {
     pub view_mode: Option<ViewMode>,
     pub sort: Option<SortDescriptorDto>,
     pub favorite_roles: Option<Vec<FavoriteRole>>,
+    pub hidden_synced_folder_ids: Option<Vec<String>>,
     pub hidden_ssh_target_ids: Option<Vec<String>>,
 }
 
@@ -162,6 +167,23 @@ struct LayoutPreferencesV2 {
     view_mode: ViewMode,
     sort: SortDescriptorDto,
     favorite_roles: Vec<FavoriteRole>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPreferencesDocumentV3 {
+    version: u32,
+    layout: LayoutPreferencesV3,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LayoutPreferencesV3 {
+    sidebar_collapsed: bool,
+    view_mode: ViewMode,
+    sort: SortDescriptorDto,
+    favorite_roles: Vec<FavoriteRole>,
+    hidden_ssh_target_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +250,10 @@ impl PreferencesStore {
             updated.layout.hidden_ssh_target_ids =
                 canonical_hidden_ssh_target_ids(&hidden_ssh_target_ids)?;
         }
+        if let Some(hidden_synced_folder_ids) = patch.layout.hidden_synced_folder_ids {
+            updated.layout.hidden_synced_folder_ids =
+                canonical_hidden_synced_folder_ids(&hidden_synced_folder_ids)?;
+        }
 
         persist_preferences(&self.storage_path, &updated)?;
         state.preferences = updated.clone();
@@ -268,6 +294,7 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
                         view_mode: document.layout.view_mode,
                         sort: document.layout.sort,
                         favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
+                        hidden_synced_folder_ids: Vec::new(),
                         hidden_ssh_target_ids: Vec::new(),
                     },
                 },
@@ -285,6 +312,7 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
                         favorite_roles: canonical_favorite_roles(
                             &document.layout.favorite_roles,
                         ),
+                        hidden_synced_folder_ids: Vec::new(),
                         hidden_ssh_target_ids: Vec::new(),
                     },
                 },
@@ -292,24 +320,51 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
             ),
             _ => malformed_recovery(),
         },
+        3 => match serde_json::from_slice::<StoredPreferencesDocumentV3>(&bytes) {
+            Ok(document) if document.version == 3 => {
+                match canonical_hidden_ssh_target_ids(&document.layout.hidden_ssh_target_ids) {
+                    Ok(hidden_ssh_target_ids) => (
+                        UserPreferencesDto {
+                            layout: LayoutPreferencesDto {
+                                sidebar_collapsed: document.layout.sidebar_collapsed,
+                                view_mode: document.layout.view_mode,
+                                sort: document.layout.sort,
+                                favorite_roles: canonical_favorite_roles(
+                                    &document.layout.favorite_roles,
+                                ),
+                                hidden_synced_folder_ids: Vec::new(),
+                                hidden_ssh_target_ids,
+                            },
+                        },
+                        None,
+                    ),
+                    Err(_) => malformed_recovery(),
+                }
+            }
+            _ => malformed_recovery(),
+        },
         PREFERENCES_FILE_VERSION => {
             match serde_json::from_slice::<StoredPreferencesDocument>(&bytes) {
-                Ok(document) => match canonical_hidden_ssh_target_ids(
-                    &document.layout.hidden_ssh_target_ids,
+                Ok(document) => match (
+                    canonical_hidden_synced_folder_ids(
+                        &document.layout.hidden_synced_folder_ids,
+                    ),
+                    canonical_hidden_ssh_target_ids(&document.layout.hidden_ssh_target_ids),
                 ) {
-                    Ok(hidden_ssh_target_ids) => (
+                    (Ok(hidden_synced_folder_ids), Ok(hidden_ssh_target_ids)) => (
                         UserPreferencesDto {
                             layout: LayoutPreferencesDto {
                                 favorite_roles: canonical_favorite_roles(
                                     &document.layout.favorite_roles,
                                 ),
+                                hidden_synced_folder_ids,
                                 hidden_ssh_target_ids,
                                 ..document.layout
                             },
                         },
                         None,
                     ),
-                    Err(_) => malformed_recovery(),
+                    (Err(_), _) | (_, Err(_)) => malformed_recovery(),
                 },
                 Err(_) => malformed_recovery(),
             }
@@ -346,6 +401,26 @@ fn canonical_hidden_ssh_target_ids(ids: &[String]) -> Result<Vec<String>, Explor
     {
         return Err(ExplorerError::InvalidConfiguration(
             "The hidden SSH target selection is invalid.".to_owned(),
+        ));
+    }
+
+    let mut canonical = ids.to_vec();
+    canonical.sort();
+    canonical.dedup();
+    Ok(canonical)
+}
+
+fn canonical_hidden_synced_folder_ids(ids: &[String]) -> Result<Vec<String>, ExplorerError> {
+    if ids.len() > MAX_HIDDEN_SYNCED_FOLDERS
+        || ids.iter().any(|id| {
+            id.len() <= "synced:".len()
+                || id.len() > MAX_SYNCED_FOLDER_ID_LENGTH
+                || id.chars().any(char::is_control)
+                || !id.starts_with("synced:")
+        })
+    {
+        return Err(ExplorerError::InvalidConfiguration(
+            "The hidden synced-folder selection is invalid.".to_owned(),
         ));
     }
 
@@ -420,6 +495,7 @@ mod tests {
                 view_mode,
                 sort,
                 favorite_roles: None,
+                hidden_synced_folder_ids: None,
                 hidden_ssh_target_ids: None,
             },
         }
@@ -432,6 +508,7 @@ mod tests {
                 view_mode: None,
                 sort: None,
                 favorite_roles: Some(favorite_roles),
+                hidden_synced_folder_ids: None,
                 hidden_ssh_target_ids: None,
             },
         }
@@ -444,12 +521,31 @@ mod tests {
                 view_mode: None,
                 sort: None,
                 favorite_roles: None,
+                hidden_synced_folder_ids: None,
                 hidden_ssh_target_ids: Some(
                     hidden_ssh_target_ids
                         .into_iter()
                         .map(str::to_owned)
                         .collect(),
                 ),
+            },
+        }
+    }
+
+    fn hidden_synced_folder_patch(hidden_synced_folder_ids: Vec<&str>) -> UserPreferencesPatchDto {
+        UserPreferencesPatchDto {
+            layout: LayoutPreferencesPatchDto {
+                sidebar_collapsed: None,
+                view_mode: None,
+                sort: None,
+                favorite_roles: None,
+                hidden_synced_folder_ids: Some(
+                    hidden_synced_folder_ids
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                ),
+                hidden_ssh_target_ids: None,
             },
         }
     }
@@ -498,6 +594,11 @@ mod tests {
             reloaded.preferences.layout.favorite_roles,
             DEFAULT_FAVORITE_ROLES
         );
+        assert!(reloaded
+            .preferences
+            .layout
+            .hidden_synced_folder_ids
+            .is_empty());
         assert!(reloaded.preferences.layout.hidden_ssh_target_ids.is_empty());
     }
 
@@ -521,6 +622,11 @@ mod tests {
             snapshot.preferences.layout.favorite_roles,
             DEFAULT_FAVORITE_ROLES
         );
+        assert!(snapshot
+            .preferences
+            .layout
+            .hidden_synced_folder_ids
+            .is_empty());
         assert!(snapshot.preferences.layout.hidden_ssh_target_ids.is_empty());
         assert_eq!(snapshot.warning, None);
     }
@@ -543,6 +649,36 @@ mod tests {
             vec![FavoriteRole::Home, FavoriteRole::Documents]
         );
         assert!(snapshot.preferences.layout.hidden_ssh_target_ids.is_empty());
+        assert!(snapshot
+            .preferences
+            .layout
+            .hidden_synced_folder_ids
+            .is_empty());
+        assert_eq!(snapshot.warning, None);
+    }
+
+    #[test]
+    fn migrates_version_three_with_no_hidden_synced_folders() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        fs::write(
+            &path,
+            br#"{"version":3,"layout":{"sidebarCollapsed":false,"viewMode":"list","sort":{"column":"name","direction":"ascending"},"favoriteRoles":["home","documents"],"hiddenSshTargetIds":["config:staging"]}}"#,
+        )
+        .expect("version three preferences");
+
+        let snapshot = PreferencesStore::new(path)
+            .snapshot()
+            .expect("migrated preferences");
+        assert!(snapshot
+            .preferences
+            .layout
+            .hidden_synced_folder_ids
+            .is_empty());
+        assert_eq!(
+            snapshot.preferences.layout.hidden_ssh_target_ids,
+            vec!["config:staging"]
+        );
         assert_eq!(snapshot.warning, None);
     }
 
@@ -609,6 +745,49 @@ mod tests {
             .preferences
             .layout
             .hidden_ssh_target_ids
+            .is_empty());
+    }
+
+    #[test]
+    fn hidden_synced_folders_are_deduplicated_and_sorted() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        let store = PreferencesStore::new(path.clone());
+
+        store
+            .update(hidden_synced_folder_patch(vec![
+                "synced:provider-b",
+                "synced:provider-a",
+                "synced:provider-b",
+            ]))
+            .expect("hidden synced-folder update");
+
+        let reloaded = PreferencesStore::new(path)
+            .snapshot()
+            .expect("reloaded hidden synced folders");
+        assert_eq!(
+            reloaded.preferences.layout.hidden_synced_folder_ids,
+            vec!["synced:provider-a", "synced:provider-b"]
+        );
+    }
+
+    #[test]
+    fn hidden_synced_folders_reject_untrusted_identifiers() {
+        let temp = TempDir::new().expect("temporary directory");
+        let store = PreferencesStore::new(temp.path().join("preferences.json"));
+
+        let result = store.update(hidden_synced_folder_patch(vec!["volume:external"]));
+
+        assert!(matches!(
+            result,
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+        assert!(store
+            .snapshot()
+            .expect("unchanged preferences")
+            .preferences
+            .layout
+            .hidden_synced_folder_ids
             .is_empty());
     }
 

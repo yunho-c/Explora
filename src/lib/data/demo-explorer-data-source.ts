@@ -1,4 +1,5 @@
 import type {
+  ContentAvailability,
   ContentKind,
   DirectoryRef,
   FileEntrySummary,
@@ -6,6 +7,7 @@ import type {
   ManualSshTargetInput,
   PreviewContent,
   SshTargetSummary,
+  SyncedFolderSnapshot,
 } from "$lib/contracts/explorer";
 
 import { createDemoPdf } from "./demo-pdf";
@@ -15,6 +17,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 
@@ -67,6 +70,24 @@ const roots: Readonly<Record<string, DirectoryRef>> = {
     name: "Workspace",
     displayPath: "Workspace",
   },
+  "synced:icloud": {
+    id: "synced:icloud",
+    locationId: "synced:icloud",
+    name: "iCloud Drive",
+    displayPath: "iCloud Drive",
+  },
+  "synced:onedrive": {
+    id: "synced:onedrive",
+    locationId: "synced:onedrive",
+    name: "OneDrive",
+    displayPath: "OneDrive",
+  },
+  "synced:google-drive": {
+    id: "synced:google-drive",
+    locationId: "synced:google-drive",
+    name: "Google Drive",
+    displayPath: "Google Drive",
+  },
   "staging-box": {
     id: "staging-box",
     locationId: "staging-box",
@@ -85,102 +106,158 @@ const locations: readonly LocationSummary[] = [
   {
     id: "home",
     name: "Home",
+    backend: "local",
     kind: "local",
     role: "home",
     status: "available",
     displayPath: "Home",
     detail: "Local",
     root: roots.home,
+    syncedFolder: null,
   },
   {
     id: "desktop",
     name: "Desktop",
+    backend: "local",
     kind: "local",
     role: "desktop",
     status: "available",
     displayPath: "Home/Desktop",
     detail: "Local",
     root: roots.desktop,
+    syncedFolder: null,
   },
   {
     id: "documents",
     name: "Documents",
+    backend: "local",
     kind: "local",
     role: "documents",
     status: "available",
     displayPath: "Home/Documents",
     detail: "Local",
     root: roots.documents,
+    syncedFolder: null,
   },
   {
     id: "downloads",
     name: "Downloads",
+    backend: "local",
     kind: "local",
     role: "downloads",
     status: "available",
     displayPath: "Home/Downloads",
     detail: "Local",
     root: roots.downloads,
+    syncedFolder: null,
   },
   {
     id: "pictures",
     name: "Pictures",
+    backend: "local",
     kind: "local",
     role: "pictures",
     status: "available",
     displayPath: "Home/Pictures",
     detail: "Local",
     root: roots.pictures,
+    syncedFolder: null,
   },
   {
     id: "music",
     name: "Music",
+    backend: "local",
     kind: "local",
     role: "music",
     status: "available",
     displayPath: "Home/Music",
     detail: "Local",
     root: roots.music,
+    syncedFolder: null,
   },
   {
     id: "videos",
     name: "Movies",
+    backend: "local",
     kind: "local",
     role: "videos",
     status: "available",
     displayPath: "Home/Movies",
     detail: "Local",
     root: roots.videos,
+    syncedFolder: null,
   },
   {
     id: "workspace",
     name: "Workspace",
+    backend: "local",
     kind: "volume",
     role: "volume",
     status: "available",
     displayPath: "Workspace",
     detail: "1.2 TB available",
     root: roots.workspace,
+    syncedFolder: null,
+  },
+  {
+    id: "synced:icloud",
+    name: "iCloud Drive",
+    backend: "local",
+    kind: "syncedFolder",
+    role: "syncedFolder",
+    status: "available",
+    displayPath: "iCloud Drive",
+    detail: "iCloud Drive · Synced folder",
+    root: roots["synced:icloud"],
+    syncedFolder: { provider: "iCloud", status: "available" },
+  },
+  {
+    id: "synced:onedrive",
+    name: "OneDrive",
+    backend: "local",
+    kind: "syncedFolder",
+    role: "syncedFolder",
+    status: "available",
+    displayPath: "OneDrive",
+    detail: "OneDrive · Synced folder",
+    root: roots["synced:onedrive"],
+    syncedFolder: { provider: "oneDrive", status: "available" },
+  },
+  {
+    id: "synced:google-drive",
+    name: "Google Drive",
+    backend: "local",
+    kind: "syncedFolder",
+    role: "syncedFolder",
+    status: "available",
+    displayPath: "Google Drive",
+    detail: "Google Drive · Synced folder",
+    root: roots["synced:google-drive"],
+    syncedFolder: { provider: "googleDrive", status: "available" },
   },
   {
     id: "staging-box",
     name: "staging-box",
+    backend: "ssh",
     kind: "ssh",
     role: "ssh",
     status: "connected",
     displayPath: "staging-box:~/projects",
     detail: "SSH · Connected",
     root: roots["staging-box"],
+    syncedFolder: null,
   },
   {
     id: "render-node",
     name: "render-node",
+    backend: "ssh",
     kind: "ssh",
     role: "ssh",
     status: "offline",
     displayPath: "render-node:~",
     detail: "SSH · Offline",
     root: roots["render-node"],
+    syncedFolder: null,
   },
 ];
 
@@ -192,6 +269,7 @@ const makeEntry = (
   size: number | null,
   modifiedAt: string,
   detail?: string,
+  availability: ContentAvailability = "local",
 ): FileEntrySummary => ({
   reference: { id: `${locationId}:${name}`, locationId },
   name,
@@ -209,6 +287,7 @@ const makeEntry = (
           displayPath: `${roots[locationId].displayPath}/${name}`,
         }
       : null,
+  availability,
   detail,
 });
 
@@ -402,6 +481,77 @@ const entriesByLocation: Readonly<Record<string, readonly FileEntrySummary[]>> =
         "2026-07-18T02:00:00Z",
       ),
     ],
+    "synced:icloud": [
+      makeEntry(
+        "synced:icloud",
+        "Desktop",
+        "directory",
+        "folder",
+        null,
+        "2026-07-21T20:12:00Z",
+        "Synced · 18 items",
+      ),
+      makeEntry(
+        "synced:icloud",
+        "Trip notes.md",
+        "file",
+        "document",
+        12_430,
+        "2026-07-21T18:44:00Z",
+        "Available offline",
+      ),
+      makeEntry(
+        "synced:icloud",
+        "Reference library.pdf",
+        "file",
+        "document",
+        8_420_112,
+        "2026-07-20T09:30:00Z",
+        "Online only",
+        "onlineOnly",
+      ),
+    ],
+    "synced:onedrive": [
+      makeEntry(
+        "synced:onedrive",
+        "Shared",
+        "directory",
+        "folder",
+        null,
+        "2026-07-21T17:30:00Z",
+        "Synced · 24 items",
+      ),
+      makeEntry(
+        "synced:onedrive",
+        "Quarterly plan.docx",
+        "file",
+        "document",
+        244_032,
+        "2026-07-21T16:52:00Z",
+        "Online only",
+        "onlineOnly",
+      ),
+    ],
+    "synced:google-drive": [
+      makeEntry(
+        "synced:google-drive",
+        "My Drive",
+        "directory",
+        "folder",
+        null,
+        "2026-07-21T22:10:00Z",
+        "Synced · 31 items",
+      ),
+      makeEntry(
+        "synced:google-drive",
+        "Project handoff.pdf",
+        "file",
+        "document",
+        1_284_992,
+        "2026-07-21T21:15:00Z",
+        "Available offline",
+      ),
+    ],
     "staging-box": [
       makeEntry(
         "staging-box",
@@ -551,6 +701,22 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     });
   }
 
+  async watchSyncedFolders({
+    signal,
+    onSnapshot,
+  }: WatchSyncedFoldersOptions): Promise<void> {
+    if (signal.aborted) throw abortError();
+    const snapshot: SyncedFolderSnapshot = {
+      revision: 1,
+      folders: locations.filter(({ kind }) => kind === "syncedFolder"),
+      warning: null,
+    };
+    onSnapshot(snapshot);
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
   async listSshTargets(
     signal: AbortSignal,
   ): Promise<readonly SshTargetSummary[]> {
@@ -630,12 +796,14 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       location = {
         id: locationId,
         name: target.name,
+        backend: "ssh",
         kind: "ssh",
         role: "ssh",
         status: "connected",
         displayPath: root.displayPath,
         detail: target.endpoint,
         root,
+        syncedFolder: null,
       };
       this.dynamicRoots.set(locationId, root);
       this.dynamicLocations.set(locationId, location);
@@ -722,7 +890,13 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       ({ id }) => id === entry.reference.locationId,
     );
     let content: PreviewContent;
-    if (location?.kind === "ssh") {
+    if (entry.availability !== "local") {
+      content = {
+        type: "metadata",
+        reason: "downloadRequired",
+        message: "Download this file before opening Quick Preview.",
+      };
+    } else if (location?.backend === "ssh") {
       content = {
         type: "metadata",
         reason: "remote",

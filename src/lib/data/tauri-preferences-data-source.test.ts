@@ -9,6 +9,7 @@ const preferencesPayload = {
     viewMode: "grid",
     sort: { column: "size", direction: "descending" },
     favoriteRoles: ["home", "documents", "music"],
+    hiddenSyncedFolderIds: ["synced:icloud"],
     hiddenSshTargetIds: ["config:archived", "manual:target-1"],
   },
 };
@@ -95,6 +96,23 @@ describe("TauriPreferencesDataSource", () => {
     await expect(
       new TauriPreferencesDataSource().getPreferences(),
     ).rejects.toThrow("hidden SSH target IDs are malformed");
+  });
+
+  it("rejects malformed hidden synced-folder IDs", async () => {
+    mockIPC(() => ({
+      preferences: {
+        ...preferencesPayload,
+        layout: {
+          ...preferencesPayload.layout,
+          hiddenSyncedFolderIds: ["volume:external"],
+        },
+      },
+      warning: null,
+    }));
+
+    await expect(
+      new TauriPreferencesDataSource().getPreferences(),
+    ).rejects.toThrow("hidden synced-folder IDs are malformed");
   });
 
   it("rejects malformed recovery warnings", async () => {

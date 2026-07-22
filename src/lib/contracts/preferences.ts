@@ -29,6 +29,7 @@ export interface LayoutPreferences {
   viewMode: ViewMode;
   sort: SortDescriptor;
   favoriteRoles: FavoriteRole[];
+  hiddenSyncedFolderIds: string[];
   hiddenSshTargetIds: string[];
 }
 
@@ -41,6 +42,7 @@ export interface LayoutPreferencesPatch {
   viewMode?: ViewMode;
   sort?: SortDescriptor;
   favoriteRoles?: FavoriteRole[];
+  hiddenSyncedFolderIds?: string[];
   hiddenSshTargetIds?: string[];
 }
 
@@ -67,6 +69,7 @@ export const defaultUserPreferences = (): UserPreferences => ({
     viewMode: "list",
     sort: { column: "name", direction: "ascending" },
     favoriteRoles: [...DEFAULT_FAVORITE_ROLES],
+    hiddenSyncedFolderIds: [],
     hiddenSshTargetIds: [],
   },
 });

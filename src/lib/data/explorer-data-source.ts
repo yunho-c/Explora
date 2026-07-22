@@ -9,6 +9,7 @@ import type {
   SshConnectionEvent,
   SshPromptResponse,
   SshTargetSummary,
+  SyncedFolderSnapshot,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
 
@@ -57,9 +58,15 @@ export interface WatchVolumesOptions {
   onSnapshot: (snapshot: VolumeSnapshot) => void;
 }
 
+export interface WatchSyncedFoldersOptions {
+  signal: AbortSignal;
+  onSnapshot: (snapshot: SyncedFolderSnapshot) => void;
+}
+
 export interface ExplorerDataSource {
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   watchVolumes(options: WatchVolumesOptions): Promise<void>;
+  watchSyncedFolders(options: WatchSyncedFoldersOptions): Promise<void>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
   createSshTarget(
     input: ManualSshTargetInput,

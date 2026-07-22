@@ -15,12 +15,14 @@ const root: DirectoryRef = {
 const locationPayload = {
   id: "home",
   name: "Home",
+  backend: "local",
   kind: "local",
   role: "home",
   status: "available",
   displayPath: "/Users/test",
   detail: "Local",
   root,
+  syncedFolder: null,
 };
 
 const entryPayload = {
@@ -32,6 +34,7 @@ const entryPayload = {
   modifiedAt: 1_721_324_000_000,
   displayPath: "/Users/test/notes.md",
   directory: null,
+  availability: "local",
   detail: null,
 };
 
@@ -44,6 +47,7 @@ const previewEntry: FileEntrySummary = {
   modifiedAt: entryPayload.modifiedAt,
   displayPath: entryPayload.displayPath,
   directory: null,
+  availability: "local",
 };
 
 const sshTargetPayload = {
@@ -80,6 +84,23 @@ const volumePayload = {
     name: "Test Volume",
     displayPath: "/Volumes/Test Volume",
   },
+};
+
+const syncedFolderPayload = {
+  ...locationPayload,
+  id: "synced:icloud",
+  name: "iCloud Drive",
+  kind: "syncedFolder",
+  role: "syncedFolder",
+  displayPath: "/Users/test/Library/Mobile Documents/com~apple~CloudDocs",
+  detail: "iCloud Drive · Synced folder",
+  root: {
+    id: "synced-root-token",
+    locationId: "synced:icloud",
+    name: "iCloud Drive",
+    displayPath: "/Users/test/Library/Mobile Documents/com~apple~CloudDocs",
+  },
+  syncedFolder: { provider: "iCloud", status: "available" },
 };
 
 const sendChannelMessages = (
@@ -188,6 +209,37 @@ describe("TauriExplorerDataSource", () => {
     ).rejects.toThrow("unknown location kind");
   });
 
+  it("rejects listing entries attributed to a different location", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "list_directory") return null;
+      if (!payload || typeof payload !== "object") {
+        throw new Error("Expected directory command arguments.");
+      }
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "entries",
+          entries: [
+            {
+              ...entryPayload,
+              reference: { ...entryPayload.reference, locationId: "forged" },
+            },
+          ],
+          replace: true,
+        },
+      ]);
+      return null;
+    });
+
+    await expect(
+      new TauriExplorerDataSource().listDirectory(root, {
+        signal: new AbortController().signal,
+        onStart: () => {},
+        onBatch: () => {},
+        onComplete: () => {},
+      }),
+    ).rejects.toThrow("entry location identity does not match");
+  });
+
   it("rejects unknown semantic location roles", async () => {
     mockIPC((command) => {
       if (command === "list_locations") {
@@ -200,6 +252,35 @@ describe("TauriExplorerDataSource", () => {
     await expect(
       source.listLocations(new AbortController().signal),
     ).rejects.toThrow("unknown location role");
+  });
+
+  it("rejects location roles and roots that do not match their identity", async () => {
+    mockIPC((command) => {
+      if (command === "list_locations") {
+        return [{ ...locationPayload, role: "volume" }];
+      }
+      return null;
+    });
+    const source = new TauriExplorerDataSource();
+    await expect(
+      source.listLocations(new AbortController().signal),
+    ).rejects.toThrow("location role does not match");
+
+    clearMocks();
+    mockIPC((command) => {
+      if (command === "list_locations") {
+        return [
+          {
+            ...locationPayload,
+            root: { ...locationPayload.root, locationId: "forged" },
+          },
+        ];
+      }
+      return null;
+    });
+    await expect(
+      source.listLocations(new AbortController().signal),
+    ).rejects.toThrow("root identity does not match");
   });
 
   it("streams validated volume snapshots and cancels the Rust watch", async () => {
@@ -233,6 +314,65 @@ describe("TauriExplorerDataSource", () => {
       warning: null,
     });
     expect(commands).toContain("cancel_volume_watch");
+  });
+
+  it("streams validated synced-folder snapshots and cancels the Rust watch", async () => {
+    const commands: string[] = [];
+    mockIPC((command, payload) => {
+      commands.push(command);
+      if (command === "watch_synced_folders") {
+        if (
+          !payload ||
+          Array.isArray(payload) ||
+          payload instanceof ArrayBuffer ||
+          payload instanceof Uint8Array
+        ) {
+          throw new Error("Expected synced-folder watch arguments.");
+        }
+        sendChannelMessages(payload.onEvent, [
+          { revision: 3, folders: [syncedFolderPayload], warning: null },
+        ]);
+      }
+      return null;
+    });
+    const source = new TauriExplorerDataSource();
+    const controller = new AbortController();
+    const onSnapshot = vi.fn(() => controller.abort());
+
+    await source.watchSyncedFolders({ signal: controller.signal, onSnapshot });
+
+    expect(onSnapshot).toHaveBeenCalledWith({
+      revision: 3,
+      folders: [syncedFolderPayload],
+      warning: null,
+    });
+    expect(commands).toContain("cancel_synced_folder_watch");
+  });
+
+  it("rejects mismatched synced-folder metadata", async () => {
+    mockIPC((command, payload) => {
+      if (command === "watch_synced_folders") {
+        if (!payload || typeof payload !== "object") {
+          throw new Error("Expected synced-folder watch arguments.");
+        }
+        sendChannelMessages(Reflect.get(payload, "onEvent"), [
+          {
+            revision: 1,
+            folders: [{ ...syncedFolderPayload, syncedFolder: null }],
+            warning: null,
+          },
+        ]);
+      }
+      return null;
+    });
+    const controller = new AbortController();
+
+    await expect(
+      new TauriExplorerDataSource().watchSyncedFolders({
+        signal: controller.signal,
+        onSnapshot: () => {},
+      }),
+    ).rejects.toThrow("synced-folder metadata is missing");
   });
 
   it("forwards AbortSignal cancellation to the active Rust listing", async () => {
@@ -532,7 +672,12 @@ describe("TauriExplorerDataSource", () => {
             fingerprint: "SHA256:test",
           },
         ]);
-        return { ...locationPayload, kind: "ssh", role: "ssh" };
+        return {
+          ...locationPayload,
+          backend: "ssh",
+          kind: "ssh",
+          role: "ssh",
+        };
       }
       if (command === "respond_ssh_prompt") {
         promptResponse = payload;
@@ -572,7 +717,12 @@ describe("TauriExplorerDataSource", () => {
           throw new Error("Expected SSH command arguments.");
         }
         eventChannel = payload.onEvent;
-        return { ...locationPayload, kind: "ssh", role: "ssh" };
+        return {
+          ...locationPayload,
+          backend: "ssh",
+          kind: "ssh",
+          role: "ssh",
+        };
       }
       return null;
     });

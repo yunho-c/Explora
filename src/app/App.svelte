@@ -27,12 +27,23 @@
   let shownRecoveryMessage: string | null = null;
   let shownPreferencesWarning: string | null = null;
   let shownVolumeWarning: string | null = null;
+  let shownSyncedFolderWarning: string | null = null;
 
   $effect(() => {
     const message = windowChrome.recoveryMessage;
     if (message && message !== shownRecoveryMessage) {
       shownRecoveryMessage = message;
       toast.warning("Window controls recovered with limited behavior", {
+        description: message,
+      });
+    }
+  });
+
+  $effect(() => {
+    const message = state.syncedFolderWarningMessage;
+    if (message && message !== shownSyncedFolderWarning) {
+      shownSyncedFolderWarning = message;
+      toast.warning("Cloud storage locations may be out of date", {
         description: message,
       });
     }

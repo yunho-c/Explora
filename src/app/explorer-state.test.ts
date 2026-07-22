@@ -5,6 +5,7 @@ import type {
   FileEntrySummary,
   LocationSummary,
   SshConnectionEvent,
+  SyncedFolderSnapshot,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
 import type {
@@ -18,6 +19,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
@@ -128,6 +130,7 @@ class FailingPreferencesDataSource implements PreferencesDataSource {
             "music",
             "videos",
           ],
+          hiddenSyncedFolderIds: [],
           hiddenSshTargetIds: [],
         },
       },
@@ -175,11 +178,42 @@ class ControllableVolumeDataSource extends DemoExplorerDataSource {
   }
 }
 
+class ControllableSyncedFolderDataSource extends DemoExplorerDataSource {
+  listingCount = 0;
+  private onSyncedFolderSnapshot:
+    ((snapshot: SyncedFolderSnapshot) => void) | null = null;
+
+  override async watchSyncedFolders({
+    signal,
+    onSnapshot,
+  }: WatchSyncedFoldersOptions): Promise<void> {
+    this.onSyncedFolderSnapshot = onSnapshot;
+    await new Promise<void>((resolve) => {
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  }
+
+  override async listDirectory(
+    directory: DirectoryRef,
+    options: ListDirectoryOptions,
+  ): Promise<void> {
+    this.listingCount += 1;
+    return super.listDirectory(directory, options);
+  }
+
+  emitSyncedFolders(
+    revision: number,
+    folders: readonly LocationSummary[],
+  ): void {
+    this.onSyncedFolderSnapshot?.({ revision, folders, warning: null });
+  }
+}
+
 describe("ExplorerState", () => {
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
 
-    expect(state.locations).toHaveLength(10);
+    expect(state.locations).toHaveLength(13);
     expect(
       state.locations
         .filter(({ kind }) => kind === "local")
@@ -224,6 +258,35 @@ describe("ExplorerState", () => {
     state.dispose();
   });
 
+  it("preserves an active synced-folder tab across removal and restores it at the root", async () => {
+    const dataSource = new ControllableSyncedFolderDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const icloud = state.locations.find(({ id }) => id === "synced:icloud");
+    expect(icloud).toBeDefined();
+    await state.selectLocation("synced:icloud");
+
+    dataSource.emitSyncedFolders(1, []);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("offline"),
+    );
+    expect(state.activeTab?.locationId).toBe("synced:icloud");
+    expect(state.activeSyncedFolderOffline).toBe(true);
+    expect(state.warningMessage).toContain("sync provider");
+    const listingCount = dataSource.listingCount;
+    await state.selectLocation("synced:icloud");
+    expect(dataSource.listingCount).toBe(listingCount);
+    expect(state.warningMessage).toContain("sync provider");
+
+    dataSource.emitSyncedFolders(2, [icloud as LocationSummary]);
+    await vi.waitFor(() =>
+      expect(state.activeLocation?.status).toBe("available"),
+    );
+    expect(state.activeDirectory?.id).toBe(icloud?.root.id);
+    expect(state.warningMessage).toBeNull();
+    state.dispose();
+  });
+
   it("filters, sorts, and switches views without mutating source entries", async () => {
     const state = await initializedState();
     const originalCount = state.entries.length;
@@ -249,6 +312,7 @@ describe("ExplorerState", () => {
         viewMode: "grid",
         sort: { column: "size", direction: "descending" },
         favoriteRoles: ["home", "music"],
+        hiddenSyncedFolderIds: ["synced:google-drive"],
         hiddenSshTargetIds: ["demo:render-node"],
       },
     });
@@ -265,6 +329,10 @@ describe("ExplorerState", () => {
     ]);
     expect(state.visibleSshTargets.map(({ id }) => id)).toEqual([
       "demo:staging-box",
+    ]);
+    expect(state.visibleSyncedFolderLocations.map(({ id }) => id)).toEqual([
+      "synced:icloud",
+      "synced:onedrive",
     ]);
   });
 
@@ -307,6 +375,28 @@ describe("ExplorerState", () => {
     );
     expect(connectedTarget?.status).toBe("connected");
     expect(connectedTarget?.connectedLocationId).toBe("staging-box");
+  });
+
+  it("persists synced-folder visibility without changing discovery state", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+
+    state.setSyncedFolderVisible("synced:onedrive", false);
+    await vi.waitFor(async () => {
+      expect(
+        (await preferences.getPreferences()).preferences.layout
+          .hiddenSyncedFolderIds,
+      ).toEqual(["synced:onedrive"]);
+    });
+
+    expect(
+      state.visibleSyncedFolderLocations.map(({ id }) => id),
+    ).not.toContain("synced:onedrive");
+    expect(
+      state.syncedFolderLocations.find(({ id }) => id === "synced:onedrive")
+        ?.status,
+    ).toBe("available");
   });
 
   it("serializes rapid preference writes so the latest choice wins", async () => {

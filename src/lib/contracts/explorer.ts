@@ -1,4 +1,5 @@
-export type LocationKind = "local" | "volume" | "ssh";
+export type LocationBackend = "local" | "ssh";
+export type LocationKind = "local" | "volume" | "syncedFolder" | "ssh";
 export type LocationRole =
   | "home"
   | "desktop"
@@ -8,8 +9,21 @@ export type LocationRole =
   | "music"
   | "videos"
   | "volume"
+  | "syncedFolder"
   | "ssh";
 export type LocationStatus = "available" | "connected" | "offline";
+export type SyncedFolderProvider =
+  "iCloud" | "oneDrive" | "googleDrive" | "other";
+export type SyncedFolderStatus =
+  "available" | "offline" | "paused" | "error" | "unknown";
+export type ContentAvailability =
+  | "local"
+  | "onlineOnly"
+  | "partial"
+  | "downloading"
+  | "syncing"
+  | "error"
+  | "unknown";
 export type SshTargetSource = "manual" | "openSshConfig";
 export type SshTargetStatus =
   "disconnected" | "connecting" | "connected" | "error";
@@ -48,17 +62,30 @@ export interface BreadcrumbSegment {
 export interface LocationSummary {
   id: string;
   name: string;
+  backend: LocationBackend;
   kind: LocationKind;
   role: LocationRole;
   status: LocationStatus;
   displayPath: string;
   detail: string;
   root: DirectoryRef;
+  syncedFolder: SyncedFolderMetadata | null;
+}
+
+export interface SyncedFolderMetadata {
+  provider: SyncedFolderProvider;
+  status: SyncedFolderStatus;
 }
 
 export interface VolumeSnapshot {
   revision: number;
   volumes: readonly LocationSummary[];
+  warning: string | null;
+}
+
+export interface SyncedFolderSnapshot {
+  revision: number;
+  folders: readonly LocationSummary[];
   warning: string | null;
 }
 
@@ -130,6 +157,7 @@ export interface FileEntrySummary {
   modifiedAt: number | null;
   displayPath: string;
   directory: DirectoryRef | null;
+  availability: ContentAvailability;
   detail?: string;
 }
 
@@ -154,6 +182,7 @@ export interface PreviewDetail {
 
 export type PreviewUnavailableReason =
   | "unsupported"
+  | "downloadRequired"
   | "remote"
   | "directory"
   | "symlink"

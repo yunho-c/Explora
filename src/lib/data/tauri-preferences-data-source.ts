@@ -30,6 +30,12 @@ const validSshTargetId = (value: unknown): value is string =>
   value.length <= 512 &&
   !/\p{Cc}/u.test(value) &&
   (value.startsWith("manual:") || value.startsWith("config:"));
+const validSyncedFolderId = (value: unknown): value is string =>
+  typeof value === "string" &&
+  value.length > "synced:".length &&
+  value.length <= 512 &&
+  !/\p{Cc}/u.test(value) &&
+  value.startsWith("synced:");
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -88,6 +94,28 @@ const parsePreferences = (value: unknown): UserPreferences => {
       "Invalid preference response: favorite roles are not canonical.",
     );
   }
+  const hiddenSyncedFolderIds = layout.hiddenSyncedFolderIds;
+  if (
+    !Array.isArray(hiddenSyncedFolderIds) ||
+    hiddenSyncedFolderIds.length > 512 ||
+    hiddenSyncedFolderIds.some((id) => !validSyncedFolderId(id))
+  ) {
+    throw new Error(
+      "Invalid preference response: hidden synced-folder IDs are malformed.",
+    );
+  }
+  const parsedHiddenSyncedFolderIds = hiddenSyncedFolderIds as string[];
+  if (
+    new Set(parsedHiddenSyncedFolderIds).size !==
+      parsedHiddenSyncedFolderIds.length ||
+    [...parsedHiddenSyncedFolderIds]
+      .sort()
+      .some((id, index) => id !== parsedHiddenSyncedFolderIds[index])
+  ) {
+    throw new Error(
+      "Invalid preference response: hidden synced-folder IDs are malformed.",
+    );
+  }
   if (
     !Array.isArray(layout.hiddenSshTargetIds) ||
     layout.hiddenSshTargetIds.length > 512 ||
@@ -108,6 +136,7 @@ const parsePreferences = (value: unknown): UserPreferences => {
         direction: layout.sort.direction as SortDirection,
       },
       favoriteRoles: [...favoriteRoles],
+      hiddenSyncedFolderIds: [...parsedHiddenSyncedFolderIds],
       hiddenSshTargetIds: [...layout.hiddenSshTargetIds] as string[],
     },
   };

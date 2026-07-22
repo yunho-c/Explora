@@ -2,12 +2,14 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 
 import type {
   BreadcrumbSegment,
+  ContentAvailability,
   ContentKind,
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
   ImagePreviewMode,
   LocationKind,
+  LocationBackend,
   LocationRole,
   LocationStatus,
   LocationSummary,
@@ -21,6 +23,9 @@ import type {
   SshTargetSource,
   SshTargetStatus,
   SshTargetSummary,
+  SyncedFolderProvider,
+  SyncedFolderSnapshot,
+  SyncedFolderStatus,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
 import type {
@@ -29,6 +34,7 @@ import type {
   ListDirectoryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  WatchSyncedFoldersOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
@@ -49,7 +55,22 @@ const entryKinds = new Set<EntryKind>([
   "symlink",
   "other",
 ]);
-const locationKinds = new Set<LocationKind>(["local", "volume", "ssh"]);
+const contentAvailabilities = new Set<ContentAvailability>([
+  "local",
+  "onlineOnly",
+  "partial",
+  "downloading",
+  "syncing",
+  "error",
+  "unknown",
+]);
+const locationBackends = new Set<LocationBackend>(["local", "ssh"]);
+const locationKinds = new Set<LocationKind>([
+  "local",
+  "volume",
+  "syncedFolder",
+  "ssh",
+]);
 const locationRoles = new Set<LocationRole>([
   "home",
   "desktop",
@@ -59,12 +80,26 @@ const locationRoles = new Set<LocationRole>([
   "music",
   "videos",
   "volume",
+  "syncedFolder",
   "ssh",
 ]);
 const locationStatuses = new Set<LocationStatus>([
   "available",
   "connected",
   "offline",
+]);
+const syncedFolderProviders = new Set<SyncedFolderProvider>([
+  "iCloud",
+  "oneDrive",
+  "googleDrive",
+  "other",
+]);
+const syncedFolderStatuses = new Set<SyncedFolderStatus>([
+  "available",
+  "offline",
+  "paused",
+  "error",
+  "unknown",
 ]);
 const sshTargetSources = new Set<SshTargetSource>(["manual", "openSshConfig"]);
 const sshTargetStatuses = new Set<SshTargetStatus>([
@@ -86,6 +121,7 @@ const sshPromptKinds = new Set([
 ] as const);
 const previewUnavailableReasons = new Set<PreviewUnavailableReason>([
   "unsupported",
+  "downloadRequired",
   "remote",
   "directory",
   "symlink",
@@ -136,12 +172,19 @@ const parseLocation = (value: unknown): LocationSummary => {
     throw new Error("Invalid filesystem response: location must be an object.");
   }
 
+  const id = requireString(value, "id");
   const kind = requireString(value, "kind");
+  const backend = requireString(value, "backend");
   const role = requireString(value, "role");
   const status = requireString(value, "status");
   if (!locationKinds.has(kind as LocationKind)) {
     throw new Error(
       `Invalid filesystem response: unknown location kind ${kind}.`,
+    );
+  }
+  if (!locationBackends.has(backend as LocationBackend)) {
+    throw new Error(
+      `Invalid filesystem response: unknown location backend ${backend}.`,
     );
   }
   if (!locationStatuses.has(status as LocationStatus)) {
@@ -154,16 +197,76 @@ const parseLocation = (value: unknown): LocationSummary => {
       `Invalid filesystem response: unknown location role ${role}.`,
     );
   }
+  const expectedRole =
+    kind === "ssh"
+      ? "ssh"
+      : kind === "volume"
+        ? "volume"
+        : kind === "syncedFolder"
+          ? "syncedFolder"
+          : null;
+  if (
+    (expectedRole !== null && role !== expectedRole) ||
+    (kind === "local" &&
+      (role === "ssh" || role === "volume" || role === "syncedFolder"))
+  ) {
+    throw new Error(
+      "Invalid filesystem response: location role does not match its kind.",
+    );
+  }
+  const expectedBackend: LocationBackend = kind === "ssh" ? "ssh" : "local";
+  if (backend !== expectedBackend) {
+    throw new Error(
+      "Invalid filesystem response: location backend does not match its kind.",
+    );
+  }
+  let syncedFolder = null;
+  if (kind === "syncedFolder") {
+    if (!isRecord(value.syncedFolder)) {
+      throw new Error(
+        "Invalid filesystem response: synced-folder metadata is missing.",
+      );
+    }
+    const provider = requireString(value.syncedFolder, "provider");
+    const syncedStatus = requireString(value.syncedFolder, "status");
+    if (!syncedFolderProviders.has(provider as SyncedFolderProvider)) {
+      throw new Error(
+        `Invalid filesystem response: unknown synced-folder provider ${provider}.`,
+      );
+    }
+    if (!syncedFolderStatuses.has(syncedStatus as SyncedFolderStatus)) {
+      throw new Error(
+        `Invalid filesystem response: unknown synced-folder status ${syncedStatus}.`,
+      );
+    }
+    syncedFolder = {
+      provider: provider as SyncedFolderProvider,
+      status: syncedStatus as SyncedFolderStatus,
+    };
+  } else if (value.syncedFolder !== null) {
+    throw new Error(
+      "Invalid filesystem response: only synced folders may include provider metadata.",
+    );
+  }
+
+  const root = parseDirectoryRef(value.root);
+  if (root.locationId !== id) {
+    throw new Error(
+      "Invalid filesystem response: location root identity does not match.",
+    );
+  }
 
   return {
-    id: requireString(value, "id"),
+    id,
     name: requireString(value, "name"),
+    backend: backend as LocationBackend,
     kind: kind as LocationKind,
     role: role as LocationRole,
     status: status as LocationStatus,
     displayPath: requireString(value, "displayPath"),
     detail: requireString(value, "detail"),
-    root: parseDirectoryRef(value.root),
+    root,
+    syncedFolder,
   };
 };
 
@@ -297,19 +400,28 @@ const parseSshConnectionEvent = (value: unknown): SshConnectionEvent => {
   throw new Error("Invalid SSH response: unknown connection event.");
 };
 
-const parseEntry = (value: unknown): FileEntrySummary => {
+const parseEntry = (
+  value: unknown,
+  expectedLocationId?: string,
+): FileEntrySummary => {
   if (!isRecord(value) || !isRecord(value.reference)) {
     throw new Error("Invalid filesystem response: entry must be an object.");
   }
 
   const kind = requireString(value, "kind");
   const contentKind = requireString(value, "contentKind");
+  const availability = requireString(value, "availability");
   if (!entryKinds.has(kind as EntryKind)) {
     throw new Error(`Invalid filesystem response: unknown entry kind ${kind}.`);
   }
   if (!contentKinds.has(contentKind as ContentKind)) {
     throw new Error(
       `Invalid filesystem response: unknown content kind ${contentKind}.`,
+    );
+  }
+  if (!contentAvailabilities.has(availability as ContentAvailability)) {
+    throw new Error(
+      `Invalid filesystem response: unknown content availability ${availability}.`,
     );
   }
   if (
@@ -341,19 +453,31 @@ const parseEntry = (value: unknown): FileEntrySummary => {
     throw new Error("Invalid filesystem response: entry detail is malformed.");
   }
 
+  const reference = {
+    id: requireString(value.reference, "id"),
+    locationId: requireString(value.reference, "locationId"),
+  };
+  const directory =
+    value.directory === null ? null : parseDirectoryRef(value.directory);
+  if (
+    (expectedLocationId && reference.locationId !== expectedLocationId) ||
+    (directory && directory.locationId !== reference.locationId)
+  ) {
+    throw new Error(
+      "Invalid filesystem response: entry location identity does not match.",
+    );
+  }
+
   return {
-    reference: {
-      id: requireString(value.reference, "id"),
-      locationId: requireString(value.reference, "locationId"),
-    },
+    reference,
     name: requireString(value, "name"),
     kind: kind as EntryKind,
     contentKind: contentKind as ContentKind,
     size: value.size,
     modifiedAt: value.modifiedAt,
     displayPath: requireString(value, "displayPath"),
-    directory:
-      value.directory === null ? null : parseDirectoryRef(value.directory),
+    directory,
+    availability: availability as ContentAvailability,
     detail: typeof value.detail === "string" ? value.detail : undefined,
   };
 };
@@ -609,6 +733,46 @@ const parseVolumeSnapshot = (value: unknown): VolumeSnapshot => {
   };
 };
 
+const parseSyncedFolderSnapshot = (value: unknown): SyncedFolderSnapshot => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid synced-folder response: snapshot is malformed.");
+  }
+  if (
+    typeof value.revision !== "number" ||
+    !Number.isSafeInteger(value.revision) ||
+    value.revision < 0
+  ) {
+    throw new Error("Invalid synced-folder response: revision is malformed.");
+  }
+  if (!Array.isArray(value.folders)) {
+    throw new Error("Invalid synced-folder response: folders must be a list.");
+  }
+  if (value.warning !== null && typeof value.warning !== "string") {
+    throw new Error("Invalid synced-folder response: warning is malformed.");
+  }
+  const folders = value.folders.map(parseLocation);
+  if (
+    folders.some(
+      ({ id, backend, kind, role, syncedFolder }) =>
+        !id.startsWith("synced:") ||
+        backend !== "local" ||
+        kind !== "syncedFolder" ||
+        role !== "syncedFolder" ||
+        syncedFolder === null,
+    ) ||
+    new Set(folders.map(({ id }) => id)).size !== folders.length
+  ) {
+    throw new Error(
+      "Invalid synced-folder response: folder entries are malformed.",
+    );
+  }
+  return {
+    revision: value.revision,
+    folders,
+    warning: value.warning,
+  };
+};
+
 const abortError = () => {
   const error = new Error("The filesystem request was cancelled.");
   error.name = "AbortError";
@@ -679,6 +843,47 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     signal.addEventListener("abort", cancel, { once: true });
     try {
       await invoke("watch_volumes", { requestId: id, onEvent: channel });
+      await watching;
+    } catch (error) {
+      if (!signal.aborted) throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  async watchSyncedFolders({
+    signal,
+    onSnapshot,
+  }: WatchSyncedFoldersOptions): Promise<void> {
+    if (signal.aborted) throw abortError();
+    const id = requestId();
+    const channel = new Channel<unknown>();
+    let rejectWatch: (error: Error) => void = () => {};
+    const watching = new Promise<void>((resolve, reject) => {
+      rejectWatch = reject;
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    const cancel = () => {
+      void invoke("cancel_synced_folder_watch", { requestId: id }).catch(() => {
+        // Cancellation is best-effort; aborted snapshots are ignored below.
+      });
+    };
+    channel.onmessage = (payload) => {
+      if (signal.aborted) return;
+      try {
+        onSnapshot(parseSyncedFolderSnapshot(payload));
+      } catch (error) {
+        cancel();
+        rejectWatch(
+          error instanceof Error
+            ? error
+            : new Error("Invalid synced-folder response."),
+        );
+      }
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      await invoke("watch_synced_folders", { requestId: id, onEvent: channel });
       await watching;
     } catch (error) {
       if (!signal.aborted) throw commandError(error);
@@ -894,7 +1099,9 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
             );
           }
           onBatch({
-            entries: payload.entries.map(parseEntry),
+            entries: payload.entries.map((entry) =>
+              parseEntry(entry, directory.locationId),
+            ),
             replace: payload.replace,
           });
         } else if (payload.event === "complete") {

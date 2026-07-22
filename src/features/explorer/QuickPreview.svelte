@@ -60,7 +60,7 @@
   <Dialog.Content
     class="flex h-[min(48rem,calc(100vh-3rem))] max-h-[calc(100vh-3rem)] w-[min(64rem,calc(100vw-3rem))] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-5xl"
   >
-    {#if state.selectedEntry?.contentKind === "image" && state.activeLocation?.kind !== "ssh"}
+    {#if state.selectedEntry?.contentKind === "image" && state.activeLocation?.backend !== "ssh"}
       <Toggle
         variant="default"
         size="sm"

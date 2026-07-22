@@ -14,7 +14,8 @@ use uuid::Uuid;
 
 use crate::filesystem::{
     BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
-    FileEntrySummaryDto, LocationRole, LocationSummaryDto, LISTING_BATCH_SIZE,
+    FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
+    SyncedFolderMetadataDto, LISTING_BATCH_SIZE,
 };
 
 #[derive(Debug, Clone)]
@@ -108,6 +109,15 @@ pub struct VolumeRoot {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncedFolderRoot {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub detail: String,
+    pub metadata: SyncedFolderMetadataDto,
+}
+
 impl LocalFilesystem {
     pub fn new(roots: Vec<LocalRoot>) -> Result<Self, ExplorerError> {
         let registry = PathRegistry::default();
@@ -124,12 +134,14 @@ impl LocalFilesystem {
             locations.push(LocationSummaryDto {
                 id: root.id.to_owned(),
                 name: root.name.to_owned(),
+                backend: LocationBackend::Local,
                 kind: "local",
                 role: root.role,
                 status: "available",
                 display_path: directory.display_path.clone(),
                 detail: "Local".to_owned(),
                 root: directory,
+                synced_folder: None,
             });
         }
 
@@ -150,6 +162,24 @@ impl LocalFilesystem {
         self.locations
             .read()
             .map(|locations| locations.clone())
+            .map_err(|_| ExplorerError::StateUnavailable)
+    }
+
+    pub fn contains_location(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        self.locations
+            .read()
+            .map(|locations| locations.iter().any(|location| location.id == location_id))
+            .map_err(|_| ExplorerError::StateUnavailable)
+    }
+
+    pub fn is_synced_folder(&self, location_id: &str) -> Result<bool, ExplorerError> {
+        self.locations
+            .read()
+            .map(|locations| {
+                locations
+                    .iter()
+                    .any(|location| location.id == location_id && location.kind == "syncedFolder")
+            })
             .map_err(|_| ExplorerError::StateUnavailable)
     }
 
@@ -188,12 +218,73 @@ impl LocalFilesystem {
             summaries.push(LocationSummaryDto {
                 id: volume.id,
                 name: volume.name,
+                backend: LocationBackend::Local,
                 kind: "volume",
                 role: LocationRole::Volume,
                 status: "available",
                 display_path: directory.display_path.clone(),
                 detail: volume.detail,
                 root: directory,
+                synced_folder: None,
+            });
+        }
+        for id in previous.keys() {
+            if !summaries.iter().any(|location| &location.id == id) {
+                self.registry.remove_location(id)?;
+            }
+        }
+        locations.extend(summaries.iter().cloned());
+        Ok(summaries)
+    }
+
+    pub fn replace_synced_folders(
+        &self,
+        folders: Vec<SyncedFolderRoot>,
+    ) -> Result<Vec<LocationSummaryDto>, ExplorerError> {
+        let mut locations = self
+            .locations
+            .write()
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let previous = locations
+            .iter()
+            .filter(|location| location.kind == "syncedFolder")
+            .map(|location| (location.id.clone(), location.clone()))
+            .collect::<HashMap<_, _>>();
+        locations.retain(|location| location.kind != "syncedFolder");
+
+        let mut summaries = Vec::with_capacity(folders.len());
+        for folder in folders {
+            if !folder.path.is_dir() {
+                continue;
+            }
+            let display_path = folder.path.display().to_string();
+            let directory = if let Some(existing) = previous
+                .get(&folder.id)
+                .filter(|existing| existing.root.display_path == display_path)
+            {
+                let mut root = existing.root.clone();
+                root.name = folder.name.clone();
+                root
+            } else {
+                self.registry.remove_location(&folder.id)?;
+                directory_ref(&self.registry, &folder.path, &folder.id, Some(&folder.name))?
+            };
+            summaries.push(LocationSummaryDto {
+                id: folder.id,
+                name: folder.name,
+                backend: LocationBackend::Local,
+                kind: "syncedFolder",
+                role: LocationRole::SyncedFolder,
+                status: if folder.metadata.status == crate::filesystem::SyncedFolderStatus::Offline
+                {
+                    "offline"
+                } else {
+                    "available"
+                },
+                display_path: directory.display_path.clone(),
+                detail: folder.detail,
+                root: directory,
+                synced_folder: Some(folder.metadata),
             });
         }
         for id in previous.keys() {
@@ -285,7 +376,14 @@ impl LocalFilesystem {
                 }
             };
 
-            match self.describe_entry(entry, location_id) {
+            let availability = if location.kind == "syncedFolder" {
+                // Until a platform adapter can inspect placeholder state
+                // authoritatively, content must not be presumed local.
+                "unknown"
+            } else {
+                "local"
+            };
+            match self.describe_entry(entry, location_id, availability) {
                 Ok(entry) => batch.push(entry),
                 Err(_) => {
                     skipped_entries += 1;
@@ -320,6 +418,7 @@ impl LocalFilesystem {
         &self,
         entry: fs::DirEntry,
         location_id: &str,
+        availability: &'static str,
     ) -> Result<FileEntrySummaryDto, ExplorerError> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -369,6 +468,7 @@ impl LocalFilesystem {
             modified_at,
             display_path: display_path(&path),
             directory,
+            availability,
             detail: file_type.is_symlink().then_some("Symbolic link"),
         })
     }
@@ -666,6 +766,68 @@ mod tests {
                 Ok(())
             });
 
+        assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+    }
+
+    #[test]
+    fn registers_synced_roots_conservatively_and_revokes_removed_tokens() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("synced-root");
+        fs::create_dir(&synced_path).expect("synced root fixture");
+        File::create(synced_path.join("placeholder.txt")).expect("synced entry fixture");
+        let root = SyncedFolderRoot {
+            id: "synced:test".to_owned(),
+            name: "Cloud Storage".to_owned(),
+            path: synced_path,
+            detail: "Cloud Storage · Synced folder".to_owned(),
+            metadata: SyncedFolderMetadataDto {
+                provider: crate::filesystem::SyncedFolderProvider::Other,
+                status: crate::filesystem::SyncedFolderStatus::Available,
+            },
+        };
+
+        let first = filesystem
+            .replace_synced_folders(vec![root.clone()])
+            .expect("first synced snapshot")
+            .remove(0);
+        assert_eq!(first.backend, LocationBackend::Local);
+        assert_eq!(first.role, LocationRole::SyncedFolder);
+        assert_eq!(first.synced_folder, Some(root.metadata.clone()));
+
+        let refreshed = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                name: "Renamed Cloud Storage".to_owned(),
+                ..root
+            }])
+            .expect("synced metadata refresh")
+            .remove(0);
+        assert_eq!(refreshed.root.id, first.root.id);
+
+        let mut availability = None;
+        filesystem
+            .list_directory(
+                &refreshed.root.id,
+                &refreshed.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        availability = entries.first().map(|entry| entry.availability);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("synced root listing");
+        assert_eq!(availability, Some("unknown"));
+
+        filesystem
+            .replace_synced_folders(Vec::new())
+            .expect("synced root removal");
+        let result = filesystem.list_directory(
+            &refreshed.root.id,
+            &refreshed.id,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+        );
         assert!(matches!(result, Err(ExplorerError::InvalidReference)));
     }
 

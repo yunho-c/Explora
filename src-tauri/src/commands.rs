@@ -20,6 +20,7 @@ use crate::{
     preview::{metadata_result, PreviewManager},
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
+    synced_folders::{SyncedFolderManager, SyncedFolderSnapshotEventDto},
     volumes::{VolumeManager, VolumeSnapshotEventDto},
 };
 
@@ -30,6 +31,7 @@ pub struct AppState {
     ssh: Arc<SshConnectionManager>,
     preview: Arc<PreviewManager>,
     volumes: Arc<VolumeManager>,
+    synced_folders: Arc<SyncedFolderManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
@@ -39,6 +41,7 @@ impl AppState {
         preferences: PreferencesStore,
         ssh_targets: SshTargetStore,
         volumes: Arc<VolumeManager>,
+        synced_folders: Arc<SyncedFolderManager>,
     ) -> Self {
         Self {
             local,
@@ -47,6 +50,7 @@ impl AppState {
             ssh: Arc::new(SshConnectionManager::default()),
             preview: Arc::new(PreviewManager::default()),
             volumes,
+            synced_folders,
             listings: Mutex::new(HashMap::new()),
         }
     }
@@ -89,6 +93,16 @@ fn validate_request_id(request_id: &str) -> Result<(), ExplorerError> {
         Err(ExplorerError::InvalidReference)
     } else {
         Ok(())
+    }
+}
+
+fn redact_synced_folder_error(error: ExplorerError) -> ExplorerError {
+    match error {
+        ExplorerError::Io { kind, .. } => ExplorerError::Io {
+            message: "Explora could not read this synced folder.".to_owned(),
+            kind,
+        },
+        error => error,
     }
 }
 
@@ -142,6 +156,30 @@ pub fn cancel_volume_watch(
 ) -> Result<(), ExplorerErrorDto> {
     state
         .volumes
+        .unsubscribe(&request_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn watch_synced_folders(
+    state: State<'_, AppState>,
+    request_id: String,
+    on_event: Channel<SyncedFolderSnapshotEventDto>,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .synced_folders
+        .subscribe(request_id, on_event)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_synced_folder_watch(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    state
+        .synced_folders
         .unsubscribe(&request_id)
         .map_err(ExplorerErrorDto::from)
 }
@@ -263,12 +301,29 @@ pub async fn list_directory(
     location_id: String,
     on_event: Channel<DirectoryListingEvent>,
 ) -> Result<(), ExplorerErrorDto> {
+    let local_location = state
+        .local
+        .contains_location(&location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    let ssh_location = state
+        .ssh
+        .contains_location(&location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    if local_location == ssh_location {
+        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+    }
+    let synced_location = local_location
+        && state
+            .local
+            .is_synced_folder(&location_id)
+            .map_err(ExplorerErrorDto::from)?;
+
     let cancellation = state
         .begin_listing(&request_id)
         .map_err(ExplorerErrorDto::from)?;
     let listing_request_id = request_id.clone();
 
-    let result = if location_id.starts_with("ssh:") {
+    let result = if ssh_location {
         state
             .ssh
             .list_directory(&location_id, &directory_id, &cancellation, |event| {
@@ -278,6 +333,7 @@ pub async fn list_directory(
             })
             .await
     } else {
+        debug_assert!(local_location);
         let local = state.local.clone();
         tauri::async_runtime::spawn_blocking(move || {
             local.list_directory(&directory_id, &location_id, &cancellation, |event| {
@@ -293,7 +349,15 @@ pub async fn list_directory(
     };
 
     state.finish_listing(&listing_request_id);
-    result.map_err(ExplorerErrorDto::from)
+    result
+        .map_err(|error| {
+            if synced_location {
+                redact_synced_folder_error(error)
+            } else {
+                error
+            }
+        })
+        .map_err(ExplorerErrorDto::from)
 }
 
 #[tauri::command]
@@ -318,7 +382,19 @@ pub async fn prepare_preview(
     validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
     validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
 
-    if location_id.starts_with("ssh:") {
+    let ssh_location = state
+        .ssh
+        .contains_location(&location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    let local_location = state
+        .local
+        .contains_location(&location_id)
+        .map_err(ExplorerErrorDto::from)?;
+    if local_location == ssh_location {
+        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+    }
+
+    if ssh_location {
         return Ok(metadata_result(
             entry_id,
             None,
@@ -327,6 +403,22 @@ pub async fn prepare_preview(
             "Remote content preview is not available yet.",
         ));
     }
+
+    if state
+        .local
+        .is_synced_folder(&location_id)
+        .map_err(ExplorerErrorDto::from)?
+    {
+        return Ok(metadata_result(
+            entry_id,
+            None,
+            None,
+            PreviewUnavailableReason::DownloadRequired,
+            "Explora needs explicit permission to download this synced file before previewing it.",
+        ));
+    }
+
+    debug_assert!(local_location);
 
     let path = state
         .local
@@ -409,5 +501,19 @@ mod tests {
             message: "failed".to_owned(),
         };
         assert_eq!(error.code, crate::filesystem::ExplorerErrorCode::Unexpected);
+    }
+
+    #[test]
+    fn synced_folder_errors_do_not_expose_provider_paths() {
+        let error = ExplorerError::Io {
+            message:
+                "could not open /Users/person/Library/CloudStorage/Provider-account@example.com"
+                    .to_owned(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+
+        let redacted = redact_synced_folder_error(error).to_string();
+        assert_eq!(redacted, "Explora could not read this synced folder.");
+        assert!(!redacted.contains("account@example.com"));
     }
 }

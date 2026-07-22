@@ -10,6 +10,26 @@ Saved SSH targets and concrete aliases from
 application retains deterministic local and remote demo assets for UI development
 and tests.
 
+Work is underway on provider-neutral discovery of operating-system-managed
+synced folders such as iCloud Drive, OneDrive, and Google Drive. Explora will
+browse these through bounded filesystem adapters while the operating system or
+installed provider retains authentication and synchronization ownership. See
+[`docs/synced-folders.md`](docs/synced-folders.md) and
+[`docs/adr/0009-os-managed-synced-folders.md`](docs/adr/0009-os-managed-synced-folders.md).
+
+Current synced-folder support is intentionally phased:
+
+| Target       | Root discovery                                                  | Browsing                                  | Content availability and hydration                                                 |
+| ------------ | --------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------- |
+| macOS        | Initial iCloud Drive and `~/Library/CloudStorage` discovery     | Read-only through opaque local references | Availability remains unknown; preview returns `downloadRequired` without hydrating |
+| Windows      | Planned through the Storage Provider registry                   | Planned                                   | Planned through Cloud Files metadata                                               |
+| Linux        | Planned for explicit and reliably detected local folders        | Planned; GIO requires a dedicated backend | Not implemented                                                                    |
+| Browser demo | Deterministic iCloud Drive, OneDrive, and Google Drive fixtures | Implemented for UI development and tests  | Synthetic local and online-only states only                                        |
+
+Packaged macOS provider validation, Windows and Linux adapters, authoritative
+placeholder-state inspection, and explicit hydration remain tracked in the
+synced-folders document.
+
 The packaged application integrates its tab strip into a guarded custom
 titlebar. macOS keeps native traffic lights, Windows 11 retains the native Snap
 Layout menu, and supported GNOME/KDE Wayland sessions receive GTK-themed window

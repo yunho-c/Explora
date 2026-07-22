@@ -1,6 +1,6 @@
 # Synced folders
 
-- Status: Design proposal
+- Status: Implementation in progress
 - Last updated: 2026-07-22
 - Tracking branch: `feat/synced-folders`
 
@@ -48,10 +48,9 @@ It does **not** mean that Explora will:
 - Depend on folder names, account email addresses, or display paths as
   authoritative identities.
 
-The accepted product charter currently lists cloud-provider-specific
-integrations and file synchronization as out of scope. Before shipping this
-feature, update that language to distinguish provider-neutral discovery of
-OS-managed locations from provider API integration and synchronization.
+The product charter distinguishes provider-neutral discovery of OS-managed
+locations from provider API integration and synchronization. The former is an
+accepted Explora feature; the latter remain out of scope.
 
 ## User experience
 
@@ -142,17 +141,13 @@ folder may use the existing local filesystem implementation, a platform storage
 adapter, or a future GIO backend. Provider identity must not select filesystem
 behavior.
 
-A possible frontend shape is:
+The current frontend contract is:
 
 ```ts
-type LocationBackend = "local" | "ssh" | "gio";
-type LocationSource = "favorite" | "volume" | "syncedFolder" | "ssh";
+type LocationBackend = "local" | "ssh";
+type LocationKind = "local" | "volume" | "syncedFolder" | "ssh";
 
-type SyncedFolderProvider =
-  | "icloud"
-  | "onedrive"
-  | "googleDrive"
-  | "other";
+type SyncedFolderProvider = "iCloud" | "oneDrive" | "googleDrive" | "other";
 
 interface SyncedFolderMetadata {
   provider: SyncedFolderProvider;
@@ -160,11 +155,10 @@ interface SyncedFolderMetadata {
 }
 ```
 
-This is illustrative, not a mandate to replace the current location DTO in one
-large migration. The important invariant is that provider names and string ID
-prefixes do not become backend dispatch. The current `ssh:` routing should be
-replaced with an authoritative backend association before adding enough
-backends for implicit fallback-to-local behavior to become unsafe.
+The important invariant is that provider names and string ID prefixes do not
+become backend dispatch. Rust now resolves an ID against registered local roots
+or active SSH sessions and rejects unknown or ambiguous identities. A later GIO
+transport must extend the backend contract explicitly.
 
 ### Identity and privacy
 
@@ -359,27 +353,27 @@ honestly rather than showing an unusable mount.
 
 ### Cross-platform
 
-- [ ] Accept a synced-folders ADR.
-- [ ] Update the product boundary in `AGENTS.md`.
-- [ ] Define location source separately from backend transport.
+- [x] Accept a synced-folders ADR.
+- [x] Update the product boundary in `AGENTS.md`.
+- [x] Define location source separately from backend transport.
 - [ ] Define synced-folder provider, status, availability, and capabilities.
-- [ ] Replace string-prefix backend routing with authoritative dispatch.
-- [ ] Implement `SyncedFolderManager` and complete revisioned snapshots.
-- [ ] Bind opaque references to synced-folder location identities.
-- [ ] Revoke references before publishing root removal.
-- [ ] Add Cloud Storage sidebar UI and visibility preferences.
-- [ ] Add deterministic demo roots and frontend tests.
+- [x] Replace string-prefix backend routing with authoritative dispatch.
+- [x] Implement `SyncedFolderManager` and complete revisioned snapshots.
+- [x] Bind opaque references to synced-folder location identities.
+- [x] Revoke references before publishing root removal.
+- [x] Add Cloud Storage sidebar UI and visibility preferences.
+- [x] Add deterministic demo roots and frontend tests.
 - [ ] Add structured offline, permission, stale, and unavailable errors.
-- [ ] Add privacy and log-redaction tests.
-- [ ] Document the supported platform/provider matrix in `README.md`.
+- [x] Add privacy and log-redaction tests.
+- [x] Document the supported platform/provider matrix in `README.md`.
 
 ### macOS
 
 - [ ] Verify discovery behavior on the minimum supported macOS version.
-- [ ] Discover accessible third-party File Provider roots.
-- [ ] Implement and validate iCloud Drive discovery separately.
-- [ ] Derive stable opaque identities without exposing account data.
-- [ ] Detect provider-root addition, removal, and client restart.
+- [x] Discover accessible third-party File Provider roots.
+- [x] Implement iCloud Drive discovery separately.
+- [x] Derive stable opaque identities without exposing account data.
+- [x] Detect provider-root addition, removal, and client restart with bounded polling.
 - [ ] Inspect iCloud availability without hydrating content.
 - [ ] Determine safe third-party File Provider availability metadata.
 - [ ] Test multiple OneDrive and Google Drive accounts.
@@ -416,8 +410,8 @@ honestly rather than showing an unusable mount.
 
 ### Hydration and preview
 
-- [ ] Add an entry availability indicator with an accessible text label.
-- [ ] Return `downloadRequired` instead of triggering implicit hydration.
+- [x] Add an entry availability indicator with an accessible text label.
+- [x] Return `downloadRequired` instead of triggering implicit hydration.
 - [ ] Add explicit Download to Preview intent.
 - [ ] Model hydration as a bounded task with honest progress.
 - [ ] Separate cancellation of waiting from cancellation of provider work.
@@ -443,15 +437,18 @@ Report discovery, listing, placeholder inspection, hydration, and packaged UI
 evidence separately. A successful browser workflow is not native proof, and a
 locally mirrored folder does not exercise online-only placeholder behavior.
 
+## Decisions for the first slice
+
+- Discovery and metadata-only browsing ship before explicit hydration.
+- Users may hide individual discovered roots; provider-wide visibility is not
+  stored.
+- Duplicate provider roots receive sanitized ordinal labels such as
+  `OneDrive 1` and `OneDrive 2`; account identifiers stay private.
+
 ## Open decisions
 
-- Is explicit hydration part of the first synced-folder slice, or does the first
-  slice show metadata-only results for non-local content?
-- Should users be able to hide individual roots, entire providers, or both?
 - Should an explicitly added local folder be marked as synced only by the user,
   or may Explora infer that status from platform metadata?
-- How should multiple roots with identical OS-provided display names be
-  disambiguated without exposing account email addresses?
 - Is GIO an accepted backend dependency, or should Linux initially support only
   ordinary local paths?
 - Which packaging models are supported on macOS, and will a sandboxed build need

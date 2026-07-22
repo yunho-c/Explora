@@ -1,5 +1,6 @@
 <script lang="ts">
   import CheckIcon from "@lucide/svelte/icons/check";
+  import CloudIcon from "@lucide/svelte/icons/cloud";
   import DownloadIcon from "@lucide/svelte/icons/download";
   import CircleMinusIcon from "@lucide/svelte/icons/circle-minus";
   import CirclePlusIcon from "@lucide/svelte/icons/circle-plus";
@@ -26,7 +27,11 @@
   import { Button } from "$lib/components/ui/button";
   import * as ContextMenu from "$lib/components/ui/context-menu";
   import * as Sheet from "$lib/components/ui/sheet";
-  import type { LocationRole, SshTargetSummary } from "$lib/contracts/explorer";
+  import type {
+    LocationRole,
+    LocationSummary,
+    SshTargetSummary,
+  } from "$lib/contracts/explorer";
   import { isFavoriteRole } from "$lib/contracts/preferences";
   import { cn } from "$lib/utils";
 
@@ -47,6 +52,7 @@
     music: Music2Icon,
     videos: FilmIcon,
     volume: HardDriveIcon,
+    syncedFolder: CloudIcon,
     ssh: ServerIcon,
   } satisfies Record<LocationRole, typeof HouseIcon>;
 
@@ -73,6 +79,14 @@
     if (restoreFocus) focusVisibleEditor("[data-ssh-editor]");
   };
 
+  const syncedFolderIsVisible = (folderId: string) =>
+    !state.hiddenSyncedFolderIds.includes(folderId);
+
+  const finishEditingSyncedFolders = (restoreFocus = false) => {
+    state.editingSyncedFolders = false;
+    if (restoreFocus) focusVisibleEditor("[data-synced-folder-editor]");
+  };
+
   const focusVisibleEditor = (selector: string) => {
     queueMicrotask(() => {
       const buttons = [
@@ -86,9 +100,15 @@
 
   const handleKeydown = (event: KeyboardEvent) => {
     if (event.key !== "Escape") return;
-    if (!state.editingFavorites && !state.editingSshTargets) return;
+    if (
+      !state.editingFavorites &&
+      !state.editingSyncedFolders &&
+      !state.editingSshTargets
+    )
+      return;
     event.preventDefault();
     if (state.editingFavorites) finishEditingFavorites(true);
+    else if (state.editingSyncedFolders) finishEditingSyncedFolders(true);
     else finishEditingSshTargets(true);
   };
 </script>
@@ -149,6 +169,36 @@
   </Button>
 {/snippet}
 
+{#snippet syncedFolderButton(location: LocationSummary, compact: boolean)}
+  <Button
+    variant={location.id === state.activeLocation?.id ? "secondary" : "ghost"}
+    size={compact ? "icon" : "sm"}
+    class={compact ? "relative w-full" : "w-full min-w-0 justify-start gap-2"}
+    aria-current={location.id === state.activeLocation?.id ? "page" : undefined}
+    disabled={location.status === "offline"}
+    title={`${location.name} · ${location.detail}`}
+    onclick={() => void state.selectLocation(location.id)}
+  >
+    <CloudIcon />
+    {#if !compact}
+      <span class="min-w-0 flex-1 truncate text-left">{location.name}</span>
+      <span
+        class={cn(
+          "size-2 rounded-full",
+          location.syncedFolder?.status === "available"
+            ? "bg-emerald-500"
+            : location.syncedFolder?.status === "error"
+              ? "bg-destructive"
+              : location.syncedFolder?.status === "paused"
+                ? "bg-amber-500"
+                : "bg-muted-foreground/40",
+        )}
+        aria-label={location.syncedFolder?.status ?? "unknown"}
+      ></span>
+    {/if}
+  </Button>
+{/snippet}
+
 {#snippet navigation(compact: boolean, titlebar: boolean)}
   <div class="flex h-full min-h-0 flex-col">
     <div
@@ -201,6 +251,7 @@
               if (state.editingFavorites) finishEditingFavorites();
               else {
                 finishEditingSshTargets();
+                finishEditingSyncedFolders();
                 state.editingFavorites = true;
               }
             }}
@@ -294,6 +345,106 @@
         {/each}
       </nav>
 
+      {#if state.syncedFolderLocations.length > 0}
+        <div
+          class={cn(
+            "group/synced-folders flex items-center pt-5 pb-1",
+            compact ? "justify-center px-1" : "justify-between pl-2",
+          )}
+        >
+          {#if compact}
+            <CloudIcon
+              class="size-3.5 text-muted-foreground"
+              aria-hidden="true"
+            />
+          {:else}
+            <p class="text-xs font-medium text-muted-foreground">
+              Cloud Storage
+            </p>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              data-synced-folder-editor
+              class={cn(
+                "opacity-100 transition-opacity",
+                !state.editingSyncedFolders &&
+                  "md:opacity-0 md:group-focus-within/synced-folders:opacity-100 md:group-hover/synced-folders:opacity-100",
+              )}
+              title={state.editingSyncedFolders
+                ? "Finish editing cloud storage"
+                : "Configure cloud storage"}
+              aria-label={state.editingSyncedFolders
+                ? "Finish editing cloud storage"
+                : "Configure cloud storage"}
+              aria-pressed={state.editingSyncedFolders}
+              onclick={() => {
+                if (state.editingSyncedFolders) finishEditingSyncedFolders();
+                else {
+                  finishEditingFavorites();
+                  finishEditingSshTargets();
+                  state.editingSyncedFolders = true;
+                }
+              }}
+            >
+              {#if state.editingSyncedFolders}<CheckIcon />{:else}<Settings2Icon
+                />{/if}
+            </Button>
+          {/if}
+        </div>
+        <nav aria-label="Cloud storage" class="space-y-1">
+          {#each state.editingSyncedFolders && !compact ? state.syncedFolderLocations : state.visibleSyncedFolderLocations as location (location.id)}
+            {@const visibleSyncedFolder = syncedFolderIsVisible(location.id)}
+            <div
+              class="flex min-w-0 items-center gap-1"
+              data-synced-folder-visible={visibleSyncedFolder}
+            >
+              {#if visibleSyncedFolder}
+                <div class="min-w-0 flex-1">
+                  {@render syncedFolderButton(location, compact)}
+                </div>
+              {:else}
+                <div
+                  class="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md border border-dashed border-border/60 bg-muted/20 px-2.5 text-sm text-muted-foreground"
+                  aria-label={`${location.name}, hidden from Cloud Storage`}
+                >
+                  <CloudIcon class="size-4 shrink-0 opacity-60" />
+                  <span class="min-w-0 flex-1 truncate">{location.name}</span>
+                </div>
+              {/if}
+              {#if state.editingSyncedFolders && !compact}
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  class={visibleSyncedFolder
+                    ? "text-muted-foreground hover:text-destructive"
+                    : "text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"}
+                  title={visibleSyncedFolder
+                    ? `Hide ${location.name} from Cloud Storage`
+                    : `Show ${location.name} in Cloud Storage`}
+                  aria-label={visibleSyncedFolder
+                    ? `Hide ${location.name} from Cloud Storage`
+                    : `Show ${location.name} in Cloud Storage`}
+                  onclick={() =>
+                    state.setSyncedFolderVisible(
+                      location.id,
+                      !visibleSyncedFolder,
+                    )}
+                >
+                  {#if visibleSyncedFolder}<CircleMinusIcon
+                    />{:else}<CirclePlusIcon />{/if}
+                </Button>
+              {/if}
+            </div>
+          {/each}
+        </nav>
+        {#if !compact && !state.editingSyncedFolders && state.visibleSyncedFolderLocations.length === 0}
+          <p class="px-2 py-2 text-xs text-muted-foreground">
+            All cloud storage locations are hidden. Configure Cloud Storage to
+            show one.
+          </p>
+        {/if}
+      {/if}
+
       <div
         class={cn(
           "group/ssh flex items-center pt-5 pb-1",
@@ -334,6 +485,7 @@
                   if (state.editingSshTargets) finishEditingSshTargets();
                   else {
                     finishEditingFavorites();
+                    finishEditingSyncedFolders();
                     state.editingSshTargets = true;
                   }
                 }}
@@ -503,6 +655,7 @@
     aria-label={state.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
     onclick={() => {
       finishEditingFavorites();
+      finishEditingSyncedFolders();
       finishEditingSshTargets();
       state.setSidebarCollapsed(!state.sidebarCollapsed);
     }}

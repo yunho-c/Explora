@@ -52,7 +52,7 @@ describe("ExplorerShell", () => {
     expect(document.querySelector(".explora-sidebar-scroll")).toHaveClass(
       "overflow-y-auto",
     );
-    for (const header of ["Favorites", "SSH"]) {
+    for (const header of ["Favorites", "Cloud Storage", "SSH"]) {
       expect(
         screen.getByText(header, { exact: true }).parentElement,
       ).toHaveClass("pl-2");
@@ -236,6 +236,73 @@ describe("ExplorerShell", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("menuitem", { name: "Remove" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows discovered cloud storage and persists per-root visibility", async () => {
+    const preferences = new MemoryPreferencesDataSource();
+    const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
+    await state.initialize();
+    renderShell(state);
+    const cloudStorage = within(
+      screen.getByRole("navigation", { name: "Cloud storage" }),
+    );
+
+    expect(
+      cloudStorage.getByRole("button", { name: "iCloud Drive available" }),
+    ).toBeInTheDocument();
+    expect(
+      cloudStorage.getByRole("button", { name: "OneDrive available" }),
+    ).toBeInTheDocument();
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Configure cloud storage" }),
+    );
+    await fireEvent.click(
+      cloudStorage.getByRole("button", {
+        name: "Hide OneDrive from Cloud Storage",
+      }),
+    );
+
+    await waitFor(async () =>
+      expect(
+        (await preferences.getPreferences()).preferences.layout
+          .hiddenSyncedFolderIds,
+      ).toEqual(["synced:onedrive"]),
+    );
+    expect(
+      cloudStorage.getByLabelText("OneDrive, hidden from Cloud Storage"),
+    ).toHaveClass("border-dashed");
+    expect(
+      state.syncedFolderLocations.find(({ id }) => id === "synced:onedrive")
+        ?.status,
+    ).toBe("available");
+
+    await fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Configure cloud storage" }),
+      ).toHaveFocus(),
+    );
+  });
+
+  it("labels online-only entries and requires a download before preview", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    await state.selectLocation("synced:icloud");
+    renderShell(state);
+
+    const entry = screen.getByText("Reference library.pdf");
+    expect(
+      entry.parentElement?.querySelector("[aria-label='Online only']"),
+    ).toBeInTheDocument();
+    await fireEvent.click(entry);
+    await fireEvent.keyDown(window, { key: " " });
+
+    const previewDialog = await screen.findByRole("dialog");
+    expect(
+      await within(previewDialog).findByText(
+        "Download this file before opening Quick Preview.",
+      ),
     ).toBeInTheDocument();
   });
 

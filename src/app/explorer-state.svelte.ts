@@ -12,6 +12,7 @@ import type {
   SshTargetSummary,
   SortColumn,
   SortDescriptor,
+  SyncedFolderSnapshot,
   ViewMode,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
@@ -83,14 +84,17 @@ export class ExplorerState {
   warningMessage = $state<string | null>(null);
   preferencesWarningMessage = $state<string | null>(null);
   volumeWarningMessage = $state<string | null>(null);
+  syncedFolderWarningMessage = $state<string | null>(null);
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
   imagePreviewMode = $state<ImagePreviewMode>("direct");
   sidebarCollapsed = $state(false);
   favoriteRoles = $state<FavoriteRole[]>([...DEFAULT_FAVORITE_ROLES]);
+  hiddenSyncedFolderIds = $state<string[]>([]);
   hiddenSshTargetIds = $state<string[]>([]);
   editingFavorites = $state(false);
+  editingSyncedFolders = $state(false);
   editingSshTargets = $state(false);
   mobileSidebarOpen = $state(false);
   sshTargetDialogOpen = $state(false);
@@ -106,7 +110,9 @@ export class ExplorerState {
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
   private volumeWatchController: AbortController | null = null;
+  private syncedFolderWatchController: AbortController | null = null;
   private volumeRevision = -1;
+  private syncedFolderRevision = -1;
   private tabSequence = 0;
   private preferencesInitialization: Promise<void> | null = null;
   private preferenceWriteQueue: Promise<void> = Promise.resolve();
@@ -133,6 +139,13 @@ export class ExplorerState {
   get activeSshLocationOffline(): boolean {
     const target = this.activeSshTarget;
     return Boolean(target && target.status !== "connected");
+  }
+
+  get activeSyncedFolderOffline(): boolean {
+    return Boolean(
+      this.activeLocation?.kind === "syncedFolder" &&
+      this.activeLocation.status === "offline",
+    );
   }
 
   get activeDirectory(): DirectoryRef | undefined {
@@ -204,6 +217,16 @@ export class ExplorerState {
     );
   }
 
+  get syncedFolderLocations(): LocationSummary[] {
+    return this.locations.filter(({ kind }) => kind === "syncedFolder");
+  }
+
+  get visibleSyncedFolderLocations(): LocationSummary[] {
+    return this.syncedFolderLocations.filter(
+      ({ id }) => !this.hiddenSyncedFolderIds.includes(id),
+    );
+  }
+
   get visibleSshTargets(): SshTargetSummary[] {
     return this.sshTargets.filter(
       ({ id }) => !this.hiddenSshTargetIds.includes(id),
@@ -228,6 +251,7 @@ export class ExplorerState {
       this.locations = [...locations];
       this.sshTargets = [...sshTargets];
       this.startVolumeWatch();
+      this.startSyncedFolderWatch();
       const initialLocation = this.locations[0];
 
       if (!initialLocation) {
@@ -257,6 +281,7 @@ export class ExplorerState {
     this.previewController?.abort();
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();
+    this.syncedFolderWatchController?.abort();
   }
 
   private startVolumeWatch(): void {
@@ -348,6 +373,103 @@ export class ExplorerState {
     }
   }
 
+  private startSyncedFolderWatch(): void {
+    this.syncedFolderWatchController?.abort();
+    const controller = new AbortController();
+    this.syncedFolderWatchController = controller;
+    void this.dataSource
+      .watchSyncedFolders({
+        signal: controller.signal,
+        onSnapshot: (snapshot) => void this.applySyncedFolderSnapshot(snapshot),
+      })
+      .catch((error: unknown) => {
+        if (
+          isAbortError(error) ||
+          this.syncedFolderWatchController !== controller
+        )
+          return;
+        this.syncedFolderWarningMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not watch synced folders.";
+      });
+  }
+
+  private async applySyncedFolderSnapshot(
+    snapshot: SyncedFolderSnapshot,
+  ): Promise<void> {
+    if (snapshot.revision <= this.syncedFolderRevision) return;
+    this.syncedFolderRevision = snapshot.revision;
+    this.syncedFolderWarningMessage = snapshot.warning;
+
+    const previousFolders = this.locations.filter(
+      ({ kind }) => kind === "syncedFolder",
+    );
+    const offlineFolders = previousFolders
+      .filter(
+        ({ id }) =>
+          !snapshot.folders.some((folder) => folder.id === id) &&
+          this.tabs.some(({ locationId }) => locationId === id),
+      )
+      .map((location) => ({
+        ...location,
+        status: "offline" as const,
+        detail: "Synced folder unavailable",
+        syncedFolder: location.syncedFolder
+          ? { ...location.syncedFolder, status: "offline" as const }
+          : null,
+      }));
+    this.locations = [
+      ...this.locations.filter(({ kind }) => kind !== "syncedFolder"),
+      ...snapshot.folders,
+      ...offlineFolders,
+    ];
+
+    const activeTab = this.activeTab;
+    const removedActiveFolder = activeTab
+      ? offlineFolders.find(({ id }) => id === activeTab.locationId)
+      : undefined;
+    if (removedActiveFolder) {
+      this.directoryController?.abort();
+      this.previewController?.abort();
+      this.loading = false;
+      this.warningMessage = `“${removedActiveFolder.name}” is no longer available. Restart its sync provider to continue.`;
+    }
+
+    const restoredIds = snapshot.folders
+      .filter(
+        ({ id }) =>
+          previousFolders.find((location) => location.id === id)?.status ===
+          "offline",
+      )
+      .map(({ id }) => id);
+    if (restoredIds.length === 0) return;
+
+    for (const tab of this.tabs) {
+      if (!restoredIds.includes(tab.locationId)) continue;
+      const folder = snapshot.folders.find(({ id }) => id === tab.locationId);
+      if (!folder) continue;
+      tab.directory = folder.root;
+      tab.history = [folder.root];
+      tab.historyIndex = 0;
+      tab.title = folder.name;
+    }
+    if (activeTab && restoredIds.includes(activeTab.locationId)) {
+      const folder = snapshot.folders.find(
+        ({ id }) => id === activeTab.locationId,
+      );
+      if (folder) {
+        this.warningMessage = null;
+        await this.loadDirectory(folder.root, (directory) => {
+          activeTab.directory = directory;
+          activeTab.history = [directory];
+          activeTab.historyIndex = 0;
+          activeTab.title = directory.name;
+        });
+      }
+    }
+  }
+
   initializePreferences(): Promise<void> {
     this.preferencesInitialization ??= this.loadPreferences();
     return this.preferencesInitialization;
@@ -363,6 +485,9 @@ export class ExplorerState {
       this.viewMode = snapshot.preferences.layout.viewMode;
       this.sort = { ...snapshot.preferences.layout.sort };
       this.favoriteRoles = [...snapshot.preferences.layout.favoriteRoles];
+      this.hiddenSyncedFolderIds = [
+        ...snapshot.preferences.layout.hiddenSyncedFolderIds,
+      ];
       this.hiddenSshTargetIds = [
         ...snapshot.preferences.layout.hiddenSshTargetIds,
       ];
@@ -838,6 +963,16 @@ export class ExplorerState {
     this.persistLayoutPreferences({ hiddenSshTargetIds });
   }
 
+  setSyncedFolderVisible(folderId: string, visible: boolean): void {
+    const hiddenSyncedFolderIds = visible
+      ? this.hiddenSyncedFolderIds.filter((id) => id !== folderId)
+      : this.hiddenSyncedFolderIds.includes(folderId)
+        ? [...this.hiddenSyncedFolderIds]
+        : [...this.hiddenSyncedFolderIds, folderId].sort();
+    this.hiddenSyncedFolderIds = hiddenSyncedFolderIds;
+    this.persistLayoutPreferences({ hiddenSyncedFolderIds });
+  }
+
   selectEntry(entryId: string): void {
     this.selectedEntryId = entryId;
   }
@@ -990,6 +1125,10 @@ export class ExplorerState {
     const location = this.locations.find(({ id }) => id === target.locationId);
     if (location?.kind === "volume" && location.status === "offline") {
       this.warningMessage = `“${location.name}” is no longer available. Reconnect the volume to continue.`;
+      return false;
+    }
+    if (location?.kind === "syncedFolder" && location.status === "offline") {
+      this.warningMessage = `“${location.name}” is no longer available. Restart its sync provider to continue.`;
       return false;
     }
     this.directoryController?.abort();

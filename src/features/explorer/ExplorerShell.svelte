@@ -1,4 +1,5 @@
 <script lang="ts">
+  import CloudOffIcon from "@lucide/svelte/icons/cloud-off";
   import SearchIcon from "@lucide/svelte/icons/search";
   import ServerOffIcon from "@lucide/svelte/icons/server-off";
 
@@ -136,6 +137,22 @@
           >
             Reconnect
           </Button>
+        </div>
+      {/if}
+
+      {#if state.activeSyncedFolderOffline}
+        <div
+          class="mx-4 mt-4 flex items-center gap-3 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+        >
+          <CloudOffIcon class="size-4 shrink-0 text-muted-foreground" />
+          <div class="min-w-0 flex-1">
+            <p class="font-medium">Cloud storage is offline</p>
+            <p class="truncate text-xs text-muted-foreground">
+              Your folder and tab history are preserved. Restart the sync
+              provider to continue.
+            </p>
+          </div>
         </div>
       {/if}
 

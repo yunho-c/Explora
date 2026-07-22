@@ -1,9 +1,13 @@
 <script lang="ts">
   import ArrowDownIcon from "@lucide/svelte/icons/arrow-down";
   import ArrowUpIcon from "@lucide/svelte/icons/arrow-up";
+  import CloudDownloadIcon from "@lucide/svelte/icons/cloud-download";
 
   import type { ExplorerState } from "../../app/explorer-state.svelte";
-  import type { SortColumn } from "$lib/contracts/explorer";
+  import type {
+    ContentAvailability,
+    SortColumn,
+  } from "$lib/contracts/explorer";
   import * as ContextMenu from "$lib/components/ui/context-menu";
   import { formatFileSize } from "$lib/file-metadata";
   import * as Table from "$lib/components/ui/table";
@@ -26,6 +30,18 @@
     if (state.sort.column !== column) return "";
     return state.sort.direction === "ascending" ? "ascending" : "descending";
   };
+
+  const availabilityLabels: Partial<Record<ContentAvailability, string>> = {
+    onlineOnly: "Online only",
+    partial: "Partially downloaded",
+    downloading: "Downloading",
+    syncing: "Syncing",
+    error: "Sync error",
+    unknown: "Availability unknown",
+  };
+
+  const availabilityLabel = (availability: ContentAvailability) =>
+    availabilityLabels[availability];
 </script>
 
 <ContextMenu.Root>
@@ -99,7 +115,15 @@
               <div class="flex min-w-0 items-center gap-3">
                 <FileGlyph kind={entry.contentKind} size="sm" />
                 <div class="min-w-0">
-                  <p class="truncate font-medium">{entry.name}</p>
+                  <p class="flex min-w-0 items-center gap-1.5 font-medium">
+                    <span class="truncate">{entry.name}</span>
+                    {#if availabilityLabel(entry.availability)}
+                      <CloudDownloadIcon
+                        class="size-3.5 shrink-0 text-muted-foreground"
+                        aria-label={availabilityLabel(entry.availability)}
+                      />
+                    {/if}
+                  </p>
                   {#if entry.detail}<p
                       class="truncate text-xs text-muted-foreground sm:hidden"
                     >

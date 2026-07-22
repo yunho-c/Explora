@@ -125,6 +125,28 @@ test("opens a discovered volume from Locations", async ({ page }) => {
   ).toHaveAttribute("aria-current", "page");
 });
 
+test("browses cloud storage without implicitly downloading content", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  const cloudStorage = page.getByRole("navigation", {
+    name: "Cloud storage",
+  });
+  await expect(page.getByText("Cloud Storage", { exact: true })).toBeVisible();
+  await cloudStorage
+    .getByRole("button", { name: "iCloud Drive available" })
+    .click();
+  await expect(page.getByText("Reference library.pdf")).toBeVisible();
+  await expect(page.getByLabel("Online only")).toBeVisible();
+
+  await page.getByText("Reference library.pdf").click();
+  await page.keyboard.press("Space");
+  await expect(page.getByRole("dialog")).toContainText(
+    "Download this file before opening Quick Preview.",
+  );
+});
+
 test("configures standard favorites from the section header", async ({
   page,
 }) => {

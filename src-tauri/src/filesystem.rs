@@ -21,6 +21,7 @@ pub enum ImagePreviewMode {
 #[serde(rename_all = "camelCase")]
 pub enum PreviewUnavailableReason {
     Unsupported,
+    DownloadRequired,
     Remote,
     Directory,
     Symlink,
@@ -81,7 +82,55 @@ pub enum LocationRole {
     Music,
     Videos,
     Volume,
+    SyncedFolder,
     Ssh,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocationBackend {
+    Local,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+pub enum SyncedFolderProvider {
+    ICloud,
+    OneDrive,
+    GoogleDrive,
+    Other,
+}
+
+impl SyncedFolderProvider {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::ICloud => "iCloud Drive",
+            Self::OneDrive => "OneDrive",
+            Self::GoogleDrive => "Google Drive",
+            Self::Other => "Cloud Storage",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+// Phase 1 defines the complete IPC vocabulary before every native adapter can
+// authoritatively emit each state.
+#[allow(dead_code)]
+pub enum SyncedFolderStatus {
+    Available,
+    Offline,
+    Paused,
+    Error,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncedFolderMetadataDto {
+    pub provider: SyncedFolderProvider,
+    pub status: SyncedFolderStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,12 +161,14 @@ pub struct BreadcrumbSegmentDto {
 pub struct LocationSummaryDto {
     pub id: String,
     pub name: String,
+    pub backend: LocationBackend,
     pub kind: &'static str,
     pub role: LocationRole,
     pub status: &'static str,
     pub display_path: String,
     pub detail: String,
     pub root: DirectoryRefDto,
+    pub synced_folder: Option<SyncedFolderMetadataDto>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -131,6 +182,7 @@ pub struct FileEntrySummaryDto {
     pub modified_at: Option<u64>,
     pub display_path: String,
     pub directory: Option<DirectoryRefDto>,
+    pub availability: &'static str,
     pub detail: Option<&'static str>,
 }
 
