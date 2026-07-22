@@ -561,16 +561,35 @@ and refresh. Cross-location remote moves remain Phase 6 transfers.
 - Report partial completion when the verified copy remains but source deletion
   fails.
 
-Implementation is in progress. The first backend slice adds an owned local
-partial-file lifecycle and a coordinator path for regular-file moves between two
-local locations. Partial files are created exclusively with least-privilege
-permissions, written in bounded 256 KiB chunks, synchronized, finalized with a
-no-replace relocation, reopened for byte-for-byte verification, and removed
-automatically on copy, cancellation, finalization, or verification failure. The
-source is revalidated and removed only after verification; a failed source
-removal preserves both copies and reports partial completion. This path remains
-unexposed in the destination chooser until byte progress, directories, symlinks,
-and every local/SFTP direction use the same safe contract.
+Implementation is in progress. The local-to-local slice supports regular files,
+directory trees, and symbolic links without following link targets. It snapshots
+at most 100,000 entries and 256 levels, aggregates regular-file byte totals,
+copies in bounded 256 KiB chunks, and checks cancellation between entries and
+chunks. Owned partial files and trees use least-privilege creation, synchronize
+file contents, finalize with a no-replace relocation, and clean themselves up on
+copy, cancellation, finalization, or verification failure. Verification compares
+the complete source and destination structure, link targets, metadata identity,
+and every regular-file byte before source removal. Deletion removes only entries
+from the verified snapshot, so a late-arriving child is preserved and produces a
+partial result instead of being deleted without a copy. A failed source removal
+preserves the verified destination and reports partial completion. This path
+remains unexposed in the destination chooser until every local/SFTP direction
+uses the same safe contract.
+
+Regular-file streaming is implemented in every direction: local to SFTP, SFTP
+to local, and SFTP to SFTP, in addition to local to local. Remote destinations
+use exclusive, owner-only `.explora-partial-*` files. The coordinator streams and
+reports bounded byte progress, flushes the partial, reopens both endpoints for a
+byte-for-byte comparison, revalidates the source, and only then assigns the final
+name without replacement. A cancellation or changed source abandons the hidden
+partial and preserves the source. Remote finalization that loses its
+acknowledgement is never replayed; Explora reports an uncertain outcome and
+requires a refresh. After successful finalization, source deletion runs exactly
+once. A rejected source deletion preserves the verified destination and reports
+partial completion. SFTP-to-local transfers translate ordinary permission bits
+without copying special mode bits. Remote directory and symbolic-link transfer
+manifests remain to be implemented before cross-location destinations are
+enabled in the UI.
 
 ### Phase 7: Multi-selection
 

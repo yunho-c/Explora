@@ -6,6 +6,7 @@ mod local_relocate;
 mod platform_trash;
 mod preferences;
 mod preview;
+mod remote_transfer;
 mod ssh;
 mod ssh_targets;
 #[cfg(test)]

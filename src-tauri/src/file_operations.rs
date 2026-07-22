@@ -9,6 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::{
@@ -17,11 +18,15 @@ use crate::{
         PROMPT_TIMEOUT,
     },
     local_filesystem::{
-        LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, RemovedLocalEntry,
-        TransferredLocalEntry,
+        LocalFilesystem, LocalMoveConflictPolicy, MovedLocalEntry, PreparedLocalFileDestination,
+        PreparedLocalFileTransfer, RemovedLocalEntry, TransferredLocalEntry,
     },
     platform_trash::{PlatformTrash, SystemPlatformTrash},
-    ssh::{MovedRemoteEntry, RemoteMoveConflictPolicy, RemovedRemoteEntry, SshConnectionManager},
+    ssh::{
+        MovedRemoteEntry, PreparedRemoteFileDestination, PreparedRemoteFileTransfer,
+        RemoteMoveConflictPolicy, RemovedRemoteEntry, SshConnectionManager,
+    },
+    transfer::TRANSFER_CHUNK_BYTES,
 };
 
 const MAX_OPERATION_SOURCES: usize = 1;
@@ -479,6 +484,7 @@ pub struct FileOperationCoordinator {
     // The first slices serialize mutations. Later transfer phases can replace
     // this with subtree-aware guards without changing the operation contract.
     execution_guard: Mutex<()>,
+    transfer_guard: tokio::sync::Mutex<()>,
     platform_trash: Arc<dyn PlatformTrash>,
 }
 
@@ -493,6 +499,7 @@ impl FileOperationCoordinator {
         Self {
             active: Mutex::new(HashMap::new()),
             execution_guard: Mutex::new(()),
+            transfer_guard: tokio::sync::Mutex::new(()),
             platform_trash,
         }
     }
@@ -545,7 +552,13 @@ impl FileOperationCoordinator {
 
         let coordinator = self.clone();
         let task_operation_id = operation_id.clone();
-        if request.sources[0].location_id.starts_with("ssh:") {
+        let uses_remote_backend = request.sources[0].location_id.starts_with("ssh:")
+            || matches!(
+                &request.action,
+                FileOperationActionDto::Move { destination }
+                    if destination.location_id.starts_with("ssh:")
+            );
+        if uses_remote_backend {
             tauri::async_runtime::spawn(async move {
                 let mut events = OperationEventEmitter {
                     operation_id: task_operation_id.clone(),
@@ -557,9 +570,15 @@ impl FileOperationCoordinator {
                     total_bytes: None,
                     channel: on_event,
                 };
-                let result = coordinator
-                    .run_remote(&ssh, &request, &active, &mut events)
-                    .await;
+                let result = if request.sources[0].location_id.starts_with("ssh:") {
+                    coordinator
+                        .run_remote(local.clone(), &ssh, &request, active.clone(), &mut events)
+                        .await
+                } else {
+                    coordinator
+                        .run_local_to_remote(local, ssh, &request, active.clone(), &mut events)
+                        .await
+                };
                 active.clear_prompt();
                 events.terminal(result);
                 coordinator.finish(&task_operation_id);
@@ -759,7 +778,7 @@ impl FileOperationCoordinator {
         let transfer = |policy, events: &mut OperationEventEmitter| {
             let mut last_emitted = 0_u64;
             self.with_execution_guard(|| {
-                local.transfer_file_to_local_location(
+                local.transfer_entry_to_local_location(
                     source,
                     destination,
                     policy,
@@ -826,11 +845,449 @@ impl FileOperationCoordinator {
         }
     }
 
-    async fn run_remote(
+    async fn run_local_to_remote(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: Arc<SshConnectionManager>,
+        request: &FileOperationRequestDto,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        let _transfer_guard = self.transfer_guard.lock().await;
+        active.ensure_not_cancelled()?;
+        events.running()?;
+        let source = request.sources[0].clone();
+        let FileOperationActionDto::Move { destination } = &request.action else {
+            return Err(ExplorerError::InvalidConfiguration(
+                "Only moves can cross filesystem backends.".to_owned(),
+            ));
+        };
+        if !destination.location_id.starts_with("ssh:") {
+            return Err(ExplorerError::InvalidConfiguration(
+                "The remote transfer destination is not valid.".to_owned(),
+            ));
+        }
+
+        let prepare_local = local.clone();
+        let prepare_active = active.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            prepare_local.prepare_file_transfer_source(&source, &prepare_active.cancelled)
+        })
+        .await
+        .map_err(|_| ExplorerError::StateUnavailable)??;
+
+        match self
+            .transfer_prepared_local_file_to_remote(
+                local.clone(),
+                ssh.clone(),
+                &prepared,
+                destination,
+                RemoteMoveConflictPolicy::Fail,
+                active.clone(),
+                events,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ExplorerError::Conflict) => {
+                let destination_name = ssh.describe_transfer_destination(destination).await?;
+                let prompt_id = Uuid::new_v4().to_string();
+                let decisions = vec![
+                    FileOperationPromptResponseDto::KeepBoth,
+                    FileOperationPromptResponseDto::Skip,
+                    FileOperationPromptResponseDto::Cancel,
+                ];
+                let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                    id: prompt_id,
+                    title: format!("“{}” already exists", prepared.name),
+                    message: format!(
+                        "Choose how to handle the existing item in “{destination_name}”. Nothing will be replaced."
+                    ),
+                    target_name: prepared.name.clone(),
+                    destination_name,
+                    decisions,
+                })?;
+                match active.await_prompt_async(response).await? {
+                    FileOperationPromptResponseDto::KeepBoth => {
+                        events.running()?;
+                        self.transfer_prepared_local_file_to_remote(
+                            local,
+                            ssh,
+                            &prepared,
+                            destination,
+                            RemoteMoveConflictPolicy::KeepBoth,
+                            active,
+                            events,
+                        )
+                        .await
+                    }
+                    FileOperationPromptResponseDto::Skip => {
+                        events.running()?;
+                        Ok(FileOperationOutcomeDto::MoveSkipped {
+                            entry: prepared.source,
+                            name: prepared.name,
+                        })
+                    }
+                    FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::Confirm => {
+                        Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for a move conflict.".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transfer_prepared_local_file_to_remote(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: Arc<SshConnectionManager>,
+        prepared: &PreparedLocalFileTransfer,
+        destination: &DirectoryRefDto,
+        conflict_policy: RemoteMoveConflictPolicy,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        active.ensure_not_cancelled()?;
+        let mut remote = ssh
+            .prepare_file_transfer_destination(
+                destination,
+                &prepared.name,
+                conflict_policy,
+                &active.cancelled,
+            )
+            .await?;
+        let total_bytes = prepared.plan.total_bytes();
+        events.byte_progress(0, total_bytes)?;
+
+        if let Err(error) =
+            copy_and_verify_local_file_to_remote(prepared, &mut remote, &active, events).await
+        {
+            return Err(abandon_remote_after_error(remote, error).await);
+        }
+
+        let revalidate_local = local.clone();
+        let revalidate_prepared = prepared.clone();
+        let revalidate_active = active.clone();
+        if let Err(error) = tokio::task::spawn_blocking(move || {
+            revalidate_local.revalidate_prepared_file_transfer_source(
+                &revalidate_prepared,
+                &revalidate_active.cancelled,
+            )
+        })
+        .await
+        .map_err(|_| ExplorerError::StateUnavailable)?
+        {
+            return Err(abandon_remote_after_error(remote, error).await);
+        }
+
+        if let Err(error) = active.ensure_not_cancelled() {
+            return Err(abandon_remote_after_error(remote, error).await);
+        }
+        let authoritative_destination = remote.destination.clone();
+        let entry = remote.finalize().await?;
+
+        // Remote finalization is irreversible and SFTP cannot prove ownership
+        // of a later replacement path. From here cancellation must not produce
+        // a misleading cancelled state; finish the source decision exactly once.
+        let finish_local = local;
+        let finish_prepared = prepared.clone();
+        let invalidated_entry_ids = tokio::task::spawn_blocking(move || {
+            finish_local.finish_prepared_file_transfer_source(
+                &finish_prepared,
+                &AtomicBool::new(false),
+            )
+        })
+        .await
+        .map_err(|_| ExplorerError::PartialCompletion(
+            "The verified remote copy was kept, but Explora could not establish whether local source cleanup finished."
+                .to_owned(),
+        ))??;
+
+        Ok(FileOperationOutcomeDto::Moved {
+            entry: Box::new(entry),
+            source_parent: prepared.source_parent.clone(),
+            destination: authoritative_destination,
+            rebased_entry_ids: Vec::new(),
+            invalidated_entry_ids,
+        })
+    }
+
+    async fn run_remote_to_remote(
         &self,
         ssh: &SshConnectionManager,
-        request: &FileOperationRequestDto,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
         active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        match self
+            .transfer_remote_file_to_remote(
+                ssh,
+                source,
+                destination,
+                RemoteMoveConflictPolicy::Fail,
+                active,
+                events,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ExplorerError::Conflict) => {
+                let destination_name = ssh.describe_transfer_destination(destination).await?;
+                let source_name = ssh.describe_operation_target(source).await?.0;
+                let prompt_id = Uuid::new_v4().to_string();
+                let decisions = vec![
+                    FileOperationPromptResponseDto::KeepBoth,
+                    FileOperationPromptResponseDto::Skip,
+                    FileOperationPromptResponseDto::Cancel,
+                ];
+                let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                    id: prompt_id,
+                    title: format!("“{source_name}” already exists"),
+                    message: format!(
+                        "Choose how to handle the existing remote item in “{destination_name}”. Nothing will be replaced."
+                    ),
+                    target_name: source_name.clone(),
+                    destination_name,
+                    decisions,
+                })?;
+                match active.await_prompt_async(response).await? {
+                    FileOperationPromptResponseDto::KeepBoth => {
+                        events.running()?;
+                        self.transfer_remote_file_to_remote(
+                            ssh,
+                            source,
+                            destination,
+                            RemoteMoveConflictPolicy::KeepBoth,
+                            active,
+                            events,
+                        )
+                        .await
+                    }
+                    FileOperationPromptResponseDto::Skip => {
+                        events.running()?;
+                        Ok(FileOperationOutcomeDto::MoveSkipped {
+                            entry: source.clone(),
+                            name: source_name,
+                        })
+                    }
+                    FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::Confirm => {
+                        Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for a move conflict.".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transfer_remote_file_to_remote(
+        &self,
+        ssh: &SshConnectionManager,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: RemoteMoveConflictPolicy,
+        active: &ActiveOperation,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        let _transfer_guard = self.transfer_guard.lock().await;
+        active.ensure_not_cancelled()?;
+        let prepared_source = ssh
+            .prepare_file_transfer_source(source, &active.cancelled)
+            .await?;
+        let mut prepared_destination = ssh
+            .prepare_file_transfer_destination(
+                destination,
+                &prepared_source.name,
+                conflict_policy,
+                &active.cancelled,
+            )
+            .await?;
+        events.byte_progress(0, prepared_source.total_bytes)?;
+        if let Err(error) = copy_and_verify_remote_file_to_remote(
+            &prepared_source,
+            &mut prepared_destination,
+            active,
+            events,
+        )
+        .await
+        {
+            return Err(abandon_remote_after_error(prepared_destination, error).await);
+        }
+        if let Err(error) = prepared_source.revalidate().await {
+            return Err(abandon_remote_after_error(prepared_destination, error).await);
+        }
+        if let Err(error) = active.ensure_not_cancelled() {
+            return Err(abandon_remote_after_error(prepared_destination, error).await);
+        }
+        let authoritative_destination = prepared_destination.destination.clone();
+        let entry = prepared_destination.finalize().await?;
+        let source_parent = prepared_source.source_parent.clone();
+        let invalidated_entry_ids = prepared_source.remove_after_verified_transfer().await?;
+        Ok(FileOperationOutcomeDto::Moved {
+            entry: Box::new(entry),
+            source_parent,
+            destination: authoritative_destination,
+            rebased_entry_ids: Vec::new(),
+            invalidated_entry_ids,
+        })
+    }
+
+    async fn run_remote_to_local(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: &SshConnectionManager,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        match self
+            .transfer_remote_file_to_local(
+                local.clone(),
+                ssh,
+                source,
+                destination,
+                LocalMoveConflictPolicy::Fail,
+                active.clone(),
+                events,
+            )
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(ExplorerError::Conflict) => {
+                let source_name = ssh.describe_operation_target(source).await?.0;
+                let describe_local = local.clone();
+                let describe_destination = destination.clone();
+                let destination_name = tokio::task::spawn_blocking(move || {
+                    describe_local.describe_transfer_destination(&describe_destination)
+                })
+                .await
+                .map_err(|_| ExplorerError::StateUnavailable)??;
+                let prompt_id = Uuid::new_v4().to_string();
+                let decisions = vec![
+                    FileOperationPromptResponseDto::KeepBoth,
+                    FileOperationPromptResponseDto::Skip,
+                    FileOperationPromptResponseDto::Cancel,
+                ];
+                let response = active.begin_prompt(prompt_id.clone(), decisions.clone())?;
+                events.awaiting_conflict(FileOperationPromptDto::MoveConflict {
+                    id: prompt_id,
+                    title: format!("“{source_name}” already exists"),
+                    message: format!(
+                        "Choose how to handle the existing item in “{destination_name}”. Nothing will be replaced."
+                    ),
+                    target_name: source_name.clone(),
+                    destination_name,
+                    decisions,
+                })?;
+                match active.await_prompt_async(response).await? {
+                    FileOperationPromptResponseDto::KeepBoth => {
+                        events.running()?;
+                        self.transfer_remote_file_to_local(
+                            local,
+                            ssh,
+                            source,
+                            destination,
+                            LocalMoveConflictPolicy::KeepBoth,
+                            active,
+                            events,
+                        )
+                        .await
+                    }
+                    FileOperationPromptResponseDto::Skip => {
+                        events.running()?;
+                        Ok(FileOperationOutcomeDto::MoveSkipped {
+                            entry: source.clone(),
+                            name: source_name,
+                        })
+                    }
+                    FileOperationPromptResponseDto::Cancel => Err(ExplorerError::Cancelled),
+                    FileOperationPromptResponseDto::Confirm => {
+                        Err(ExplorerError::InvalidConfiguration(
+                            "That response is not valid for a move conflict.".to_owned(),
+                        ))
+                    }
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn transfer_remote_file_to_local(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: &SshConnectionManager,
+        source: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: LocalMoveConflictPolicy,
+        active: Arc<ActiveOperation>,
+        events: &mut OperationEventEmitter,
+    ) -> Result<FileOperationOutcomeDto, ExplorerError> {
+        let _transfer_guard = self.transfer_guard.lock().await;
+        active.ensure_not_cancelled()?;
+        let prepared_source = ssh
+            .prepare_file_transfer_source(source, &active.cancelled)
+            .await?;
+        let prepare_local = local.clone();
+        let prepare_destination = destination.clone();
+        let prepare_name = prepared_source.name.clone();
+        let prepare_active = active.clone();
+        let mut prepared_destination = tokio::task::spawn_blocking(move || {
+            prepare_local.prepare_file_transfer_destination(
+                &prepare_destination,
+                &prepare_name,
+                conflict_policy,
+                &prepare_active.cancelled,
+            )
+        })
+        .await
+        .map_err(|_| ExplorerError::StateUnavailable)??;
+        events.byte_progress(0, prepared_source.total_bytes)?;
+        copy_and_verify_remote_file_to_local(
+            &prepared_source,
+            &mut prepared_destination,
+            &active,
+            events,
+        )
+        .await?;
+        prepared_source.revalidate().await?;
+        active.ensure_not_cancelled()?;
+
+        let finalize_local = local;
+        let source_permissions = prepared_source.permissions;
+        let (entry, authoritative_destination) = tokio::task::spawn_blocking(move || {
+            finalize_local.finalize_received_file(prepared_destination, source_permissions)
+        })
+        .await
+        .map_err(|_| ExplorerError::StateUnavailable)??;
+        let source_parent = prepared_source.source_parent.clone();
+        let invalidated_entry_ids = prepared_source.remove_after_verified_transfer().await?;
+        Ok(FileOperationOutcomeDto::Moved {
+            entry: Box::new(entry),
+            source_parent,
+            destination: authoritative_destination,
+            rebased_entry_ids: Vec::new(),
+            invalidated_entry_ids,
+        })
+    }
+
+    async fn run_remote(
+        &self,
+        local: Arc<LocalFilesystem>,
+        ssh: &SshConnectionManager,
+        request: &FileOperationRequestDto,
+        active: Arc<ActiveOperation>,
         events: &mut OperationEventEmitter,
     ) -> Result<FileOperationOutcomeDto, ExplorerError> {
         active.ensure_not_cancelled()?;
@@ -845,6 +1302,23 @@ impl FileOperationCoordinator {
                     entry: Box::new(entry),
                 }),
             FileOperationActionDto::Move { destination } => {
+                if destination.location_id != source.location_id {
+                    if destination.location_id.starts_with("ssh:") {
+                        return self
+                            .run_remote_to_remote(ssh, source, destination, &active, events)
+                            .await;
+                    }
+                    return self
+                        .run_remote_to_local(
+                            local,
+                            ssh,
+                            source,
+                            destination,
+                            active.clone(),
+                            events,
+                        )
+                        .await;
+                }
                 match ssh
                     .move_entry(
                         source,
@@ -965,6 +1439,346 @@ impl FileOperationCoordinator {
         if let Ok(mut active) = self.active.lock() {
             active.remove(operation_id);
         }
+    }
+}
+
+async fn copy_and_verify_local_file_to_remote(
+    prepared: &PreparedLocalFileTransfer,
+    remote: &mut PreparedRemoteFileDestination,
+    active: &ActiveOperation,
+    events: &mut OperationEventEmitter,
+) -> Result<(), ExplorerError> {
+    let total_bytes = prepared.plan.total_bytes();
+    let mut source = tokio::fs::File::open(prepared.plan.source_root())
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not open the local transfer source.".to_owned(),
+            kind: error.kind(),
+        })?;
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut completed = 0_u64;
+    let mut last_emitted = 0_u64;
+    while completed < total_bytes {
+        active.ensure_not_cancelled()?;
+        let remaining = usize::try_from((total_bytes - completed).min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let read = source
+            .read(&mut buffer[..remaining])
+            .await
+            .map_err(|error| ExplorerError::Io {
+                message: "Explora could not read the local transfer source.".to_owned(),
+                kind: error.kind(),
+            })?;
+        if read == 0 {
+            return Err(ExplorerError::SourceChanged);
+        }
+        completed = remote.write_chunk(&buffer[..read]).await?;
+        if completed == total_bytes
+            || completed.saturating_sub(last_emitted) >= BYTE_PROGRESS_EVENT_INTERVAL
+        {
+            last_emitted = completed;
+            events.byte_progress(completed, total_bytes)?;
+        }
+    }
+    let mut extra = [0_u8; 1];
+    if source
+        .read(&mut extra)
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not finish reading the local transfer source.".to_owned(),
+            kind: error.kind(),
+        })?
+        != 0
+    {
+        return Err(ExplorerError::SourceChanged);
+    }
+    if remote.bytes_written()? != total_bytes {
+        return Err(ExplorerError::Unexpected(
+            "The remote partial file has an unexpected size.".to_owned(),
+        ));
+    }
+    active.ensure_not_cancelled()?;
+    remote.close_for_verification().await?;
+
+    let mut source = tokio::fs::File::open(prepared.plan.source_root())
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not reopen the local transfer source.".to_owned(),
+            kind: error.kind(),
+        })?;
+    let mut destination = remote.open_partial_for_verification().await?;
+    let mut source_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut destination_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        active.ensure_not_cancelled()?;
+        let chunk = usize::try_from(remaining.min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        source
+            .read_exact(&mut source_buffer[..chunk])
+            .await
+            .map_err(|_| ExplorerError::SourceChanged)?;
+        destination
+            .read_exact(&mut destination_buffer[..chunk])
+            .await
+            .map_err(|_| {
+                ExplorerError::Unexpected(
+                    "The remote partial file ended before verification completed.".to_owned(),
+                )
+            })?;
+        if source_buffer[..chunk] != destination_buffer[..chunk] {
+            return Err(ExplorerError::SourceChanged);
+        }
+        remaining -= chunk as u64;
+    }
+    let source_extra = source
+        .read(&mut extra)
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not finish verifying the local source.".to_owned(),
+            kind: error.kind(),
+        })?;
+    let destination_extra = destination.read(&mut extra).await.map_err(|_| {
+        ExplorerError::Offline(
+            "The SSH connection was lost while verifying the remote partial file.".to_owned(),
+        )
+    })?;
+    if source_extra != 0 {
+        return Err(ExplorerError::SourceChanged);
+    }
+    if destination_extra != 0 {
+        return Err(ExplorerError::Unexpected(
+            "The remote partial file grew during verification.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn copy_and_verify_remote_file_to_remote(
+    source: &PreparedRemoteFileTransfer,
+    destination: &mut PreparedRemoteFileDestination,
+    active: &ActiveOperation,
+    events: &mut OperationEventEmitter,
+) -> Result<(), ExplorerError> {
+    let total_bytes = source.total_bytes;
+    let mut source_file = source.open_for_read().await?;
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut completed = 0_u64;
+    let mut last_emitted = 0_u64;
+    while completed < total_bytes {
+        active.ensure_not_cancelled()?;
+        let chunk = usize::try_from((total_bytes - completed).min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let read = source_file.read(&mut buffer[..chunk]).await.map_err(|_| {
+            source.connection_error(
+                "The SSH connection was lost while reading the remote transfer source.",
+            )
+        })?;
+        if read == 0 {
+            return Err(ExplorerError::SourceChanged);
+        }
+        completed = destination.write_chunk(&buffer[..read]).await?;
+        if completed == total_bytes
+            || completed.saturating_sub(last_emitted) >= BYTE_PROGRESS_EVENT_INTERVAL
+        {
+            last_emitted = completed;
+            events.byte_progress(completed, total_bytes)?;
+        }
+    }
+    let mut extra = [0_u8; 1];
+    if source_file.read(&mut extra).await.map_err(|_| {
+        source
+            .connection_error("The SSH connection was lost while finishing the remote source read.")
+    })? != 0
+    {
+        return Err(ExplorerError::SourceChanged);
+    }
+    if destination.bytes_written()? != total_bytes {
+        return Err(ExplorerError::Unexpected(
+            "The remote partial file has an unexpected size.".to_owned(),
+        ));
+    }
+    active.ensure_not_cancelled()?;
+    destination.close_for_verification().await?;
+
+    let mut source_file = source.open_for_read().await?;
+    let mut destination_file = destination.open_partial_for_verification().await?;
+    let mut source_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut destination_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        active.ensure_not_cancelled()?;
+        let chunk = usize::try_from(remaining.min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        source_file
+            .read_exact(&mut source_buffer[..chunk])
+            .await
+            .map_err(|_| ExplorerError::SourceChanged)?;
+        destination_file
+            .read_exact(&mut destination_buffer[..chunk])
+            .await
+            .map_err(|_| {
+                destination.connection_error(
+                    "The SSH connection was lost while verifying the remote transfer destination.",
+                )
+            })?;
+        if source_buffer[..chunk] != destination_buffer[..chunk] {
+            return Err(ExplorerError::SourceChanged);
+        }
+        remaining -= chunk as u64;
+    }
+    let source_extra = source_file.read(&mut extra).await.map_err(|_| {
+        source.connection_error("The SSH connection was lost while finishing source verification.")
+    })?;
+    let destination_extra = destination_file.read(&mut extra).await.map_err(|_| {
+        destination.connection_error(
+            "The SSH connection was lost while finishing destination verification.",
+        )
+    })?;
+    if source_extra != 0 {
+        return Err(ExplorerError::SourceChanged);
+    }
+    if destination_extra != 0 {
+        return Err(ExplorerError::Unexpected(
+            "The remote partial file grew during verification.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn copy_and_verify_remote_file_to_local(
+    source: &PreparedRemoteFileTransfer,
+    destination: &mut PreparedLocalFileDestination,
+    active: &ActiveOperation,
+    events: &mut OperationEventEmitter,
+) -> Result<(), ExplorerError> {
+    let total_bytes = source.total_bytes;
+    let mut source_file = source.open_for_read().await?;
+    let local_file = destination.artifact.take_file()?;
+    let mut local_file = tokio::fs::File::from_std(local_file);
+    let mut buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut completed = 0_u64;
+    let mut last_emitted = 0_u64;
+    while completed < total_bytes {
+        active.ensure_not_cancelled()?;
+        let chunk = usize::try_from((total_bytes - completed).min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        let read = source_file.read(&mut buffer[..chunk]).await.map_err(|_| {
+            source.connection_error(
+                "The SSH connection was lost while reading the remote transfer source.",
+            )
+        })?;
+        if read == 0 {
+            return Err(ExplorerError::SourceChanged);
+        }
+        local_file
+            .write_all(&buffer[..read])
+            .await
+            .map_err(|error| ExplorerError::Io {
+                message: "Explora could not write the owned local partial file.".to_owned(),
+                kind: error.kind(),
+            })?;
+        completed = completed.checked_add(read as u64).ok_or_else(|| {
+            ExplorerError::InvalidConfiguration(
+                "The transfer exceeded the supported size.".to_owned(),
+            )
+        })?;
+        if completed == total_bytes
+            || completed.saturating_sub(last_emitted) >= BYTE_PROGRESS_EVENT_INTERVAL
+        {
+            last_emitted = completed;
+            events.byte_progress(completed, total_bytes)?;
+        }
+    }
+    let mut extra = [0_u8; 1];
+    if source_file.read(&mut extra).await.map_err(|_| {
+        source
+            .connection_error("The SSH connection was lost while finishing the remote source read.")
+    })? != 0
+    {
+        return Err(ExplorerError::SourceChanged);
+    }
+    active.ensure_not_cancelled()?;
+    local_file
+        .flush()
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not flush the local partial file.".to_owned(),
+            kind: error.kind(),
+        })?;
+    local_file
+        .sync_all()
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not synchronize the local partial file.".to_owned(),
+            kind: error.kind(),
+        })?;
+    let local_file = local_file.into_std().await;
+    destination.artifact.restore_file(local_file, completed)?;
+
+    let mut source_file = source.open_for_read().await?;
+    let mut local_file = tokio::fs::File::open(destination.artifact.current_path())
+        .await
+        .map_err(|error| ExplorerError::Io {
+            message: "Explora could not reopen the local partial file.".to_owned(),
+            kind: error.kind(),
+        })?;
+    let mut source_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut destination_buffer = vec![0_u8; TRANSFER_CHUNK_BYTES];
+    let mut remaining = total_bytes;
+    while remaining > 0 {
+        active.ensure_not_cancelled()?;
+        let chunk = usize::try_from(remaining.min(TRANSFER_CHUNK_BYTES as u64))
+            .map_err(|_| ExplorerError::StateUnavailable)?;
+        source_file
+            .read_exact(&mut source_buffer[..chunk])
+            .await
+            .map_err(|_| ExplorerError::SourceChanged)?;
+        local_file
+            .read_exact(&mut destination_buffer[..chunk])
+            .await
+            .map_err(|_| {
+                ExplorerError::Unexpected(
+                    "The local partial file ended before verification completed.".to_owned(),
+                )
+            })?;
+        if source_buffer[..chunk] != destination_buffer[..chunk] {
+            return Err(ExplorerError::SourceChanged);
+        }
+        remaining -= chunk as u64;
+    }
+    let source_extra = source_file.read(&mut extra).await.map_err(|_| {
+        source.connection_error("The SSH connection was lost while finishing source verification.")
+    })?;
+    let destination_extra =
+        local_file
+            .read(&mut extra)
+            .await
+            .map_err(|error| ExplorerError::Io {
+                message: "Explora could not finish verifying the local partial file.".to_owned(),
+                kind: error.kind(),
+            })?;
+    if source_extra != 0 {
+        return Err(ExplorerError::SourceChanged);
+    }
+    if destination_extra != 0 {
+        return Err(ExplorerError::Unexpected(
+            "The local partial file grew during verification.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn abandon_remote_after_error(
+    remote: PreparedRemoteFileDestination,
+    original: ExplorerError,
+) -> ExplorerError {
+    match remote.abandon().await {
+        Ok(()) => original,
+        Err(_) => ExplorerError::PartialCompletion(
+            "The local source was preserved, but the remote partial file could not be cleaned up. Reconnect and remove the .explora-partial file before retrying."
+                .to_owned(),
+        ),
     }
 }
 
@@ -1199,7 +2013,15 @@ mod tests {
         server: &TestSshServer,
         manager: Arc<SshConnectionManager>,
     ) -> LocationSummaryDto {
-        let request_id = "operation-remote-connect".to_owned();
+        connect_remote_fixture_as(server, manager, "operation-test-target").await
+    }
+
+    async fn connect_remote_fixture_as(
+        server: &TestSshServer,
+        manager: Arc<SshConnectionManager>,
+        target_id: &str,
+    ) -> LocationSummaryDto {
+        let request_id = format!("operation-remote-connect-{target_id}");
         let response_manager = manager.clone();
         let response_request_id = request_id.clone();
         let channel = Channel::<SshConnectionEventDto>::new(move |body| {
@@ -1221,8 +2043,8 @@ mod tests {
         manager
             .connect(
                 ResolvedSshTarget {
-                    id: "operation-test-target".to_owned(),
-                    name: "Operation test server".to_owned(),
+                    id: target_id.to_owned(),
+                    name: format!("Operation test server {target_id}"),
                     host: server.host().to_owned(),
                     port: server.port(),
                     username: server.username().to_owned(),
@@ -1542,6 +2364,513 @@ mod tests {
             fs::read(temp.path().join("destination/notes.md")).expect("destination bytes"),
             vec![0x33; 600_000]
         );
+    }
+
+    #[tokio::test]
+    async fn coordinator_transfers_a_local_directory_tree_with_aggregate_byte_progress() {
+        let (temp, local, _, destination) = transfer_fixture();
+        fs::create_dir_all(temp.path().join("source/bundle/nested")).expect("source tree");
+        fs::write(
+            temp.path().join("source/bundle/first.bin"),
+            vec![0x21; 300_000],
+        )
+        .expect("first source");
+        fs::write(
+            temp.path().join("source/bundle/nested/second.bin"),
+            vec![0x42; 400_000],
+        )
+        .expect("second source");
+        let source_root = local
+            .locations()
+            .expect("locations")
+            .into_iter()
+            .find(|location| location.id == "operation-source")
+            .expect("source location")
+            .root;
+        let mut source = None;
+        local
+            .list_directory(
+                &source_root.id,
+                &source_root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        source = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "bundle")
+                            .map(|entry| entry.reference);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("source listing");
+        let source = source.expect("bundle entry");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start(
+                local,
+                FileOperationRequestDto {
+                    sources: vec![source.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: destination.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start transfer");
+        wait_for_event(&events, "completed").await;
+
+        let events = events.lock().expect("events");
+        let terminal = events.last().expect("terminal event");
+        assert_eq!(terminal["outcome"]["kind"], "moved");
+        assert_eq!(terminal["completedBytes"], "700000");
+        assert_eq!(terminal["totalBytes"], "700000");
+        assert!(terminal["outcome"]["invalidatedEntryIds"]
+            .as_array()
+            .expect("invalidated source identities")
+            .iter()
+            .any(|id| id == &source.id));
+        assert!(!temp.path().join("source/bundle").exists());
+        assert_eq!(
+            fs::read(temp.path().join("destination/bundle/nested/second.bin"))
+                .expect("destination bytes"),
+            vec![0x42; 400_000]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_uploads_verifies_and_removes_a_local_file_over_sftp() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let (temp, local, source, _) = transfer_fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: remote.root.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start local to SFTP transfer");
+        wait_for_event(&events, "completed").await;
+
+        {
+            let events = events.lock().expect("events");
+            let terminal = events.last().expect("terminal event");
+            assert_eq!(terminal["outcome"]["kind"], "moved");
+            assert_eq!(
+                terminal["outcome"]["entry"]["reference"]["locationId"],
+                remote.id
+            );
+            assert_eq!(terminal["completedBytes"], "600000");
+            assert_eq!(terminal["totalBytes"], "600000");
+            assert!(terminal["outcome"]["invalidatedEntryIds"]
+                .as_array()
+                .expect("invalidated local identities")
+                .iter()
+                .any(|id| id == &source.id));
+        }
+        assert!(!temp.path().join("source/notes.md").exists());
+        assert_eq!(
+            server.read_file("/notes.md").await.expect("uploaded file"),
+            vec![0x33; 600_000]
+        );
+        assert!(!remote_root_entries(&ssh, &remote)
+            .await
+            .iter()
+            .any(|entry| entry.name.starts_with(".explora-partial-")));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_to_sftp_conflict_preserves_both_until_keep_both_is_selected() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let (temp, local, _) = fixture();
+        fs::write(temp.path().join("README.md"), b"uploaded readme").expect("local source");
+        let source = listed_entry_ref(&local, "README.md");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move {
+                        destination: remote.root.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start conflicting transfer");
+        wait_for_event(&events, "awaitingConflict").await;
+
+        assert!(temp.path().join("README.md").exists());
+        assert_eq!(
+            server
+                .read_file("/README.md")
+                .await
+                .expect("existing remote"),
+            vec![0; 128]
+        );
+        let prompt_id = events
+            .lock()
+            .expect("events")
+            .iter()
+            .find(|event| event["event"] == "awaitingConflict")
+            .expect("conflict event")["prompt"]["id"]
+            .as_str()
+            .expect("prompt id")
+            .to_owned();
+        coordinator
+            .respond(
+                &operation_id,
+                &prompt_id,
+                FileOperationPromptResponseDto::KeepBoth,
+            )
+            .expect("keep both response");
+        wait_for_event(&events, "completed").await;
+
+        assert!(!temp.path().join("README.md").exists());
+        assert_eq!(
+            server
+                .read_file("/README copy.md")
+                .await
+                .expect("kept-both upload"),
+            b"uploaded readme"
+        );
+        assert_eq!(
+            server
+                .read_file("/README.md")
+                .await
+                .expect("existing remote"),
+            vec![0; 128]
+        );
+        assert!(!remote_root_entries(&ssh, &remote)
+            .await
+            .iter()
+            .any(|entry| entry.name.starts_with(".explora-partial-")));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_local_to_sftp_copy_removes_the_partial_and_preserves_the_source() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let (temp, local, source, _) = transfer_fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        let operation_id = coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move {
+                        destination: remote.root.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start cancellable transfer");
+        server.wait_for_mutation().await;
+        coordinator.cancel(&operation_id).expect("cancel transfer");
+        wait_for_event(&events, "cancelled").await;
+
+        assert!(temp.path().join("source/notes.md").exists());
+        assert!(!server.path_exists("/notes.md").await);
+        assert!(!remote_root_entries(&ssh, &remote)
+            .await
+            .iter()
+            .any(|entry| entry.name.starts_with(".explora-partial-")));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_source_change_during_sftp_copy_removes_the_partial_and_reports_source_changed() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(100),
+        )
+        .await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let (temp, local, source, _) = transfer_fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+        coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move {
+                        destination: remote.root.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start mutable transfer");
+        server.wait_for_mutation().await;
+        fs::write(temp.path().join("source/notes.md"), b"changed").expect("mutate local source");
+        wait_for_event(&events, "failed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal event")
+            .clone();
+        assert_eq!(terminal["error"]["code"], "sourceChanged");
+        assert_eq!(
+            fs::read(temp.path().join("source/notes.md")).expect("changed source"),
+            b"changed"
+        );
+        assert!(!server.path_exists("/notes.md").await);
+        assert!(!remote_root_entries(&ssh, &remote)
+            .await
+            .iter()
+            .any(|entry| entry.name.starts_with(".explora-partial-")));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_streams_and_verifies_a_file_between_two_sftp_locations() {
+        let source_server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let destination_server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let payload = vec![0x58; 600_000];
+        source_server
+            .write_file("/transfer.bin", payload.clone())
+            .await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let source_location =
+            connect_remote_fixture_as(&source_server, ssh.clone(), "operation-source-target").await;
+        let destination_location = connect_remote_fixture_as(
+            &destination_server,
+            ssh.clone(),
+            "operation-destination-target",
+        )
+        .await;
+        let source = remote_root_entries(&ssh, &source_location)
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "transfer.bin")
+            .expect("remote transfer source")
+            .reference;
+        let (_temp, local, _) = fixture();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: destination_location.root.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start SFTP to SFTP transfer");
+        wait_for_event(&events, "completed").await;
+
+        {
+            let events = events.lock().expect("events");
+            let terminal = events.last().expect("terminal event");
+            assert_eq!(terminal["outcome"]["kind"], "moved");
+            assert_eq!(
+                terminal["outcome"]["entry"]["reference"]["locationId"],
+                destination_location.id
+            );
+            assert_eq!(terminal["completedBytes"], "600000");
+            assert_eq!(terminal["totalBytes"], "600000");
+            assert!(terminal["outcome"]["invalidatedEntryIds"]
+                .as_array()
+                .expect("invalidated remote identities")
+                .iter()
+                .any(|id| id == &source.id));
+        }
+        assert!(!source_server.path_exists("/transfer.bin").await);
+        assert_eq!(
+            destination_server
+                .read_file("/transfer.bin")
+                .await
+                .expect("destination payload"),
+            payload
+        );
+        assert!(!remote_root_entries(&ssh, &destination_location)
+            .await
+            .iter()
+            .any(|entry| entry.name.starts_with(".explora-partial-")));
+        ssh.disconnect("operation-source-target")
+            .await
+            .expect("disconnect source");
+        ssh.disconnect("operation-destination-target")
+            .await
+            .expect("disconnect destination");
+        source_server.shutdown().await;
+        destination_server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coordinator_downloads_verifies_and_removes_an_sftp_file_to_local_storage() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let payload = vec![0x71; 600_000];
+        server.write_file("/download.bin", payload.clone()).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let source = remote_root_entries(&ssh, &remote)
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "download.bin")
+            .expect("remote download source")
+            .reference;
+        let (temp, local, _) = fixture();
+        let destination = destination_fixture(&temp, &local, "downloads");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source.clone()],
+                    action: FileOperationActionDto::Move {
+                        destination: destination.clone(),
+                    },
+                },
+                channel(events.clone()),
+            )
+            .expect("start SFTP to local transfer");
+        wait_for_event(&events, "completed").await;
+
+        {
+            let events = events.lock().expect("events");
+            let terminal = events.last().expect("terminal event");
+            assert_eq!(terminal["outcome"]["kind"], "moved");
+            assert_eq!(
+                terminal["outcome"]["entry"]["reference"]["locationId"],
+                destination.location_id
+            );
+            assert_eq!(terminal["completedBytes"], "600000");
+            assert_eq!(terminal["totalBytes"], "600000");
+            assert!(terminal["outcome"]["invalidatedEntryIds"]
+                .as_array()
+                .expect("invalidated remote identities")
+                .iter()
+                .any(|id| id == &source.id));
+        }
+        assert!(!server.path_exists("/download.bin").await);
+        assert_eq!(
+            fs::read(temp.path().join("downloads/download.bin")).expect("downloaded payload"),
+            payload
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::symlink_metadata(temp.path().join("downloads/download.bin"))
+                    .expect("download metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+        }
+        assert!(fs::read_dir(temp.path().join("downloads"))
+            .expect("download listing")
+            .all(|entry| !entry
+                .expect("download entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".explora-partial-")));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_remote_source_removal_keeps_the_verified_local_destination() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let source = remote_root_entries(&ssh, &remote)
+            .await
+            .into_iter()
+            .find(|entry| entry.name == "locked.txt")
+            .expect("locked remote source")
+            .reference;
+        let (temp, local, _) = fixture();
+        let destination = destination_fixture(&temp, &local, "downloads");
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+
+        coordinator
+            .start_with_backends(
+                local,
+                ssh.clone(),
+                FileOperationRequestDto {
+                    sources: vec![source],
+                    action: FileOperationActionDto::Move { destination },
+                },
+                channel(events.clone()),
+            )
+            .expect("start partial transfer");
+        wait_for_event(&events, "failed").await;
+
+        let terminal = events
+            .lock()
+            .expect("events")
+            .last()
+            .expect("terminal event")
+            .clone();
+        assert_eq!(terminal["error"]["code"], "partialCompletion");
+        assert!(server.path_exists("/locked.txt").await);
+        assert_eq!(
+            fs::read(temp.path().join("downloads/locked.txt")).expect("verified destination"),
+            vec![0; 8]
+        );
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
     }
 
     #[tokio::test]

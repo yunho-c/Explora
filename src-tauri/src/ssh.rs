@@ -27,7 +27,7 @@ use russh_sftp::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::{oneshot, Mutex as AsyncMutex, OwnedMutexGuard};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
@@ -38,6 +38,7 @@ use crate::{
         LocationSummaryDto, CONNECTION_TIMEOUT, LISTING_BATCH_SIZE, PROMPT_TIMEOUT,
         SFTP_REQUEST_TIMEOUT_SECONDS, SSH_KEEPALIVE_INTERVAL, SSH_KEEPALIVE_MAX,
     },
+    remote_transfer::OwnedRemoteFileArtifact,
     ssh_targets::{location_id, ResolvedSshTarget, SshTargetSummaryDto},
 };
 
@@ -452,7 +453,7 @@ struct SshSession {
     paths: Arc<RemotePathRegistry>,
     handle: AsyncMutex<Handle<HostKeyHandler>>,
     sftp: Arc<SftpSession>,
-    mutation_guard: AsyncMutex<()>,
+    mutation_guard: Arc<AsyncMutex<()>>,
     lifecycle: Arc<AtomicU8>,
     events: Arc<Channel<SshConnectionEventDto>>,
 }
@@ -476,6 +477,166 @@ pub struct RemovedRemoteEntry {
     pub reference: EntryRefDto,
     pub name: String,
     pub invalidated_entry_ids: Vec<String>,
+}
+
+pub(crate) struct PreparedRemoteFileDestination {
+    session: Arc<SshSession>,
+    artifact: Option<OwnedRemoteFileArtifact>,
+    pub(crate) destination: DirectoryRefDto,
+    _mutation_guard: OwnedMutexGuard<()>,
+}
+
+pub(crate) struct PreparedRemoteFileTransfer {
+    session: Arc<SshSession>,
+    path: String,
+    fingerprint: RemoteEntryFingerprint,
+    pub(crate) source: EntryRefDto,
+    pub(crate) name: String,
+    pub(crate) source_parent: DirectoryRefDto,
+    pub(crate) total_bytes: u64,
+    pub(crate) permissions: Option<u32>,
+    _mutation_guard: OwnedMutexGuard<()>,
+}
+
+impl PreparedRemoteFileTransfer {
+    pub(crate) fn connection_error(&self, message: &str) -> ExplorerError {
+        self.session.mark_offline();
+        ExplorerError::Offline(message.to_owned())
+    }
+
+    pub(crate) async fn open_for_read(
+        &self,
+    ) -> Result<russh_sftp::client::fs::File, ExplorerError> {
+        let result = self
+            .session
+            .sftp
+            .open(self.path.clone())
+            .await
+            .map_err(map_sftp_error);
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) async fn revalidate(&self) -> Result<(), ExplorerError> {
+        let result =
+            self.session
+                .revalidate_source(&self.source)
+                .await
+                .and_then(|(path, metadata)| {
+                    if path == self.path
+                        && RemoteEntryFingerprint::from(&metadata) == self.fingerprint
+                    {
+                        Ok(())
+                    } else {
+                        Err(ExplorerError::SourceChanged)
+                    }
+                });
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) async fn remove_after_verified_transfer(self) -> Result<Vec<String>, ExplorerError> {
+        match self.session.sftp.remove_file(self.path.clone()).await {
+            Ok(()) => self.session.paths.invalidate_subtree(&self.path),
+            Err(error) if is_sftp_connectivity_error(&error) => {
+                self.session.mark_offline();
+                Err(ExplorerError::OutcomeUncertain(
+                    "The verified destination was kept, but the SSH connection ended while removing the remote source. Reconnect and refresh before retrying."
+                        .to_owned(),
+                ))
+            }
+            Err(_) => Err(ExplorerError::PartialCompletion(
+                "The verified destination was kept, but the remote source could not be removed."
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
+impl PreparedRemoteFileDestination {
+    pub(crate) fn connection_error(&self, message: &str) -> ExplorerError {
+        self.session.mark_offline();
+        ExplorerError::Offline(message.to_owned())
+    }
+
+    pub(crate) fn partial_path(&self) -> Result<&str, ExplorerError> {
+        self.artifact
+            .as_ref()
+            .map(OwnedRemoteFileArtifact::partial_path)
+            .ok_or(ExplorerError::StateUnavailable)
+    }
+
+    pub(crate) async fn write_chunk(&mut self, chunk: &[u8]) -> Result<u64, ExplorerError> {
+        let result = self
+            .artifact
+            .as_mut()
+            .ok_or(ExplorerError::StateUnavailable)?
+            .write_chunk(chunk)
+            .await;
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) fn bytes_written(&self) -> Result<u64, ExplorerError> {
+        self.artifact
+            .as_ref()
+            .map(OwnedRemoteFileArtifact::bytes_written)
+            .ok_or(ExplorerError::StateUnavailable)
+    }
+
+    pub(crate) async fn close_for_verification(&mut self) -> Result<(), ExplorerError> {
+        let result = self
+            .artifact
+            .as_mut()
+            .ok_or(ExplorerError::StateUnavailable)?
+            .close_for_verification()
+            .await;
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) async fn open_partial_for_verification(
+        &self,
+    ) -> Result<russh_sftp::client::fs::File, ExplorerError> {
+        let result = self
+            .session
+            .sftp
+            .open(self.partial_path()?.to_owned())
+            .await
+            .map_err(map_sftp_error);
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) async fn finalize(mut self) -> Result<FileEntrySummaryDto, ExplorerError> {
+        let final_path = match self
+            .artifact
+            .as_mut()
+            .ok_or(ExplorerError::StateUnavailable)?
+            .finalize_no_replace()
+            .await
+        {
+            Ok(path) => path.to_owned(),
+            Err(error) => {
+                if let Some(artifact) = self.artifact.take() {
+                    let _ = artifact.abandon().await;
+                }
+                return finish_remote_result(&self.session, Err(error));
+            }
+        };
+        let artifact = self
+            .artifact
+            .take()
+            .ok_or(ExplorerError::StateUnavailable)?;
+        artifact.preserve();
+        let result = self.session.summary_for_registered_path(&final_path).await;
+        finish_remote_result(&self.session, result)
+    }
+
+    pub(crate) async fn abandon(mut self) -> Result<(), ExplorerError> {
+        let result = self
+            .artifact
+            .take()
+            .ok_or(ExplorerError::StateUnavailable)?
+            .abandon()
+            .await;
+        finish_remote_result(&self.session, result)
+    }
 }
 
 #[derive(Debug)]
@@ -1303,7 +1464,7 @@ impl SshConnectionManager {
             paths,
             handle: AsyncMutex::new(handle),
             sftp,
-            mutation_guard: AsyncMutex::new(()),
+            mutation_guard: Arc::new(AsyncMutex::new(())),
             lifecycle: lifecycle.clone(),
             events: events.clone(),
         });
@@ -1616,6 +1777,101 @@ impl SshConnectionManager {
         finish_remote_result(&session, result)
     }
 
+    pub(crate) async fn prepare_file_transfer_source(
+        &self,
+        source: &EntryRefDto,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedRemoteFileTransfer, ExplorerError> {
+        let session = self.active_session(&source.location_id)?;
+        let mutation_guard = session.mutation_guard.clone().lock_owned().await;
+        ensure_not_cancelled(cancelled)?;
+        let (path, metadata) = match session.revalidate_source(source).await {
+            Ok(source) => source,
+            Err(error) => return finish_remote_result(&session, Err(error)),
+        };
+        if metadata.is_symlink() || !metadata.is_regular() {
+            return Err(ExplorerError::Unsupported(
+                "This cross-backend transfer path currently accepts regular files only.".to_owned(),
+            ));
+        }
+        let source_parent_path = remote_parent(&path).ok_or(ExplorerError::InvalidReference)?;
+        Ok(PreparedRemoteFileTransfer {
+            session: session.clone(),
+            path: path.clone(),
+            fingerprint: RemoteEntryFingerprint::from(&metadata),
+            source: source.clone(),
+            name: remote_name(&path),
+            source_parent: session.directory_ref(&source_parent_path, None)?,
+            total_bytes: metadata.size.unwrap_or(0),
+            permissions: metadata.permissions,
+            _mutation_guard: mutation_guard,
+        })
+    }
+
+    pub(crate) async fn prepare_file_transfer_destination(
+        &self,
+        destination: &DirectoryRefDto,
+        source_name: &str,
+        conflict_policy: RemoteMoveConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedRemoteFileDestination, ExplorerError> {
+        validate_remote_name(source_name)?;
+        let session = self.active_session(&destination.location_id)?;
+        let mutation_guard = session.mutation_guard.clone().lock_owned().await;
+        ensure_not_cancelled(cancelled)?;
+        let destination_path = match session.revalidate_directory(destination).await {
+            Ok(path) => path,
+            Err(error) => return finish_remote_result(&session, Err(error)),
+        };
+        let (artifact, final_name) = match conflict_policy {
+            RemoteMoveConflictPolicy::Fail => {
+                let artifact = OwnedRemoteFileArtifact::create(
+                    session.sftp.clone(),
+                    &destination_path,
+                    source_name,
+                )
+                .await;
+                (
+                    finish_remote_result(&session, artifact)?,
+                    source_name.to_owned(),
+                )
+            }
+            RemoteMoveConflictPolicy::KeepBoth => {
+                let mut prepared = None;
+                for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
+                    ensure_not_cancelled(cancelled)?;
+                    let candidate = remote_keep_both_name(source_name, false, attempt)?;
+                    match OwnedRemoteFileArtifact::create(
+                        session.sftp.clone(),
+                        &destination_path,
+                        &candidate,
+                    )
+                    .await
+                    {
+                        Ok(artifact) => {
+                            prepared = Some((artifact, candidate));
+                            break;
+                        }
+                        Err(ExplorerError::Conflict) => continue,
+                        Err(error) => return finish_remote_result(&session, Err(error)),
+                    }
+                }
+                prepared.ok_or(ExplorerError::Conflict)?
+            }
+        };
+        let authoritative_destination = session.directory_ref(&destination_path, None)?;
+        debug_assert_eq!(
+            artifact.final_path(),
+            remote_join(&destination_path, &final_name)
+        );
+        Ok(PreparedRemoteFileDestination {
+            session,
+            artifact: Some(artifact),
+            destination: authoritative_destination,
+            _mutation_guard: mutation_guard,
+        })
+    }
+
     pub async fn describe_move_conflict(
         &self,
         source: &EntryRefDto,
@@ -1623,6 +1879,18 @@ impl SshConnectionManager {
     ) -> Result<(String, String), ExplorerError> {
         let session = self.active_session(&source.location_id)?;
         let result = session.describe_move_conflict(source, destination).await;
+        finish_remote_result(&session, result)
+    }
+
+    pub(crate) async fn describe_transfer_destination(
+        &self,
+        destination: &DirectoryRefDto,
+    ) -> Result<String, ExplorerError> {
+        let session = self.active_session(&destination.location_id)?;
+        let result = session
+            .revalidate_directory(destination)
+            .await
+            .map(|path| remote_name(&path));
         finish_remote_result(&session, result)
     }
 
