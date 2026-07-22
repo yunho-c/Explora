@@ -242,17 +242,29 @@ mode; legacy Google Drive installations may instead use `/Volumes/GoogleDrive`.
 OneDrive also delegates Files On-Demand behavior and disk accounting to File
 Provider.
 
-Discovery should enumerate accessible children of the standard user-visible
-cloud-storage location and inspect operating-system metadata such as the File
-Provider domain extended attribute. Folder-name matching may improve a display
-label but must not establish identity or capabilities. iCloud Drive requires a
-separate adapter and live validation because its user-visible root and ubiquity
-APIs do not have identical semantics to third-party File Provider domains.
+Discovery enumerates accessible children of the standard user-visible
+cloud-storage location. Folder-name matching may improve a display label but
+must not establish identity or capabilities. The implementation does not read
+private File Provider extended attributes: no documented provider-neutral client
+API has yet been identified for third-party placeholder availability, so those
+entries remain `unknown`. iCloud Drive uses a separate adapter because its
+user-visible root and documented ubiquity APIs have different semantics.
 
 Foundation exposes ubiquitous-item state for iCloud content, including whether
-an item is ubiquitous and its current download status. A macOS adapter should
-use native URL resource values where applicable. Do not assume those iCloud
-keys describe every third-party File Provider placeholder.
+an item is ubiquitous, whether it is downloading, any download error, and its
+current download status. The macOS adapter reads only those URL resource values;
+it never calls `startDownloadingUbiquitousItem`. It maps a current local copy to
+`local`, a not-downloaded item to `onlineOnly`, an active download to
+`downloading`, a reported error to `error`, and a downloaded-but-stale copy to
+`syncing` so preview stays gated until the copy is current. Missing, unexpected,
+and non-ubiquitous values remain `unknown`. These iCloud-specific keys are never
+used to infer third-party File Provider state.
+
+Listing inspects availability only for regular files. Directories, symlinks, and
+special entries remain metadata-only and are not followed or opened. Preview
+revalidates the opaque entry reference and current availability before content
+access; only a file reported as a current local copy enters the bounded preview
+reader.
 
 The initial packaged application should be tested both with locally available
 and evicted files. Future Mac App Store sandboxing would change folder-access
@@ -268,10 +280,26 @@ registered sync roots and may include legacy roots. This avoids guessing
 OneDrive folder names or Google Drive letters, both of which can vary by account,
 organization, policy, and user configuration.
 
+The Windows adapter enumerates that registry directly. It hashes each opaque
+registration ID into Explora's stable location identity and decodes only the
+provider component before the first `!` as a display hint. The SID and account
+components never enter UI state, logs, or persisted metadata. Duplicate paths
+and identities are removed before roots are published, and the existing bounded
+refresh detects registration and removal. Provider disconnects that leave a
+root registered still need an explicit status model.
+
 Use the Windows Cloud Files API to inspect placeholder state. It distinguishes a
 placeholder, sync root, in-sync item, partial item, and content that is only
 partly on disk. Query state from directory enumeration metadata when possible so
 listing does not open file content.
+
+The availability adapter uses `FindFirstFileExW` to obtain file attributes and
+the reparse tag, then passes only those values to
+`CfGetPlaceholderStateFromAttributeTag`. It does not open file content or request
+hydration. Partial and partially-on-disk placeholders map to `partial`; offline
+or recall-on-access placeholders map to `onlineOnly`; non-placeholders and fully
+local placeholders map to `local`; invalid or unreadable metadata remains
+`unknown`. Preview revalidates this state and only reads content reported local.
 
 `FOLDERID_SkyDrive` or documented OneDrive policy locations may be considered
 only as bounded compatibility fallbacks. A fallback root must still be verified
@@ -325,6 +353,7 @@ honestly rather than showing an unusable mount.
 - Implement native discovery and stable identities.
 - Register real filesystem roots through the opaque local path registry.
 - Watch for provider-root changes with a bounded polling fallback.
+- Inspect documented iCloud availability metadata without requesting content.
 - Preserve tabs as offline tombstones when a provider disappears.
 - Validate in a packaged Tauri application with real providers.
 
@@ -374,8 +403,8 @@ honestly rather than showing an unusable mount.
 - [x] Implement iCloud Drive discovery separately.
 - [x] Derive stable opaque identities without exposing account data.
 - [x] Detect provider-root addition, removal, and client restart with bounded polling.
-- [ ] Inspect iCloud availability without hydrating content.
-- [ ] Determine safe third-party File Provider availability metadata.
+- [x] Inspect documented iCloud availability without hydrating content.
+- [x] Keep third-party availability unknown pending a documented provider-neutral API.
 - [ ] Test multiple OneDrive and Google Drive accounts.
 - [ ] Test locally available, online-only, downloading, and failed items.
 - [ ] Test permission denial and future sandbox implications.
@@ -383,11 +412,12 @@ honestly rather than showing an unusable mount.
 
 ### Windows
 
-- [ ] Add the required Windows Storage Provider API bindings.
-- [ ] Enumerate current sync roots generically.
-- [ ] Normalize provider display metadata without path-name heuristics.
-- [ ] Read Cloud Files placeholder state from listing metadata.
-- [ ] Detect sync-root registration, removal, and provider disconnects.
+- [x] Add the required Windows Storage Provider API bindings.
+- [x] Enumerate current sync roots generically.
+- [x] Normalize provider display metadata without path-name heuristics.
+- [x] Read Cloud Files placeholder state from listing metadata.
+- [x] Detect sync-root registration and removal with bounded refresh.
+- [ ] Model provider disconnects that do not unregister the sync root.
 - [ ] Test OneDrive Personal and work/school roots.
 - [ ] Test multiple OneDrive accounts.
 - [ ] Test Google Drive streaming to a drive letter and folder.
@@ -466,8 +496,9 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [ADR 0003](adr/0003-bounded-local-preview-pipeline.md)
 - Apple File Provider manager and domain APIs:
   [Apple Developer Documentation](https://developer.apple.com/documentation/fileprovider/nsfileprovidermanager)
-- Apple ubiquitous-item download status:
-  [Apple Developer Documentation](https://developer.apple.com/documentation/foundation/urlresourcekey/ubiquitousitemdownloadingstatuskey)
+- Apple ubiquitous-item download status key and values:
+  [URL resource key](https://developer.apple.com/documentation/foundation/urlresourcekey/ubiquitousitemdownloadingstatuskey),
+  [download status](https://developer.apple.com/documentation/foundation/urlubiquitousitemdownloadingstatus)
 - Google Drive File Provider and legacy locations on macOS:
   [Google Drive Help](https://support.google.com/drive/answer/12178485?hl=en-GB)
 - Google Drive streaming and mirroring behavior:
@@ -476,8 +507,12 @@ locally mirrored folder does not exercise online-only placeholder behavior.
   [Microsoft Support](https://support.microsoft.com/en-US/onedrive/save-disk-space-with-onedrive-files-on-demand-for-mac)
 - Windows registered sync-root enumeration:
   [Microsoft Learn](https://learn.microsoft.com/en-us/uwp/api/windows.storage.provider.storageprovidersyncrootmanager.getcurrentsyncroots)
+- Windows sync-root registration identity:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/uwp/api/windows.storage.provider.storageprovidersyncrootinfo.id)
 - Windows Cloud Files placeholder states:
   [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/ne-cfapi-cf_placeholder_state)
+- Windows metadata-only placeholder-state helper:
+  [Microsoft Learn](https://learn.microsoft.com/en-us/windows/win32/api/cfapi/nf-cfapi-cfgetplaceholderstatefromattributetag)
 - GIO volume monitor and user-visible mounts:
   [GNOME API Documentation](https://docs.gtk.org/gio/class.VolumeMonitor.html)
 - GIO mount semantics:

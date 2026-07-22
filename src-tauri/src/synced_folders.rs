@@ -55,12 +55,25 @@ impl SyncedFolderDiscovery for SystemSyncedFolderDiscovery {
             discover_macos_roots(&self.home_dir)
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            let _ = &self.home_dir;
+            discover_windows_roots()
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let _ = &self.home_dir;
             Ok(Vec::new())
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SyncedFolderCandidate {
+    identity: Vec<u8>,
+    path: PathBuf,
+    provider: SyncedFolderProvider,
 }
 
 struct SyncedFolderState {
@@ -218,10 +231,14 @@ impl Drop for SyncedFolderManager {
 }
 
 fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, ExplorerError> {
-    let mut candidates = Vec::<(PathBuf, SyncedFolderProvider)>::new();
+    let mut candidates = Vec::new();
     let icloud = home_dir.join("Library/Mobile Documents/com~apple~CloudDocs");
     if directory_without_following_symlinks(&icloud)? {
-        candidates.push((icloud, SyncedFolderProvider::ICloud));
+        candidates.push(SyncedFolderCandidate {
+            identity: path_identity(&icloud),
+            path: icloud,
+            provider: SyncedFolderProvider::ICloud,
+        });
     }
 
     let cloud_storage = home_dir.join("Library/CloudStorage");
@@ -239,7 +256,12 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
                     continue;
                 }
                 let provider = provider_from_name(&entry.file_name());
-                candidates.push((entry.path(), provider));
+                let path = entry.path();
+                candidates.push(SyncedFolderCandidate {
+                    identity: path_identity(&path),
+                    path,
+                    provider,
+                });
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -248,34 +270,50 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
         }
     }
 
-    candidates.sort_by(|(left_path, left_provider), (right_path, right_provider)| {
-        left_provider
-            .cmp(right_provider)
-            .then_with(|| path_identity(left_path).cmp(&path_identity(right_path)))
+    roots_from_candidates(candidates)
+}
+
+fn roots_from_candidates(
+    mut candidates: Vec<SyncedFolderCandidate>,
+) -> Result<Vec<SyncedFolderRoot>, ExplorerError> {
+    candidates.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.identity.cmp(&right.identity))
     });
-    candidates.dedup_by(|(left, _), (right, _)| left == right);
+    let mut seen_identities = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    candidates.retain(|candidate| {
+        seen_identities.insert(candidate.identity.clone())
+            && seen_paths.insert(candidate.path.clone())
+    });
 
     let provider_counts = candidates
         .iter()
-        .fold(BTreeMap::new(), |mut counts, (_, provider)| {
-            *counts.entry(*provider).or_insert(0_usize) += 1;
+        .fold(BTreeMap::new(), |mut counts, candidate| {
+            *counts.entry(candidate.provider).or_insert(0_usize) += 1;
             counts
         });
     let mut provider_indexes = BTreeMap::<SyncedFolderProvider, usize>::new();
     let mut seen_ids = HashSet::new();
     let mut roots = Vec::with_capacity(candidates.len());
-    for (path, provider) in candidates {
+    for candidate in candidates {
         let id = format!(
             "synced:{}",
-            Uuid::new_v5(&SYNCED_FOLDER_NAMESPACE, &path_identity(&path))
+            Uuid::new_v5(&SYNCED_FOLDER_NAMESPACE, &candidate.identity)
         );
         if !seen_ids.insert(id.clone()) {
             continue;
         }
-        let index = provider_indexes.entry(provider).or_insert(0);
+        let index = provider_indexes.entry(candidate.provider).or_insert(0);
         *index += 1;
-        let base_name = provider.display_name();
-        let name = if provider_counts.get(&provider).copied().unwrap_or(0) > 1 {
+        let base_name = candidate.provider.display_name();
+        let name = if provider_counts
+            .get(&candidate.provider)
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
             format!("{base_name} {}", *index)
         } else {
             base_name.to_owned()
@@ -283,15 +321,52 @@ fn discover_macos_roots(home_dir: &Path) -> Result<Vec<SyncedFolderRoot>, Explor
         roots.push(SyncedFolderRoot {
             id,
             name,
-            path,
-            detail: format!("{} · Synced folder", provider.display_name()),
+            path: candidate.path,
+            detail: format!("{} · Synced folder", candidate.provider.display_name()),
             metadata: SyncedFolderMetadataDto {
-                provider,
+                provider: candidate.provider,
                 status: SyncedFolderStatus::Available,
             },
         });
     }
     Ok(roots)
+}
+
+#[cfg(target_os = "windows")]
+fn discover_windows_roots() -> Result<Vec<SyncedFolderRoot>, ExplorerError> {
+    let mut candidates = Vec::new();
+    for root in crate::windows_synced_folders::discover().map_err(|error| {
+        ExplorerError::Unexpected(format!(
+            "Explora could not {} (Windows error 0x{:08X}).",
+            error.action, error.code
+        ))
+    })? {
+        if !directory_without_following_symlinks(&root.path)? {
+            continue;
+        }
+        candidates.push(SyncedFolderCandidate {
+            identity: root.identity,
+            path: root.path,
+            provider: provider_from_windows_registration_provider_id(
+                &root.registration_provider_id,
+            ),
+        });
+    }
+
+    roots_from_candidates(candidates)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn provider_from_windows_registration_provider_id(provider_id: &str) -> SyncedFolderProvider {
+    if provider_id.eq_ignore_ascii_case("OneDrive") {
+        SyncedFolderProvider::OneDrive
+    } else if provider_id.eq_ignore_ascii_case("GoogleDrive")
+        || provider_id.eq_ignore_ascii_case("GoogleDriveFS")
+    {
+        SyncedFolderProvider::GoogleDrive
+    } else {
+        SyncedFolderProvider::Other
+    }
 }
 
 fn directory_without_following_symlinks(path: &Path) -> Result<bool, ExplorerError> {
@@ -404,6 +479,61 @@ mod tests {
             provider_from_name(OsStr::new("Acme Cloud")),
             SyncedFolderProvider::Other
         );
+    }
+
+    #[test]
+    fn windows_registration_provider_component_is_a_hint_without_exposing_account_data() {
+        assert_eq!(
+            provider_from_windows_registration_provider_id("OneDrive"),
+            SyncedFolderProvider::OneDrive
+        );
+        assert_eq!(
+            provider_from_windows_registration_provider_id("GoogleDriveFS"),
+            SyncedFolderProvider::GoogleDrive
+        );
+        assert_eq!(
+            provider_from_windows_registration_provider_id("AcmeCloud"),
+            SyncedFolderProvider::Other
+        );
+    }
+
+    #[test]
+    fn normalizes_platform_candidates_with_private_stable_identities() {
+        let temp = TempDir::new().expect("temporary roots");
+        let one = temp.path().join("one");
+        let two = temp.path().join("two");
+        let duplicate_path = two.clone();
+        let roots = roots_from_candidates(vec![
+            SyncedFolderCandidate {
+                identity: b"OneDrive!private-account-one".to_vec(),
+                path: one,
+                provider: SyncedFolderProvider::OneDrive,
+            },
+            SyncedFolderCandidate {
+                identity: b"OneDrive!private-account-two".to_vec(),
+                path: two,
+                provider: SyncedFolderProvider::OneDrive,
+            },
+            SyncedFolderCandidate {
+                identity: b"duplicate-registration".to_vec(),
+                path: duplicate_path,
+                provider: SyncedFolderProvider::Other,
+            },
+        ])
+        .expect("normalized candidates");
+
+        assert_eq!(roots.len(), 2);
+        assert_eq!(
+            roots
+                .iter()
+                .map(|root| root.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["OneDrive 1", "OneDrive 2"]
+        );
+        assert!(roots.iter().all(|root| root.id.starts_with("synced:")));
+        assert!(roots
+            .iter()
+            .all(|root| !root.id.contains("private-account")));
     }
 
     #[test]

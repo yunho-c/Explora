@@ -10,8 +10,8 @@ use tauri::{ipc::Channel, State};
 
 use crate::{
     filesystem::{
-        DirectoryListingEvent, ExplorerError, ExplorerErrorDto, ImagePreviewMode,
-        LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
+        ContentAvailability, DirectoryListingEvent, ExplorerError, ExplorerErrorDto,
+        ImagePreviewMode, LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
     },
     local_filesystem::LocalFilesystem,
     preferences::{
@@ -404,31 +404,68 @@ pub async fn prepare_preview(
         ));
     }
 
-    if state
+    let synced_location = state
         .local
         .is_synced_folder(&location_id)
-        .map_err(ExplorerErrorDto::from)?
-    {
-        return Ok(metadata_result(
-            entry_id,
-            None,
-            None,
-            PreviewUnavailableReason::DownloadRequired,
-            "Explora needs explicit permission to download this synced file before previewing it.",
-        ));
-    }
+        .map_err(ExplorerErrorDto::from)?;
 
     debug_assert!(local_location);
 
-    let path = state
+    // Resolve and revalidate the opaque entry before deciding whether content
+    // access is allowed. Filesystem metadata is sufficient for this decision
+    // and does not open the file or request provider hydration.
+    let access = state
         .local
-        .resolve_preview_path(&entry_id, &location_id)
-        .map_err(ExplorerErrorDto::from)?;
+        .resolve_preview_access(&entry_id, &location_id)
+        .map_err(|error| local_preview_error(error, synced_location))?;
+
+    if access.availability != ContentAvailability::Local {
+        return Ok(metadata_result(
+            entry_id,
+            access.size,
+            access.modified_at,
+            PreviewUnavailableReason::DownloadRequired,
+            synced_preview_message(access.availability),
+        ));
+    }
+
     state
         .preview
-        .prepare_local(request_id, entry_id, path, image_mode)
+        .prepare_local(request_id, entry_id, access.path, image_mode)
         .await
-        .map_err(ExplorerErrorDto::from)
+        .map_err(|error| local_preview_error(error, synced_location))
+}
+
+fn local_preview_error(error: ExplorerError, synced_location: bool) -> ExplorerErrorDto {
+    ExplorerErrorDto::from(if synced_location {
+        redact_synced_folder_error(error)
+    } else {
+        error
+    })
+}
+
+fn synced_preview_message(availability: ContentAvailability) -> &'static str {
+    match availability {
+        ContentAvailability::OnlineOnly => {
+            "This file is online-only. Download it explicitly before previewing."
+        }
+        ContentAvailability::Partial => {
+            "Only part of this file is available locally. Download it explicitly before previewing."
+        }
+        ContentAvailability::Downloading => {
+            "This file is still downloading. Try the preview again when the download finishes."
+        }
+        ContentAvailability::Syncing => {
+            "This file's local copy is not current yet. Try the preview again after it finishes syncing."
+        }
+        ContentAvailability::Error => {
+            "The operating system reported a download error for this file."
+        }
+        ContentAvailability::Unknown => {
+            "Explora cannot verify that this file is available locally. Download it explicitly before previewing."
+        }
+        ContentAvailability::Local => "This file is available locally.",
+    }
 }
 
 #[tauri::command]
@@ -515,5 +552,27 @@ mod tests {
         let redacted = redact_synced_folder_error(error).to_string();
         assert_eq!(redacted, "Explora could not read this synced folder.");
         assert!(!redacted.contains("account@example.com"));
+    }
+
+    #[test]
+    fn synced_preview_errors_do_not_expose_provider_paths() {
+        let error = ExplorerError::Io {
+            message: "could not preview /Users/person/Library/Mobile Documents/private.txt"
+                .to_owned(),
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+
+        let mapped = local_preview_error(error, true);
+        assert_eq!(mapped.message, "Explora could not read this synced folder.");
+        assert!(!mapped.message.contains("private.txt"));
+    }
+
+    #[test]
+    fn synced_preview_messages_distinguish_authoritative_availability() {
+        assert!(synced_preview_message(ContentAvailability::OnlineOnly).contains("online-only"));
+        assert!(synced_preview_message(ContentAvailability::Downloading).contains("downloading"));
+        assert!(synced_preview_message(ContentAvailability::Syncing).contains("not current"));
+        assert!(synced_preview_message(ContentAvailability::Error).contains("download error"));
+        assert!(synced_preview_message(ContentAvailability::Unknown).contains("cannot verify"));
     }
 }

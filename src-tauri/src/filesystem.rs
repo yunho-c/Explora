@@ -171,6 +171,21 @@ pub struct LocationSummaryDto {
     pub synced_folder: Option<SyncedFolderMetadataDto>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+// The shared wire vocabulary includes states that are emitted only by later
+// platform adapters (for example, partial Windows Cloud Files placeholders).
+#[allow(dead_code)]
+pub enum ContentAvailability {
+    Local,
+    OnlineOnly,
+    Partial,
+    Downloading,
+    Syncing,
+    Error,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct FileEntrySummaryDto {
@@ -182,7 +197,7 @@ pub struct FileEntrySummaryDto {
     pub modified_at: Option<u64>,
     pub display_path: String,
     pub directory: Option<DirectoryRefDto>,
-    pub availability: &'static str,
+    pub availability: ContentAvailability,
     pub detail: Option<&'static str>,
 }
 

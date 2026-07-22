@@ -13,10 +13,11 @@ use std::{
 use uuid::Uuid;
 
 use crate::filesystem::{
-    BreadcrumbSegmentDto, DirectoryListingEvent, DirectoryRefDto, EntryRefDto, ExplorerError,
-    FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
-    SyncedFolderMetadataDto, LISTING_BATCH_SIZE,
+    BreadcrumbSegmentDto, ContentAvailability, DirectoryListingEvent, DirectoryRefDto, EntryRefDto,
+    ExplorerError, FileEntrySummaryDto, LocationBackend, LocationRole, LocationSummaryDto,
+    SyncedFolderMetadataDto, SyncedFolderProvider, LISTING_BATCH_SIZE,
 };
+use crate::synced_availability::SyncedAvailabilityInspector;
 
 #[derive(Debug, Clone)]
 pub struct LocalRoot {
@@ -99,6 +100,14 @@ impl PathRegistry {
 pub struct LocalFilesystem {
     registry: PathRegistry,
     locations: RwLock<Vec<LocationSummaryDto>>,
+    availability: SyncedAvailabilityInspector,
+}
+
+pub(crate) struct LocalPreviewAccess {
+    pub path: PathBuf,
+    pub availability: ContentAvailability,
+    pub size: Option<String>,
+    pub modified_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +164,7 @@ impl LocalFilesystem {
         Ok(Self {
             registry,
             locations: RwLock::new(locations),
+            availability: SyncedAvailabilityInspector::default(),
         })
     }
 
@@ -296,21 +306,53 @@ impl LocalFilesystem {
         Ok(summaries)
     }
 
-    pub(crate) fn resolve_preview_path(
+    pub(crate) fn resolve_preview_access(
         &self,
         entry_id: &str,
         location_id: &str,
-    ) -> Result<PathBuf, ExplorerError> {
-        let location_exists = self
+    ) -> Result<LocalPreviewAccess, ExplorerError> {
+        let location = self
             .locations
             .read()
             .map_err(|_| ExplorerError::StateUnavailable)?
             .iter()
-            .any(|location| location.id == location_id);
-        if !location_exists {
-            return Err(ExplorerError::InvalidReference);
-        }
-        self.registry.resolve(location_id, entry_id)
+            .find(|location| location.id == location_id)
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let path = self.registry.resolve(location_id, entry_id)?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
+        let size = metadata
+            .file_type()
+            .is_file()
+            .then(|| metadata.len().to_string());
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        let availability = if metadata.file_type().is_file() {
+            location
+                .synced_folder
+                .as_ref()
+                .map(|synced| {
+                    self.availability
+                        .inspect(synced.provider, path.as_path(), false)
+                })
+                .unwrap_or(ContentAvailability::Local)
+        } else {
+            // Directories, symlinks, and special entries have no file content
+            // for the preview pipeline to hydrate. The previewer will return
+            // metadata without following or opening them.
+            ContentAvailability::Local
+        };
+
+        Ok(LocalPreviewAccess {
+            path,
+            availability,
+            size,
+            modified_at,
+        })
     }
 
     pub fn list_directory<F>(
@@ -376,14 +418,11 @@ impl LocalFilesystem {
                 }
             };
 
-            let availability = if location.kind == "syncedFolder" {
-                // Until a platform adapter can inspect placeholder state
-                // authoritatively, content must not be presumed local.
-                "unknown"
-            } else {
-                "local"
-            };
-            match self.describe_entry(entry, location_id, availability) {
+            let synced_provider = location
+                .synced_folder
+                .as_ref()
+                .map(|synced| synced.provider);
+            match self.describe_entry(entry, location_id, synced_provider) {
                 Ok(entry) => batch.push(entry),
                 Err(_) => {
                     skipped_entries += 1;
@@ -418,7 +457,7 @@ impl LocalFilesystem {
         &self,
         entry: fs::DirEntry,
         location_id: &str,
-        availability: &'static str,
+        synced_provider: Option<SyncedFolderProvider>,
     ) -> Result<FileEntrySummaryDto, ExplorerError> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -455,6 +494,13 @@ impl LocalFilesystem {
             .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
             .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+        let availability = if file_type.is_file() {
+            synced_provider
+                .map(|provider| self.availability.inspect(provider, path.as_path(), false))
+                .unwrap_or(ContentAvailability::Local)
+        } else {
+            ContentAvailability::Local
+        };
 
         Ok(FileEntrySummaryDto {
             reference: EntryRefDto {
@@ -817,7 +863,7 @@ mod tests {
                 },
             )
             .expect("synced root listing");
-        assert_eq!(availability, Some("unknown"));
+        assert_eq!(availability, Some(ContentAvailability::Unknown));
 
         filesystem
             .replace_synced_folders(Vec::new())
@@ -829,6 +875,73 @@ mod tests {
             |_| Ok(()),
         );
         assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+    }
+
+    #[test]
+    fn preview_access_revalidates_synced_tokens_without_opening_file_content() {
+        let (temp, filesystem, _) = fixture();
+        let synced_path = temp.path().join("preview-synced-root");
+        let folder_path = synced_path.join("folder");
+        let file_path = synced_path.join("online-only.txt");
+        fs::create_dir_all(&folder_path).expect("synced directory fixture");
+        File::create(&file_path).expect("synced file fixture");
+        let location = filesystem
+            .replace_synced_folders(vec![SyncedFolderRoot {
+                id: "synced:preview-test".to_owned(),
+                name: "Cloud Storage".to_owned(),
+                path: synced_path,
+                detail: "Cloud Storage · Synced folder".to_owned(),
+                metadata: SyncedFolderMetadataDto {
+                    provider: crate::filesystem::SyncedFolderProvider::Other,
+                    status: crate::filesystem::SyncedFolderStatus::Available,
+                },
+            }])
+            .expect("synced snapshot")
+            .remove(0);
+        let mut entries = Vec::new();
+
+        filesystem
+            .list_directory(
+                &location.root.id,
+                &location.id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries: batch, .. } = event {
+                        entries.extend(batch);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("synced listing");
+
+        let file = entries
+            .iter()
+            .find(|entry| entry.name == "online-only.txt")
+            .expect("file entry");
+        let directory = entries
+            .iter()
+            .find(|entry| entry.name == "folder")
+            .expect("directory entry");
+        assert_eq!(file.availability, ContentAvailability::Unknown);
+        assert_eq!(directory.availability, ContentAvailability::Local);
+
+        let file_access = filesystem
+            .resolve_preview_access(&file.reference.id, &location.id)
+            .expect("file preview access");
+        assert_eq!(file_access.path, file_path);
+        assert_eq!(file_access.availability, ContentAvailability::Unknown);
+        assert_eq!(file_access.size.as_deref(), Some("0"));
+
+        let directory_access = filesystem
+            .resolve_preview_access(&directory.reference.id, &location.id)
+            .expect("directory preview access");
+        assert_eq!(directory_access.path, folder_path);
+        assert_eq!(directory_access.availability, ContentAvailability::Local);
+
+        assert!(matches!(
+            filesystem.resolve_preview_access("forged-token", &location.id),
+            Err(ExplorerError::InvalidReference)
+        ));
     }
 
     #[test]

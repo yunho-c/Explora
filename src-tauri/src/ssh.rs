@@ -438,7 +438,7 @@ impl SshSession {
                 modified_at: metadata.mtime.map(|seconds| u64::from(seconds) * 1000),
                 display_path: format!("{}:{entry_path}", self.target.name),
                 directory,
-                availability: "unknown",
+                availability: crate::filesystem::ContentAvailability::Unknown,
                 detail: None,
             });
             if batch.len() == LISTING_BATCH_SIZE {

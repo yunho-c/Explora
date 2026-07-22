@@ -7,8 +7,11 @@ mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
+mod synced_availability;
 mod synced_folders;
 mod volumes;
+#[cfg(target_os = "windows")]
+mod windows_synced_folders;
 
 use commands::AppState;
 use filesystem::LocationRole;
