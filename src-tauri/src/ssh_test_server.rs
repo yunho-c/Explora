@@ -14,7 +14,7 @@ use russh::{
     Channel, ChannelId, Disconnect, MethodKind, MethodSet,
 };
 use russh_sftp::protocol::{
-    Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 use tempfile::TempDir;
 use tokio::{
@@ -420,6 +420,46 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         Ok(ok_status(id))
     }
 
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        _pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
+        let path = canonical_path(&filename);
+        if remote_contents(&path).is_none() {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(Handle { id, handle: path })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        let contents = remote_contents(&handle).ok_or(StatusCode::NoSuchFile)?;
+        let start = usize::try_from(offset).map_err(|_| StatusCode::Eof)?;
+        if start >= contents.len() {
+            return Err(StatusCode::Eof);
+        }
+        let end = start.saturating_add(len as usize).min(contents.len());
+        Ok(Data {
+            id,
+            data: contents[start..end].to_vec(),
+        })
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        Ok(Attrs {
+            id,
+            attrs: metadata_for(&handle, true).ok_or(StatusCode::NoSuchFile)?,
+        })
+    }
+
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let path = canonical_path(&path);
         if path == "/private" {
@@ -509,6 +549,16 @@ fn metadata_for(path: &str, follow_symlink: bool) -> Option<FileAttributes> {
         "/project-link" => Some(symlink_attrs()),
         _ => None,
     }
+}
+
+fn remote_contents(path: &str) -> Option<Vec<u8>> {
+    let (length, pattern) = match path {
+        "/README.md" => (128, b"Explora remote README\n".as_slice()),
+        "/projects/notes.txt" => (42, b"Remote notes\n".as_slice()),
+        "/slow/eventually.txt" => (7, b"ready\n".as_slice()),
+        _ => return None,
+    };
+    Some(pattern.iter().copied().cycle().take(length).collect())
 }
 
 fn directory_attrs() -> FileAttributes {

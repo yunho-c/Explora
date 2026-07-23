@@ -13,6 +13,8 @@
   import ExplorerToolbar from "./ExplorerToolbar.svelte";
   import FileGrid from "./FileGrid.svelte";
   import FileList from "./FileList.svelte";
+  import NativeOpenConfirmation from "./NativeOpenConfirmation.svelte";
+  import NativeOpenOperations from "./NativeOpenOperations.svelte";
   import QuickPreview from "./QuickPreview.svelte";
   import SshPromptDialog from "./SshPromptDialog.svelte";
   import SshTargetDialog from "./SshTargetDialog.svelte";
@@ -193,6 +195,8 @@
   </main>
 
   <QuickPreview {state} />
+  <NativeOpenOperations {state} />
+  <NativeOpenConfirmation {state} />
   <SshTargetDialog {state} />
   <SshPromptDialog {state} />
 </div>

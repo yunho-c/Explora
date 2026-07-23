@@ -132,6 +132,7 @@ pub struct FileEntrySummaryDto {
     pub display_path: String,
     pub directory: Option<DirectoryRefDto>,
     pub detail: Option<&'static str>,
+    pub native_open: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -167,6 +168,7 @@ pub enum ExplorerErrorCode {
     AuthenticationFailed,
     HostKeyFailure,
     Unsupported,
+    Conflict,
     InvalidConfiguration,
     Unexpected,
 }
@@ -202,6 +204,8 @@ pub enum ExplorerError {
     #[error("{0}")]
     Unsupported(String),
     #[error("{0}")]
+    Conflict(String),
+    #[error("{0}")]
     InvalidConfiguration(String),
     #[error("{0}")]
     Unexpected(String),
@@ -231,6 +235,7 @@ impl From<ExplorerError> for ExplorerErrorDto {
             ExplorerError::AuthenticationFailed(_) => ExplorerErrorCode::AuthenticationFailed,
             ExplorerError::HostKeyFailure(_) => ExplorerErrorCode::HostKeyFailure,
             ExplorerError::Unsupported(_) => ExplorerErrorCode::Unsupported,
+            ExplorerError::Conflict(_) => ExplorerErrorCode::Conflict,
             ExplorerError::InvalidConfiguration(_) => ExplorerErrorCode::InvalidConfiguration,
             ExplorerError::StateUnavailable
             | ExplorerError::ChannelClosed

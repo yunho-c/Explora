@@ -5,6 +5,10 @@ packaged Tauri application provides read-only local and SSH/SFTP navigation
 through Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
 bounded Quick Preview for local text, source, common raster-image, and PDF files.
+Double-click, Enter, and the Open context action launch local files with their
+default native application while Space remains Quick Preview. SSH files open as
+bounded, cancellable, read-only local snapshots; large or unknown downloads
+require confirmation and are never uploaded automatically.
 Saved SSH targets and concrete aliases from
 `~/.ssh/config` appear alongside local favorites. The browser-only Vite
 application retains deterministic local and remote demo assets for UI development
@@ -54,6 +58,14 @@ authoritative. See
 and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ssh-sftp-locations.md)
 for the authorization, trust, and credential-handling model.
 
+Native opening is authorized with those same opaque references. Local files and
+file symlinks are delegated to the operating system, local macOS `.app` bundles
+launch normally, and directories continue to navigate inside Explora. Remote
+snapshots have bounded concurrency and size, carry platform origin metadata,
+and are cleaned on the next launch. See
+[`docs/adr/0009-native-file-opening.md`](docs/adr/0009-native-file-opening.md)
+for the transfer, cleanup, and security decisions.
+
 The current filesystem backends are deliberately read-only. SSH authentication
 supports agents, standard or configured identity files, encrypted-key
 passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
@@ -67,7 +79,8 @@ in the Rust boundary and updated through native platform notifications with a
 bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
 target visibility persist as versioned local preferences. File watching,
 hidden-file controls, mutations, remote content previews, and additional preview
-formats remain later vertical slices. See
+formats remain later vertical slices. Native opening downloads SSH snapshots but
+does not add general remote copy or write operations. See
 [`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
 and
 [`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)

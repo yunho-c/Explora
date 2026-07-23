@@ -27,6 +27,8 @@
   let shownRecoveryMessage: string | null = null;
   let shownPreferencesWarning: string | null = null;
   let shownVolumeWarning: string | null = null;
+  let shownNativeOpenWarning: string | null = null;
+  let shownNativeOpenError: string | null = null;
 
   $effect(() => {
     const message = windowChrome.recoveryMessage;
@@ -35,6 +37,22 @@
       toast.warning("Window controls recovered with limited behavior", {
         description: message,
       });
+    }
+  });
+
+  $effect(() => {
+    const message = state.nativeOpenWarningMessage;
+    if (message && message !== shownNativeOpenWarning) {
+      shownNativeOpenWarning = message;
+      toast.warning("Temporary files need attention", { description: message });
+    }
+  });
+
+  $effect(() => {
+    const message = state.nativeOpenErrorMessage;
+    if (message && message !== shownNativeOpenError) {
+      shownNativeOpenError = message;
+      toast.error("Could not open item", { description: message });
     }
   });
 

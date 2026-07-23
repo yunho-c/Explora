@@ -1,6 +1,7 @@
 mod commands;
 mod filesystem;
 mod local_filesystem;
+mod native_open;
 mod preferences;
 mod preview;
 mod ssh;
@@ -12,6 +13,7 @@ mod volumes;
 use commands::AppState;
 use filesystem::LocationRole;
 use local_filesystem::{LocalFilesystem, LocalRoot};
+use native_open::NativeOpenManager;
 use preferences::PreferencesStore;
 use serde::Serialize;
 use ssh_targets::SshTargetStore;
@@ -148,7 +150,14 @@ pub fn run() {
                 paths.app_config_dir()?.join("ssh-targets.json"),
                 paths.home_dir()?,
             )?;
-            app.manage(AppState::new(filesystem, preferences, ssh_targets, volumes));
+            let native_open = NativeOpenManager::new(paths.app_cache_dir()?.join("native-open"))?;
+            app.manage(AppState::new(
+                filesystem,
+                preferences,
+                ssh_targets,
+                volumes,
+                native_open,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -159,6 +168,7 @@ pub fn run() {
             commands::get_user_preferences,
             commands::update_user_preferences,
             commands::list_locations,
+            commands::get_native_open_status,
             commands::list_ssh_targets,
             commands::create_ssh_target,
             commands::update_ssh_target,
@@ -173,6 +183,8 @@ pub fn run() {
             commands::cancel_preview,
             commands::read_preview_resource,
             commands::discard_preview_resource,
+            commands::open_entry,
+            commands::cancel_open_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

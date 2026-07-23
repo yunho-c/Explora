@@ -5,6 +5,8 @@ import type {
   ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
+  NativeOpenOutcome,
+  NativeOpenProgress,
   PreviewSummary,
   SshConnectionEvent,
   SshPromptResponse,
@@ -52,12 +54,19 @@ export interface PreparePreviewOptions {
   imageMode: ImagePreviewMode;
 }
 
+export interface OpenEntryOptions {
+  signal: AbortSignal;
+  allowLargeRemoteDownload: boolean;
+  onProgress: (progress: NativeOpenProgress) => void;
+}
+
 export interface WatchVolumesOptions {
   signal: AbortSignal;
   onSnapshot: (snapshot: VolumeSnapshot) => void;
 }
 
 export interface ExplorerDataSource {
+  getNativeOpenStartupWarning(signal: AbortSignal): Promise<string | null>;
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   watchVolumes(options: WatchVolumesOptions): Promise<void>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
@@ -84,4 +93,8 @@ export interface ExplorerDataSource {
     entry: FileEntrySummary,
     options: PreparePreviewOptions,
   ): Promise<PreparedPreview>;
+  openEntry(
+    entry: FileEntrySummary,
+    options: OpenEntryOptions,
+  ): Promise<NativeOpenOutcome>;
 }
