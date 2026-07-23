@@ -1,7 +1,7 @@
 # Synced folders
 
 - Status: Implementation in progress
-- Last updated: 2026-07-22
+- Last updated: 2026-07-23
 - Tracking branch: `feat/synced-folders`
 
 ## Summary
@@ -202,14 +202,15 @@ to render a breadcrumb, tooltip, or accessibility description. Root reuse is
 validated against the Rust path registry; it never compares or accepts the
 presentation string as path authority.
 
-Local synced-folder listings run in blocking workers because provider namespace
-calls can be synchronous. Explora waits at most 30 seconds and allows at most
-four concurrent workers. Cancellation wakes the IPC command immediately, while
-the worker retains its concurrency permit until the provider call actually
-returns. This bounds abandoned native work without falsely claiming that a
-provider-owned call was cancelled. A cancellation flag is rechecked immediately
-after opening the namespace and before any event is emitted, preventing a late
-worker from publishing into a newer navigation lifetime.
+Local and GIO synced-folder listings run in blocking workers because provider
+namespace calls can be synchronous. Explora waits at most 30 seconds and allows
+at most four concurrent workers across both transports. Cancellation wakes the
+IPC command immediately and reaches `GCancellable` for GIO, while the worker
+retains its concurrency permit until the provider call actually returns. This
+bounds abandoned native work without falsely claiming that a provider-owned
+call was cancelled. A cancellation flag is rechecked immediately after opening
+the namespace and before any event is emitted, preventing a late worker from
+publishing into a newer navigation lifetime.
 
 Discovery and errors must not log:
 
@@ -433,12 +434,15 @@ existing bounded synced-folder refresh publishes revisioned sidebar state.
 
 GIO URIs and account labels remain Rust-only. The backend issues cancellable,
 no-follow directory enumeration on a blocking worker and maps GIO error domains
-to structured Explora errors without returning provider messages. Quick Preview
-is an explicit read: GIO streams at most the byte limit selected by the existing
-preview pipeline into an owned temporary file, cancellation reaches
-`GCancellable`, and decoding then uses the same five-second timeout, concurrency,
-format, pixel, and resource limits as local preview. The temporary file is
-deleted when preparation finishes.
+to structured Explora errors without returning provider messages. The shared
+synced-listing limiter caps local and GIO provider opens at four workers with a
+30-second command deadline. A timed-out GIO request is cancelled and cannot emit
+its Started event later; its worker continues to hold capacity until the native
+call actually exits. Quick Preview is an explicit read: GIO streams at most the
+byte limit selected by the existing preview pipeline into an owned temporary
+file, cancellation reaches `GCancellable`, and decoding then uses the same
+five-second timeout, concurrency, format, pixel, and resource limits as local
+preview. The temporary file is deleted when preparation finishes.
 
 The initial Linux support matrix is capability-based. GNOME-compatible sessions
 with GLib/GIO 2.56 or newer, a user D-Bus session, GNOME Online Accounts, and the
@@ -533,6 +537,9 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Add structured offline, permission, stale, and unavailable errors.
 - [x] Add privacy and log-redaction tests.
 - [x] Document the supported platform/provider matrix in `README.md`.
+- [x] Add a least-privilege macOS, Windows, and Linux CI matrix that compiles and
+      tests target-gated adapters without pretending synthetic runners are real
+      provider validation.
 
 ### macOS
 
@@ -568,6 +575,11 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
       cancellation as stopping the wait only.
 - [x] Detect sync-root registration and removal with bounded refresh.
 - [x] Model provider disconnects that do not unregister the sync root.
+- [x] Type-check sync-root discovery, placeholder metadata, and explicit
+      hydration against the Windows MSVC target independently of unrelated
+      native dependencies.
+- [x] Add an ignored, privacy-safe native smoke for registered-root discovery,
+      opaque registration, and time-bounded namespace opening.
 - [ ] Test OneDrive Personal and work/school roots.
 - [ ] Test multiple OneDrive accounts.
 - [ ] Test Google Drive streaming to a drive letter and folder.
@@ -589,11 +601,20 @@ Explora exposes only the allowlisted `google-drive` scheme as a synced folder.
 - [x] Accept a narrow, read-only GIO backend for the first stable release.
 - [x] Implement cancellable GIO listing and bounded preview reads before exposing
       `google-drive://` mounts.
+- [x] Bound GIO namespace opens with the shared 30-second deadline and four-worker
+      provider cap, retaining capacity until native work exits.
+- [x] Add an ignored, privacy-safe native smoke for Google Drive GIO discovery,
+      opaque registration, and time-bounded namespace opening.
 - [ ] Test GNOME Online Accounts Google Drive where supported.
 - [ ] Test environments without GVfs or a running GLib main loop.
 - [ ] Verify packaging does not silently load unapproved GIO modules.
 - [ ] Test the native folder picker on representative GNOME and KDE sessions.
 - [ ] Run packaged Linux native smoke tests.
+
+Native Linux provider, picker, and packaging verification is deferred as of
+2026-07-23 because no representative Linux host is currently available. The CI
+matrix still provides target compile and deterministic test coverage once run,
+but these native checklist items remain open and must not be inferred from CI.
 
 ### Hydration and preview
 
@@ -624,6 +645,24 @@ for discovery events and placeholder states. At least one real-provider smoke
 scenario per supported platform is required because browser tests and synthetic
 filesystem trees cannot prove File Provider, Cloud Files, or GVfs behavior.
 
+The GitHub Actions matrix is configured to run `format:check`, `lint`, `check`,
+and `test` using the locked repository command surface across macOS, Windows,
+and Ubuntu. Its token is read-only, external actions are pinned to full commit
+SHAs, and Bun is pinned to the version used to validate the lockfile. This is
+intended to catch target-gated compile and deterministic test failures. The
+ignored provider smokes remain manual because hosted runners have no
+user-authenticated provider roots; the first remote workflow run is still
+required evidence that the runner images and system prerequisites are correct.
+
+On macOS on 2026-07-22, an isolated `x86_64-pc-windows-msvc` compile harness
+type-checked the actual sync-root discovery, Cloud Files placeholder inspection,
+and hydration modules against their pinned Windows bindings. That check exposed
+and verified a missing `OsStrExt` import in the provider-status path. This is
+useful target-compile evidence, but it does not execute WinRT or Cloud Files and
+is not Windows runtime proof. The full application cross-check still belongs on
+the native CI runner because unrelated SSH crypto dependencies require the
+Windows SDK.
+
 The macOS native smoke can be run without logging provider paths or account
 labels:
 
@@ -632,6 +671,25 @@ cargo test --manifest-path src-tauri/Cargo.toml \
   native_macos_roots_register_and_open_without_provider_authority_crossing_ipc \
   -- --ignored --nocapture
 ```
+
+Equivalent target-native discovery and namespace-opening smokes are available
+on Windows and Linux. They emit aggregate root counts only:
+
+```powershell
+cargo test --manifest-path src-tauri/Cargo.toml `
+  native_windows_roots_register_and_open_without_provider_authority_crossing_ipc `
+  -- --ignored --nocapture
+```
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml \
+  native_linux_google_drive_mounts_register_and_open_without_uris_crossing_ipc \
+  -- --ignored --nocapture
+```
+
+These smokes require a real configured provider on their host and deliberately
+stop after the provider namespace opens. They are native adapter evidence, not
+packaged UI proof and not placeholder hydration coverage.
 
 On macOS 15.6 on 2026-07-22, the release `.app` and DMG packaged successfully.
 The native smoke discovered and registered four installed OS-managed roots; two

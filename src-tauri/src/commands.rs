@@ -452,7 +452,7 @@ pub async fn list_directory(
                 .local
                 .is_synced_folder(&location_id)
                 .map_err(ExplorerErrorDto::from)?);
-    let synced_listing_permit = if backend == LocationBackend::Local && synced_location {
+    let synced_listing_permit = if synced_location {
         Some(
             state
                 .synced_listing_limiter
@@ -492,8 +492,12 @@ pub async fn list_directory(
         LocationBackend::Gio => {
             let gio = state.gio.clone();
             let worker_cancellation = cancellation.clone();
+            let (result_sender, result_receiver) = oneshot::channel();
             tauri::async_runtime::spawn_blocking(move || {
-                gio.list_directory(
+                // A provider-blocked worker retains this permit even after the
+                // command returns a timeout, bounding abandoned GIO calls.
+                let _permit = synced_listing_permit;
+                let result = gio.list_directory(
                     &directory_id,
                     &location_id,
                     &worker_cancellation.cancelled,
@@ -502,14 +506,16 @@ pub async fn list_directory(
                             .send(event)
                             .map_err(|_| ExplorerError::ChannelClosed)
                     },
-                )
-            })
+                );
+                let _ = result_sender.send(result);
+            });
+
+            await_bounded_synced_listing(
+                result_receiver,
+                cancellation.clone(),
+                SYNCED_LISTING_TIMEOUT,
+            )
             .await
-            .unwrap_or_else(|error| {
-                Err(ExplorerError::Unexpected(format!(
-                    "The GIO listing task failed: {error}"
-                )))
-            })
         }
         LocationBackend::Local => {
             let local = state.local.clone();

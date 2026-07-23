@@ -1,4 +1,8 @@
-use std::{ffi::OsString, os::windows::ffi::OsStringExt, path::PathBuf};
+use std::{
+    ffi::OsString,
+    os::windows::ffi::{OsStrExt, OsStringExt},
+    path::PathBuf,
+};
 
 use windows::{
     core::PCWSTR,

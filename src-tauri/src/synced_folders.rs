@@ -702,10 +702,12 @@ mod tests {
         assert!(!error.contains('@'));
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "requires real macOS iCloud Drive or File Provider roots"]
-    fn native_macos_roots_register_and_open_without_provider_authority_crossing_ipc() {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn run_native_local_synced_folder_smoke(
+        platform: &str,
+        home: PathBuf,
+        roots: Vec<SyncedFolderRoot>,
+    ) {
         use std::{sync::mpsc, time::Duration};
 
         use crate::{
@@ -713,12 +715,6 @@ mod tests {
             local_filesystem::LocalRoot,
         };
 
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .expect("native smoke requires an accessible macOS home directory");
-        let roots = discover_macos_roots(&home)
-            .unwrap_or_else(|_| panic!("native macOS synced-folder discovery failed"));
         assert!(
             !roots.is_empty(),
             "native smoke requires at least one configured synced-folder root"
@@ -731,10 +727,10 @@ mod tests {
             role: LocationRole::Home,
             path: home.clone(),
         }])
-        .unwrap_or_else(|_| panic!("native macOS local filesystem setup failed"));
+        .unwrap_or_else(|_| panic!("native synced-folder local filesystem setup failed"));
         let locations = filesystem
             .replace_synced_folders(roots)
-            .unwrap_or_else(|_| panic!("native macOS synced-folder registration failed"));
+            .unwrap_or_else(|_| panic!("native synced-folder registration failed"));
         assert_eq!(locations.len(), expected_root_count);
         assert!(locations.iter().all(|location| {
             location.display_path == location.name && location.root.display_path == location.name
@@ -743,8 +739,11 @@ mod tests {
             location
                 .synced_folder
                 .as_ref()
-                .is_some_and(|metadata| metadata.status == SyncedFolderStatus::Unknown)
+                .is_some_and(|metadata| metadata.source == SyncedFolderSource::System)
         }));
+        let serialized = serde_json::to_string(&locations)
+            .expect("native synced-folder locations should serialize");
+        assert!(!serialized.contains('@'));
 
         let mut opened_roots = 0_usize;
         for root in roots_to_open {
@@ -799,12 +798,44 @@ mod tests {
         }
 
         eprintln!(
-            "native macOS synced-folder smoke: discovered={expected_root_count}, opened={opened_roots}, stalled_or_failed={}",
+            "native {platform} synced-folder smoke: discovered={expected_root_count}, opened={opened_roots}, stalled_or_failed={}",
             expected_root_count - opened_roots
         );
         assert!(
             opened_roots > 0,
-            "no discovered macOS synced-folder root opened through the local backend"
+            "no discovered synced-folder root opened through the local backend"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires real macOS iCloud Drive or File Provider roots"]
+    fn native_macos_roots_register_and_open_without_provider_authority_crossing_ipc() {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .expect("native smoke requires an accessible macOS home directory");
+        let roots = discover_macos_roots(&home)
+            .unwrap_or_else(|_| panic!("native macOS synced-folder discovery failed"));
+        assert!(roots
+            .iter()
+            .all(|root| root.metadata.status == SyncedFolderStatus::Unknown));
+
+        run_native_local_synced_folder_smoke("macOS", home, roots);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "requires real Windows Cloud Files sync roots"]
+    fn native_windows_roots_register_and_open_without_provider_authority_crossing_ipc() {
+        let home = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .expect("native smoke requires an accessible Windows home directory");
+        let roots = discover_windows_roots()
+            .unwrap_or_else(|_| panic!("native Windows synced-folder discovery failed"));
+
+        run_native_local_synced_folder_smoke("Windows", home, roots);
     }
 }

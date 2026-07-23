@@ -693,11 +693,6 @@ mod platform {
         }
         let (directory, parent, breadcrumbs) =
             filesystem.navigation_context(location_id, directory_id)?;
-        emit(DirectoryListingEvent::Started {
-            directory,
-            parent,
-            breadcrumbs,
-        })?;
 
         with_cancellable(cancelled, |cancellable| {
             let enumerator = file
@@ -707,6 +702,14 @@ mod platform {
                     Some(cancellable),
                 )
                 .map_err(map_gio_error)?;
+            // Opening a provider namespace can block. Do not publish a Started
+            // event after the request has been cancelled or timed out.
+            ensure_not_cancelled(cancelled)?;
+            emit(DirectoryListingEvent::Started {
+                directory,
+                parent,
+                breadcrumbs,
+            })?;
             let mut batch = Vec::with_capacity(LISTING_BATCH_SIZE);
             let mut replace = true;
             loop {
@@ -990,5 +993,68 @@ mod tests {
         assert!(!json.contains("person@example.com"));
         assert!(json.contains("Google Drive"));
         assert!(json.contains("\"backend\":\"gio\""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a real GNOME Online Accounts Google Drive mount"]
+    fn native_linux_google_drive_mounts_register_and_open_without_uris_crossing_ipc() {
+        use std::{sync::mpsc, time::Duration};
+
+        let filesystem = GioFilesystem::start()
+            .unwrap_or_else(|_| panic!("native Linux GIO synced-folder discovery failed"));
+        let locations = filesystem
+            .locations()
+            .unwrap_or_else(|_| panic!("native Linux GIO synced-folder snapshot failed"));
+        assert!(
+            !locations.is_empty(),
+            "native smoke requires at least one Google Drive GIO mount"
+        );
+        let serialized =
+            serde_json::to_string(&locations).expect("native GIO locations should serialize");
+        assert!(!serialized.contains("google-drive://"));
+        assert!(!serialized.contains('@'));
+
+        let expected_root_count = locations.len();
+        let mut opened_roots = 0_usize;
+        for location in locations {
+            let filesystem = Arc::clone(&filesystem);
+            let (sender, receiver) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let mut opened = false;
+                let result = filesystem.list_directory(
+                    &location.root.id,
+                    &location.id,
+                    &AtomicBool::new(false),
+                    |event| {
+                        if matches!(event, DirectoryListingEvent::Started { .. }) {
+                            opened = true;
+                            // Opening the provider namespace is enough for this
+                            // smoke. Enumerating private user entries belongs in
+                            // a controlled fixture or packaged-app scenario.
+                            return Err(ExplorerError::Cancelled);
+                        }
+                        Ok(())
+                    },
+                );
+                let _ = sender.send(opened && matches!(result, Err(ExplorerError::Cancelled)));
+            });
+
+            if receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or(false)
+            {
+                opened_roots += 1;
+            }
+        }
+
+        eprintln!(
+            "native Linux GIO synced-folder smoke: discovered={expected_root_count}, opened={opened_roots}, stalled_or_failed={}",
+            expected_root_count - opened_roots
+        );
+        assert!(
+            opened_roots > 0,
+            "no discovered Google Drive GIO root opened through the GIO backend"
+        );
     }
 }

@@ -23,7 +23,7 @@ Current synced-folder support is intentionally phased:
 | ------------ | --------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
 | macOS        | Initial iCloud Drive and `~/Library/CloudStorage` discovery     | Read-only through opaque local references | iCloud metadata and explicit Download to Preview; real online-only validation pending; third-party unknown |
 | Windows      | Implemented through registered Storage Provider sync roots      | Read-only through opaque local references | Cloud Files metadata and explicit Download to Preview; native provider validation pending                  |
-| Linux        | Explicit local folders plus GNOME/GVfs Google Drive mounts      | Read-only local and GIO transports        | Local mirrors and bounded GIO preview streams; native validation pending                                   |
+| Linux        | Explicit local folders plus GNOME/GVfs Google Drive mounts      | Read-only local and GIO transports        | Local mirrors and bounded GIO preview streams; native validation deferred pending a representative host    |
 | Browser demo | Deterministic iCloud Drive, OneDrive, and Google Drive fixtures | Implemented for UI development and tests  | Synthetic explicit-download lifecycle and online-only states                                               |
 
 Packaged macOS, Windows, and Linux provider validation, automatic discovery of
@@ -151,3 +151,9 @@ when needed.
 The Playwright suite validates the browser-rendered shell. It is not packaged
 Tauri end-to-end proof; native menus, window behavior, and IPC require separate
 desktop smoke tests as those capabilities are introduced.
+
+GitHub Actions is configured to run the locked format, lint, check, and unit-test
+command surface on macOS, Windows, and Ubuntu. This compiles each target-gated
+Rust adapter, but hosted runners do not have authenticated provider accounts and
+therefore cannot run the ignored real-provider smokes or replace packaged native
+validation. The first remote run remains required validation for the workflow.

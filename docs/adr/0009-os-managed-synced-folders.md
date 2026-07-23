@@ -100,7 +100,10 @@ The GIO adapter retains every URI behind opaque Rust references. It enumerates
 only Google Drive mounts already authenticated and mounted by the desktop,
 listens for mount lifecycle changes on the GTK/GLib main loop, and revokes
 references when a mount disappears. Listing requests run off the UI thread with
-`GCancellable`. Explicit Quick Preview reads stream only the bounded bytes
+`GCancellable`. Local and GIO provider namespace opens share a four-worker cap
+and a 30-second command deadline. A timed-out or cancelled request cannot emit a
+late Started event, and its blocking worker retains capacity until the native
+call actually exits. Explicit Quick Preview reads stream only the bounded bytes
 requested by the existing preview pipeline into an owner-only temporary file,
 then reuse the same decoding, image, PDF, timeout, concurrency, and cleanup
 limits as local previews. No URI is converted to a POSIX path or exposed over
