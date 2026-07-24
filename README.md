@@ -8,6 +8,10 @@ bounded Quick Preview for local text, source, common raster-image, and PDF files
 Local and SSH files, directories, and symlinks can be renamed, moved within one
 backend location, and permanently deleted through a capability-driven,
 cancellable Rust operation boundary. Local entries also use native Trash.
+Double-click, Enter, and the Open context action launch local files with their
+default native application while Space remains Quick Preview. SSH files open as
+bounded, cancellable, read-only local snapshots; large or unknown downloads
+require confirmation and are never uploaded automatically.
 Saved SSH targets and concrete aliases from
 `~/.ssh/config` appear alongside local favorites. The browser-only Vite
 application retains deterministic local and remote demo assets for UI development
@@ -81,6 +85,14 @@ slices. See
 and
 [`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)
 for the persistence and volume-lifecycle decisions.
+
+Native opening is authorized with those same opaque references. Local files and
+file symlinks are delegated to the operating system, local macOS `.app` bundles
+launch normally, and directories continue to navigate inside Explora. Remote
+snapshots have bounded concurrency and size, carry platform origin metadata,
+and are cleaned on the next launch. See
+[`docs/adr/0009-native-file-opening.md`](docs/adr/0009-native-file-opening.md)
+for the transfer, cleanup, and security decisions.
 
 Filesystem mutations use typed per-entry capabilities and a Rust-owned operation
 lifecycle. See [`docs/filesystem-action.md`](docs/filesystem-action.md) and

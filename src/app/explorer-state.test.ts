@@ -18,6 +18,7 @@ import type {
   ConnectSshOptions,
   FileOperationOptions,
   ListDirectoryOptions,
+  OpenEntryOptions,
   PreparePreviewOptions,
   PreparedPreview,
   WatchVolumesOptions,
@@ -111,6 +112,15 @@ class StalePreviewDataSource extends DemoExplorerDataSource {
       },
       dispose: () => this.disposedEntryIds.push(entry.reference.id),
     };
+  }
+}
+
+class RecordingNativeOpenDataSource extends DemoExplorerDataSource {
+  readonly opened: string[] = [];
+
+  override async openEntry(entry: FileEntrySummary, options: OpenEntryOptions) {
+    this.opened.push(entry.name);
+    return super.openEntry(entry, options);
   }
 }
 
@@ -818,6 +828,54 @@ describe("ExplorerState", () => {
 
     state.closePreview();
     expect(state.previewOpen).toBe(false);
+  });
+
+  it("opens files natively while keeping Space-based preview separate", async () => {
+    const dataSource = new RecordingNativeOpenDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    const file = state.entries.find(({ name }) => name === "explora-notes.md")!;
+
+    await state.openEntry(file.reference.id);
+    expect(dataSource.opened).toEqual(["explora-notes.md"]);
+    expect(state.previewOpen).toBe(false);
+
+    state.selectEntry(file.reference.id);
+    await state.openPreview();
+    expect(state.preview?.entryId).toBe(file.reference.id);
+  });
+
+  it("requires confirmation before downloading a large remote file", async () => {
+    const dataSource = new RecordingNativeOpenDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectLocation("staging-box");
+    const file = state.entries.find(({ name }) => name === "README.md")!;
+    file.size = (300 * 1024 * 1024).toString();
+
+    await state.openEntry(file.reference.id);
+    expect(state.pendingNativeOpenConfirmation?.entry.name).toBe("README.md");
+    expect(state.nativeOpenOperations).toHaveLength(0);
+
+    await state.confirmNativeOpen();
+    expect(state.pendingNativeOpenConfirmation).toBeNull();
+    expect(dataSource.opened).toEqual(["README.md", "README.md"]);
+  });
+
+  it("requires confirmation when a remote file's size is unknown", async () => {
+    const dataSource = new RecordingNativeOpenDataSource();
+    const state = new ExplorerState(dataSource);
+    await state.initialize();
+    await state.selectLocation("staging-box");
+    const file = state.entries.find(({ name }) => name === "README.md")!;
+    file.size = null;
+
+    await state.openEntry(file.reference.id);
+
+    expect(state.pendingNativeOpenConfirmation).toMatchObject({
+      entry: { name: "README.md" },
+      size: null,
+    });
   });
 
   it("disposes stale and closed preview resources", async () => {

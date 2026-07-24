@@ -45,6 +45,7 @@ const entryPayload = {
     trash: true,
     deletePermanently: true,
   },
+  nativeOpen: "direct",
 };
 
 const previewEntry: FileEntrySummary = {
@@ -62,6 +63,7 @@ const previewEntry: FileEntrySummary = {
     trash: true,
     deletePermanently: true,
   },
+  nativeOpen: "direct",
 };
 
 const destination: DirectoryRef = {
@@ -1246,6 +1248,74 @@ describe("TauriExplorerDataSource", () => {
 
     await expect(preview).rejects.toMatchObject({ name: "AbortError" });
     expect(commands).toContain("cancel_preview");
+  });
+
+  it("streams validated native-open progress and returns its typed outcome", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "open_entry") return null;
+      if (
+        !payload ||
+        Array.isArray(payload) ||
+        payload instanceof ArrayBuffer ||
+        payload instanceof Uint8Array
+      ) {
+        throw new Error("Expected native-open command arguments.");
+      }
+      sendChannelMessages(payload.onEvent, [
+        { phase: "queued" },
+        {
+          phase: "downloading",
+          transferredBytes: "5",
+          totalBytes: "5",
+        },
+        { phase: "launching" },
+      ]);
+      return { outcome: "opened" };
+    });
+
+    const source = new TauriExplorerDataSource();
+    const onProgress = vi.fn();
+    await expect(
+      source.openEntry(previewEntry, {
+        signal: new AbortController().signal,
+        allowLargeRemoteDownload: false,
+        onProgress,
+      }),
+    ).resolves.toEqual({ outcome: "opened" });
+    expect(onProgress).toHaveBeenNthCalledWith(1, { phase: "queued" });
+    expect(onProgress).toHaveBeenNthCalledWith(2, {
+      phase: "downloading",
+      transferredBytes: "5",
+      totalBytes: "5",
+    });
+    expect(onProgress).toHaveBeenNthCalledWith(3, { phase: "launching" });
+  });
+
+  it("cancels a native-open request when its abort signal fires", async () => {
+    const commands: string[] = [];
+    let finish = () => {};
+    mockIPC((command) => {
+      commands.push(command);
+      if (command === "open_entry") {
+        return new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+      }
+      if (command === "cancel_open_entry") finish();
+      return null;
+    });
+
+    const source = new TauriExplorerDataSource();
+    const controller = new AbortController();
+    const opening = source.openEntry(previewEntry, {
+      signal: controller.signal,
+      allowLargeRemoteDownload: false,
+      onProgress: () => {},
+    });
+    controller.abort();
+
+    await expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    expect(commands).toContain("cancel_open_entry");
   });
 
   it("validates saved SSH targets and their editable metadata", async () => {

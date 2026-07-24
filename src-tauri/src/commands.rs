@@ -18,6 +18,10 @@ use crate::{
         LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
     },
     local_filesystem::LocalFilesystem,
+    native_open::{
+        NativeOpenEventDto, NativeOpenManager, NativeOpenOutcomeDto, LARGE_REMOTE_OPEN_BYTES,
+        MAX_REMOTE_OPEN_BYTES,
+    },
     preferences::{
         PreferencesSnapshotDto, PreferencesStore, UserPreferencesDto, UserPreferencesPatchDto,
     },
@@ -34,6 +38,7 @@ pub struct AppState {
     ssh: Arc<SshConnectionManager>,
     preview: Arc<PreviewManager>,
     volumes: Arc<VolumeManager>,
+    native_open: Arc<NativeOpenManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
     operations: Arc<FileOperationCoordinator>,
 }
@@ -44,6 +49,7 @@ impl AppState {
         preferences: PreferencesStore,
         ssh_targets: SshTargetStore,
         volumes: Arc<VolumeManager>,
+        native_open: NativeOpenManager,
     ) -> Self {
         Self {
             local,
@@ -52,6 +58,7 @@ impl AppState {
             ssh: Arc::new(SshConnectionManager::default()),
             preview: Arc::new(PreviewManager::default()),
             volumes,
+            native_open: Arc::new(native_open),
             listings: Mutex::new(HashMap::new()),
             operations: Arc::new(FileOperationCoordinator::default()),
         }
@@ -126,6 +133,11 @@ pub fn list_locations(
     let mut locations = state.local.locations().map_err(ExplorerErrorDto::from)?;
     locations.extend(state.ssh.locations());
     Ok(locations)
+}
+
+#[tauri::command]
+pub fn get_native_open_status(state: State<'_, AppState>) -> Option<String> {
+    state.native_open.startup_warning()
 }
 
 #[tauri::command]
@@ -418,6 +430,165 @@ pub fn discard_preview_resource(
     state
         .preview
         .discard_resource(&resource_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn open_entry(
+    state: State<'_, AppState>,
+    request_id: String,
+    entry_id: String,
+    location_id: String,
+    allow_large_remote_download: bool,
+    on_event: Channel<NativeOpenEventDto>,
+) -> Result<NativeOpenOutcomeDto, ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&entry_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
+    let cancellation = state
+        .native_open
+        .begin(&request_id)
+        .map_err(ExplorerErrorDto::from)?;
+
+    let result = open_entry_inner(
+        &state,
+        &entry_id,
+        &location_id,
+        allow_large_remote_download,
+        &on_event,
+        &cancellation,
+    )
+    .await;
+    state.native_open.finish(&request_id);
+    result.map_err(ExplorerErrorDto::from)
+}
+
+async fn open_entry_inner(
+    state: &State<'_, AppState>,
+    entry_id: &str,
+    location_id: &str,
+    allow_large_remote_download: bool,
+    on_event: &Channel<NativeOpenEventDto>,
+    cancellation: &AtomicBool,
+) -> Result<NativeOpenOutcomeDto, ExplorerError> {
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(ExplorerError::Cancelled);
+    }
+
+    if !location_id.starts_with("ssh:") {
+        let local = state.local.clone();
+        let native_open = state.native_open.clone();
+        let entry_id = entry_id.to_owned();
+        let location_id = location_id.to_owned();
+        on_event
+            .send(NativeOpenEventDto::Launching)
+            .map_err(|_| ExplorerError::ChannelClosed)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let path = local.resolve_native_open_path(&entry_id, &location_id)?;
+            native_open.open(&path)?;
+            Ok(NativeOpenOutcomeDto::Opened)
+        })
+        .await
+        .map_err(|error| {
+            ExplorerError::Unexpected(format!("The native-open task failed: {error}"))
+        })?;
+    }
+
+    let metadata = state
+        .ssh
+        .native_open_metadata(location_id, entry_id, cancellation)
+        .await?;
+    if metadata
+        .size
+        .is_some_and(|size| size > MAX_REMOTE_OPEN_BYTES)
+    {
+        return Err(ExplorerError::Unsupported(
+            "Remote files larger than 2 GiB cannot be opened yet.".to_owned(),
+        ));
+    }
+    if !allow_large_remote_download
+        && metadata
+            .size
+            .is_none_or(|size| size > LARGE_REMOTE_OPEN_BYTES)
+    {
+        return Ok(NativeOpenOutcomeDto::ConfirmationRequired {
+            size: metadata.size.map(|size| size.to_string()),
+        });
+    }
+
+    on_event
+        .send(NativeOpenEventDto::Queued)
+        .map_err(|_| ExplorerError::ChannelClosed)?;
+    let _permit = state
+        .native_open
+        .acquire_download_slot(cancellation)
+        .await?;
+    if cancellation.load(Ordering::Relaxed) {
+        return Err(ExplorerError::Cancelled);
+    }
+    let name = state.ssh.native_open_name(location_id, entry_id)?;
+    let (partial_path, final_path) = state.native_open.destination(&name)?;
+    let download = state
+        .ssh
+        .download_for_native_open(
+            location_id,
+            entry_id,
+            &partial_path,
+            cancellation,
+            MAX_REMOTE_OPEN_BYTES,
+            |transferred, total| {
+                on_event
+                    .send(NativeOpenEventDto::Downloading {
+                        transferred_bytes: transferred.to_string(),
+                        total_bytes: total.map(|value| value.to_string()),
+                    })
+                    .map_err(|_| ExplorerError::ChannelClosed)
+            },
+        )
+        .await;
+    let download = match download {
+        Ok(download) => download,
+        Err(error) => {
+            state.native_open.discard_snapshot(&partial_path);
+            return Err(error);
+        }
+    };
+    if cancellation.load(Ordering::Relaxed) {
+        state.native_open.discard_snapshot(&partial_path);
+        return Err(ExplorerError::Cancelled);
+    }
+    if let Err(error) =
+        state
+            .native_open
+            .finalize_remote_snapshot(&partial_path, &final_path, download.executable)
+    {
+        state.native_open.discard_snapshot(&partial_path);
+        return Err(error);
+    }
+    if cancellation.load(Ordering::Relaxed) {
+        state.native_open.discard_snapshot(&final_path);
+        return Err(ExplorerError::Cancelled);
+    }
+    if on_event.send(NativeOpenEventDto::Launching).is_err() {
+        state.native_open.discard_snapshot(&final_path);
+        return Err(ExplorerError::ChannelClosed);
+    }
+    if let Err(error) = state.native_open.open(&final_path) {
+        state.native_open.discard_snapshot(&final_path);
+        return Err(error);
+    }
+    Ok(NativeOpenOutcomeDto::Opened)
+}
+
+#[tauri::command]
+pub fn cancel_open_entry(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .native_open
+        .cancel(&request_id)
         .map_err(ExplorerErrorDto::from)
 }
 

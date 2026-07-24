@@ -16,6 +16,9 @@ import type {
   LocationStatus,
   LocationSummary,
   ManualSshTargetInput,
+  NativeOpenCapability,
+  NativeOpenOutcome,
+  NativeOpenProgress,
   PreviewContent,
   PreviewImageMediaType,
   PreviewSummary,
@@ -33,6 +36,7 @@ import type {
   FileOperationOptions,
   FileOperationProgress,
   ListDirectoryOptions,
+  OpenEntryOptions,
   PreparePreviewOptions,
   PreparedPreview,
   RemoveEntryOptions,
@@ -108,6 +112,11 @@ const previewImageMediaTypes = new Set<PreviewImageMediaType>([
   "image/webp",
 ]);
 const imagePreviewModes = new Set<ImagePreviewMode>(["direct", "sanitized"]);
+const nativeOpenCapabilities = new Set<NativeOpenCapability>([
+  "none",
+  "direct",
+  "download",
+]);
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -335,12 +344,18 @@ const parseEntry = (value: unknown): FileEntrySummary => {
 
   const kind = requireString(value, "kind");
   const contentKind = requireString(value, "contentKind");
+  const nativeOpen = requireString(value, "nativeOpen");
   if (!entryKinds.has(kind as EntryKind)) {
     throw new Error(`Invalid filesystem response: unknown entry kind ${kind}.`);
   }
   if (!contentKinds.has(contentKind as ContentKind)) {
     throw new Error(
       `Invalid filesystem response: unknown content kind ${contentKind}.`,
+    );
+  }
+  if (!nativeOpenCapabilities.has(nativeOpen as NativeOpenCapability)) {
+    throw new Error(
+      `Invalid filesystem response: unknown native-open capability ${nativeOpen}.`,
     );
   }
   if (
@@ -394,6 +409,7 @@ const parseEntry = (value: unknown): FileEntrySummary => {
       value.directory === null ? null : parseDirectoryRef(value.directory),
     detail: typeof value.detail === "string" ? value.detail : undefined,
     capabilities: parsedCapabilities,
+    nativeOpen: nativeOpen as NativeOpenCapability,
   };
 };
 
@@ -743,6 +759,48 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
   };
 };
 
+const parseNativeOpenProgress = (value: unknown): NativeOpenProgress => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid native-open response: progress is malformed.");
+  }
+  if (value.phase === "queued" || value.phase === "launching") {
+    return { phase: value.phase };
+  }
+  if (value.phase !== "downloading") {
+    throw new Error("Invalid native-open response: progress phase is unknown.");
+  }
+  if (
+    typeof value.transferredBytes !== "string" ||
+    !/^\d+$/.test(value.transferredBytes) ||
+    (value.totalBytes !== null &&
+      (typeof value.totalBytes !== "string" || !/^\d+$/.test(value.totalBytes)))
+  ) {
+    throw new Error(
+      "Invalid native-open response: byte progress is malformed.",
+    );
+  }
+  return {
+    phase: "downloading",
+    transferredBytes: value.transferredBytes,
+    totalBytes: value.totalBytes,
+  };
+};
+
+const parseNativeOpenOutcome = (value: unknown): NativeOpenOutcome => {
+  if (!isRecord(value)) {
+    throw new Error("Invalid native-open response: outcome is malformed.");
+  }
+  if (value.outcome === "opened") return { outcome: "opened" };
+  if (
+    value.outcome === "confirmationRequired" &&
+    (value.size === null ||
+      (typeof value.size === "string" && /^\d+$/.test(value.size)))
+  ) {
+    return { outcome: "confirmationRequired", size: value.size };
+  }
+  throw new Error("Invalid native-open response: outcome is unknown.");
+};
+
 interface PreparedPreviewPayload {
   entryId: string;
   size: string | null;
@@ -1028,6 +1086,18 @@ const requestId = () =>
 
 export class TauriExplorerDataSource implements ExplorerDataSource {
   private readonly sshChannels = new Map<string, Channel<unknown>>();
+
+  async getNativeOpenStartupWarning(
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    if (signal.aborted) throw abortError();
+    const payload = await invoke<unknown>("get_native_open_status");
+    if (signal.aborted) throw abortError();
+    if (payload !== null && typeof payload !== "string") {
+      throw new Error("Invalid native-open response: warning is malformed.");
+    }
+    return payload;
+  }
 
   async listLocations(
     signal: AbortSignal,
@@ -1742,6 +1812,52 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
       }
       if (imageUrl) URL.revokeObjectURL(imageUrl);
       if (signal.aborted) throw abortError();
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  async openEntry(
+    entry: FileEntrySummary,
+    { signal, allowLargeRemoteDownload, onProgress }: OpenEntryOptions,
+  ): Promise<NativeOpenOutcome> {
+    if (signal.aborted) throw abortError();
+    const id = requestId();
+    const channel = new Channel<unknown>();
+    let payloadError: Error | null = null;
+    const cancel = () => {
+      void invoke("cancel_open_entry", { requestId: id }).catch(() => {
+        // Cancellation is best-effort; stale progress is ignored below.
+      });
+    };
+    channel.onmessage = (payload) => {
+      if (signal.aborted || payloadError) return;
+      try {
+        onProgress(parseNativeOpenProgress(payload));
+      } catch (error) {
+        payloadError =
+          error instanceof Error
+            ? error
+            : new Error("Invalid native-open response.");
+        cancel();
+      }
+    };
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const payload = await invoke<unknown>("open_entry", {
+        requestId: id,
+        entryId: entry.reference.id,
+        locationId: entry.reference.locationId,
+        allowLargeRemoteDownload,
+        onEvent: channel,
+      });
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
+      return parseNativeOpenOutcome(payload);
+    } catch (error) {
+      if (signal.aborted) throw abortError();
+      if (payloadError) throw payloadError;
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);

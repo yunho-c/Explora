@@ -9,6 +9,7 @@ import type {
   ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
+  NativeOpenProgress,
   PreviewSummary,
   SshConnectionEvent,
   SshPromptResponse,
@@ -22,6 +23,7 @@ import { SvelteSet } from "svelte/reactivity";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
+import { SvelteMap } from "svelte/reactivity";
 import {
   DEFAULT_FAVORITE_ROLES,
   isFavoriteRole,
@@ -77,6 +79,22 @@ export interface PendingSshPrompt {
   respond: (response: SshPromptResponse) => Promise<void>;
 }
 
+export interface NativeOpenOperation {
+  id: string;
+  entryId: string;
+  title: string;
+  locationName: string;
+  phase: NativeOpenProgress["phase"];
+  transferredBytes: string;
+  totalBytes: string | null;
+}
+
+export interface PendingNativeOpenConfirmation {
+  entry: FileEntrySummary;
+  locationName: string;
+  size: string | null;
+}
+
 export class ExplorerState {
   readonly fileOperations: FileOperationStore;
   locations = $state<LocationSummary[]>([]);
@@ -103,6 +121,12 @@ export class ExplorerState {
   warningMessage = $state<string | null>(null);
   preferencesWarningMessage = $state<string | null>(null);
   volumeWarningMessage = $state<string | null>(null);
+  nativeOpenWarningMessage = $state<string | null>(null);
+  nativeOpenErrorMessage = $state<string | null>(null);
+  nativeOpenOperations = $state<NativeOpenOperation[]>([]);
+  pendingNativeOpenConfirmation = $state<PendingNativeOpenConfirmation | null>(
+    null,
+  );
   previewOpen = $state(false);
   previewLoading = $state(false);
   preview = $state<PreviewSummary | null>(null);
@@ -127,8 +151,10 @@ export class ExplorerState {
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
   private volumeWatchController: AbortController | null = null;
+  private nativeOpenControllers = new SvelteMap<string, AbortController>();
   private volumeRevision = -1;
   private tabSequence = 0;
+  private nativeOpenSequence = 0;
   private preferencesInitialization: Promise<void> | null = null;
   private preferenceWriteQueue: Promise<void> = Promise.resolve();
   private selectionAnchorId: string | null = null;
@@ -299,7 +325,7 @@ export class ExplorerState {
     const controller = new AbortController();
 
     try {
-      const [locations, sshTargets] = await Promise.all([
+      const [locations, sshTargets, nativeOpenWarning] = await Promise.all([
         this.dataSource.listLocations(controller.signal),
         this.dataSource.listSshTargets(controller.signal).catch((error) => {
           this.sshErrorMessage =
@@ -308,9 +334,13 @@ export class ExplorerState {
               : "Explora could not load SSH targets.";
           return [];
         }),
+        this.dataSource
+          .getNativeOpenStartupWarning(controller.signal)
+          .catch(() => null),
       ]);
       this.locations = [...locations];
       this.sshTargets = [...sshTargets];
+      this.nativeOpenWarningMessage = nativeOpenWarning;
       this.startVolumeWatch();
       const initialLocation = this.locations[0];
 
@@ -342,6 +372,10 @@ export class ExplorerState {
     this.previewController?.abort();
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();
+    for (const controller of this.nativeOpenControllers.values()) {
+      controller.abort();
+    }
+    this.nativeOpenControllers.clear();
   }
 
   private startVolumeWatch(): void {
@@ -876,11 +910,105 @@ export class ExplorerState {
     if (!entry) return;
 
     this.setSingleSelection(entry.reference.id);
-    if (entry.directory) {
+    if (entry.nativeOpen !== "none") {
+      await this.openWithNativeApplication(entry, false);
+    } else if (entry.directory) {
       await this.openDirectory(entry.directory);
     } else {
       await this.openPreview(entry.reference.id);
     }
+  }
+
+  async confirmNativeOpen(): Promise<void> {
+    const pending = this.pendingNativeOpenConfirmation;
+    if (!pending) return;
+    this.pendingNativeOpenConfirmation = null;
+    await this.openWithNativeApplication(pending.entry, true);
+  }
+
+  dismissNativeOpenConfirmation(): void {
+    this.pendingNativeOpenConfirmation = null;
+  }
+
+  cancelNativeOpen(operationId: string): void {
+    this.nativeOpenControllers.get(operationId)?.abort();
+    this.removeNativeOpenOperation(operationId);
+  }
+
+  private async openWithNativeApplication(
+    entry: FileEntrySummary,
+    allowLargeRemoteDownload: boolean,
+  ): Promise<void> {
+    this.nativeOpenSequence += 1;
+    const operationId = `native-open-${this.nativeOpenSequence}`;
+    const controller = new AbortController();
+    const locationName =
+      this.locations.find(({ id }) => id === entry.reference.locationId)
+        ?.name ?? "this location";
+    this.nativeOpenControllers.set(operationId, controller);
+    this.nativeOpenOperations = [
+      ...this.nativeOpenOperations,
+      {
+        id: operationId,
+        entryId: entry.reference.id,
+        title: entry.name,
+        locationName,
+        phase: entry.nativeOpen === "download" ? "queued" : "launching",
+        transferredBytes: "0",
+        totalBytes: entry.size,
+      },
+    ];
+    this.nativeOpenErrorMessage = null;
+
+    try {
+      const outcome = await this.dataSource.openEntry(entry, {
+        signal: controller.signal,
+        allowLargeRemoteDownload,
+        onProgress: (progress) => {
+          if (!this.nativeOpenControllers.has(operationId)) return;
+          this.nativeOpenOperations = this.nativeOpenOperations.map(
+            (operation) =>
+              operation.id === operationId
+                ? {
+                    ...operation,
+                    phase: progress.phase,
+                    transferredBytes:
+                      progress.phase === "downloading"
+                        ? progress.transferredBytes
+                        : operation.transferredBytes,
+                    totalBytes:
+                      progress.phase === "downloading"
+                        ? progress.totalBytes
+                        : operation.totalBytes,
+                  }
+                : operation,
+          );
+        },
+      });
+      if (outcome.outcome === "confirmationRequired") {
+        this.pendingNativeOpenConfirmation = {
+          entry,
+          locationName,
+          size: outcome.size,
+        };
+      }
+    } catch (error) {
+      if (!isAbortError(error)) {
+        this.nativeOpenErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not open this item.";
+      }
+    } finally {
+      this.removeNativeOpenOperation(operationId);
+    }
+  }
+
+  private removeNativeOpenOperation(operationId: string): void {
+    this.nativeOpenControllers.delete(operationId);
+    this.nativeOpenOperations = this.nativeOpenOperations.filter(
+      ({ id }) => id !== operationId,
+    );
   }
 
   toggleSort(column: SortColumn): void {

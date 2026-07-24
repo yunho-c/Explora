@@ -645,6 +645,39 @@ describe("ExplorerShell", () => {
     expect(await screen.findByText("explora-notes.md")).toBeInTheDocument();
   });
 
+  it("confirms large remote snapshots and exposes cancellable progress", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    await state.selectLocation("staging-box");
+    const file = state.entries.find(({ name }) => name === "README.md")!;
+    file.size = (300 * 1024 * 1024).toString();
+    renderShell(state);
+
+    await fireEvent.dblClick(screen.getByText("README.md"));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("Download and open this remote file?");
+    expect(dialog).toHaveTextContent("Changes made in the native application");
+
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Download and open" }),
+    );
+    expect(
+      await screen.findByRole("region", {
+        name: "Files opening in native applications",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Cancel opening README.md" }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("region", {
+          name: "Files opening in native applications",
+        }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
   it("limits custom titlebar dragging to non-interactive chrome", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

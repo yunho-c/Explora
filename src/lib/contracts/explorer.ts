@@ -27,6 +27,7 @@ export type ViewMode = "list" | "grid";
 export type SortColumn = "name" | "modifiedAt" | "size";
 export type SortDirection = "ascending" | "descending";
 export type ImagePreviewMode = "direct" | "sanitized";
+export type NativeOpenCapability = "none" | "direct" | "download";
 export type PreviewImageMediaType =
   "image/bmp" | "image/jpeg" | "image/png" | "image/webp";
 
@@ -145,6 +146,7 @@ export interface FileEntrySummary {
   directory: DirectoryRef | null;
   detail?: string;
   capabilities: EntryCapabilities;
+  nativeOpen: NativeOpenCapability;
 }
 
 export type FileOperationPrompt =
@@ -226,6 +228,19 @@ export interface FileOperationBatchResult {
   status: "completed" | "partial" | "cancelled";
   items: readonly FileOperationBatchItem[];
 }
+
+export type NativeOpenProgress =
+  | { phase: "queued" }
+  | {
+      phase: "downloading";
+      transferredBytes: string;
+      totalBytes: string | null;
+    }
+  | { phase: "launching" };
+
+export type NativeOpenOutcome =
+  | { outcome: "opened" }
+  | { outcome: "confirmationRequired"; size: string | null };
 
 export interface ExplorerTab {
   id: string;

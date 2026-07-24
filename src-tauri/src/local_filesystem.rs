@@ -1106,6 +1106,30 @@ impl LocalFilesystem {
         Ok((name, location_name))
     }
 
+    pub(crate) fn resolve_native_open_path(
+        &self,
+        entry_id: &str,
+        location_id: &str,
+    ) -> Result<PathBuf, ExplorerError> {
+        let path = self.resolve_preview_path(entry_id, location_id)?;
+        let link_metadata = fs::symlink_metadata(&path)
+            .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
+        let target_metadata = if link_metadata.file_type().is_symlink() {
+            Some(
+                fs::metadata(&path)
+                    .map_err(|error| ExplorerError::io("open", path.as_path(), error))?,
+            )
+        } else {
+            None
+        };
+        if native_open_capability(&path, &link_metadata, target_metadata.as_ref()) != "direct" {
+            return Err(ExplorerError::Unsupported(
+                "This item cannot be opened with a native application.".to_owned(),
+            ));
+        }
+        Ok(path)
+    }
+
     pub fn list_directory<F>(
         &self,
         directory_id: &str,
@@ -1220,10 +1244,13 @@ impl LocalFilesystem {
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| ExplorerError::io("inspect", path.as_path(), error))?;
         let file_type = metadata.file_type();
-        let symlink_target_is_directory = file_type.is_symlink()
-            && fs::metadata(&path)
-                .map(|target| target.is_dir())
-                .unwrap_or(false);
+        let target_metadata = file_type
+            .is_symlink()
+            .then(|| fs::metadata(&path).ok())
+            .flatten();
+        let symlink_target_is_directory = target_metadata
+            .as_ref()
+            .is_some_and(std::fs::Metadata::is_dir);
         let is_navigable = file_type.is_dir() || symlink_target_is_directory;
         let id = self.registry.register(location_id, path.clone())?;
         let directory = is_navigable.then(|| DirectoryRefDto {
@@ -1270,6 +1297,7 @@ impl LocalFilesystem {
             directory,
             detail: file_type.is_symlink().then_some("Symbolic link"),
             capabilities: EntryCapabilitiesDto::local(self.trash_available),
+            native_open: native_open_capability(&path, &metadata, target_metadata.as_ref()),
         })
     }
 
@@ -1706,6 +1734,43 @@ fn rename_case_only(source: &Path, destination: &Path) -> Result<(), ExplorerErr
         return Err(ExplorerError::io("rename", source, error));
     }
     Ok(())
+}
+
+fn native_open_capability(
+    path: &Path,
+    metadata: &fs::Metadata,
+    target_metadata: Option<&fs::Metadata>,
+) -> &'static str {
+    let target_is_file = if metadata.file_type().is_symlink() {
+        target_metadata.is_some_and(fs::Metadata::is_file)
+    } else {
+        metadata.is_file()
+    };
+    if target_is_file {
+        return "direct";
+    }
+
+    let target_is_directory = if metadata.file_type().is_symlink() {
+        target_metadata.is_some_and(fs::Metadata::is_dir)
+    } else {
+        metadata.is_dir()
+    };
+    if target_is_directory && is_native_application_bundle(path) {
+        "direct"
+    } else {
+        "none"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_native_application_bundle(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_native_application_bundle(_path: &Path) -> bool {
+    false
 }
 
 fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), ExplorerError> {
@@ -2236,12 +2301,14 @@ mod tests {
 
         assert_eq!(folder.kind, "directory");
         assert!(folder.directory.is_some());
+        assert_eq!(folder.native_open, "none");
         assert_eq!(file.size.as_deref(), Some("5"));
         assert_eq!(file.content_kind, "document");
         assert!(file.capabilities.rename);
         assert!(file.capabilities.move_entry);
         assert!(file.capabilities.trash);
         assert!(file.capabilities.delete_permanently);
+        assert_eq!(file.native_open, "direct");
         assert!(!file.reference.id.contains("notes.md"));
         assert_eq!(started.0.id, root.id);
         assert!(started.1.is_none());
@@ -2985,5 +3052,90 @@ mod tests {
         let link = link.expect("link entry");
         assert_eq!(link.kind, "symlink");
         assert!(link.directory.is_some());
+        assert_eq!(link.native_open, "none");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opens_file_symlinks_through_their_opaque_reference() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temporary directory");
+        fs::write(temp.path().join("target.txt"), b"hello").expect("target file");
+        symlink(temp.path().join("target.txt"), temp.path().join("link.txt")).expect("symlink");
+        let filesystem = LocalFilesystem::new(vec![LocalRoot {
+            id: "home",
+            name: "Home",
+            role: LocationRole::Home,
+            path: temp.path().to_path_buf(),
+        }])
+        .expect("local filesystem");
+        let root = filesystem.locations().expect("locations")[0].root.clone();
+        let mut link = None;
+        filesystem
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        link = entries.into_iter().find(|entry| entry.name == "link.txt");
+                    }
+                    Ok(())
+                },
+            )
+            .expect("listing");
+        let link = link.expect("file symlink");
+        assert_eq!(link.native_open, "direct");
+        assert_eq!(
+            filesystem
+                .resolve_native_open_path(&link.reference.id, &link.reference.location_id)
+                .expect("resolved open path"),
+            temp.path().join("link.txt")
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_application_bundles_are_openable_instead_of_only_navigable() {
+        let temp = TempDir::new().expect("temporary directory");
+        fs::create_dir(temp.path().join("Example.app")).expect("application bundle");
+        let filesystem = LocalFilesystem::new(vec![LocalRoot {
+            id: "home",
+            name: "Home",
+            role: LocationRole::Home,
+            path: temp.path().to_path_buf(),
+        }])
+        .expect("local filesystem");
+        let root = filesystem.locations().expect("locations")[0].root.clone();
+        let mut application = None;
+        filesystem
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        application = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "Example.app");
+                    }
+                    Ok(())
+                },
+            )
+            .expect("listing");
+        let application = application.expect("application entry");
+        assert_eq!(application.kind, "directory");
+        assert!(application.directory.is_some());
+        assert_eq!(application.native_open, "direct");
+        assert_eq!(
+            filesystem
+                .resolve_native_open_path(
+                    &application.reference.id,
+                    &application.reference.location_id,
+                )
+                .expect("resolved application bundle"),
+            temp.path().join("Example.app")
+        );
     }
 }

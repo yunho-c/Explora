@@ -11,6 +11,7 @@ import type {
   FileRemovalResult,
   LocationSummary,
   ManualSshTargetInput,
+  NativeOpenOutcome,
   PreviewContent,
   SshTargetSummary,
 } from "$lib/contracts/explorer";
@@ -21,6 +22,7 @@ import type {
   ExplorerDataSource,
   FileOperationOptions,
   ListDirectoryOptions,
+  OpenEntryOptions,
   PreparePreviewOptions,
   PreparedPreview,
   RemoveEntryOptions,
@@ -250,6 +252,7 @@ const makeEntry = (
       trash: !remote,
       deletePermanently: true,
     },
+    nativeOpen: kind === "directory" ? "none" : remote ? "download" : "direct",
   };
 };
 
@@ -538,6 +541,13 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   private readonly renamedEntries = new Map<string, FileEntrySummary>();
   private readonly movedParentIds = new Map<string, string>();
   private readonly removedEntryIds = new Set<string>();
+
+  async getNativeOpenStartupWarning(
+    signal: AbortSignal,
+  ): Promise<string | null> {
+    if (signal.aborted) throw abortError();
+    return null;
+  }
   private sshTargets: SshTargetSummary[] = [
     {
       id: "demo:staging-box",
@@ -1291,5 +1301,37 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       },
       dispose: () => {},
     };
+  }
+
+  async openEntry(
+    entry: FileEntrySummary,
+    { signal, allowLargeRemoteDownload, onProgress }: OpenEntryOptions,
+  ): Promise<NativeOpenOutcome> {
+    if (
+      entry.nativeOpen === "download" &&
+      entry.size !== null &&
+      BigInt(entry.size) > 2n * 1024n * 1024n * 1024n
+    ) {
+      throw new Error("Remote files larger than 2 GiB cannot be opened yet.");
+    }
+    if (
+      entry.nativeOpen === "download" &&
+      !allowLargeRemoteDownload &&
+      (entry.size === null || BigInt(entry.size) > 256n * 1024n * 1024n)
+    ) {
+      return { outcome: "confirmationRequired", size: entry.size };
+    }
+    if (entry.nativeOpen === "download") {
+      onProgress({ phase: "queued" });
+      await wait(40, signal);
+      onProgress({
+        phase: "downloading",
+        transferredBytes: entry.size ?? "0",
+        totalBytes: entry.size,
+      });
+    }
+    await wait(30, signal);
+    onProgress({ phase: "launching" });
+    return { outcome: "opened" };
   }
 }
