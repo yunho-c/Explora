@@ -2,6 +2,13 @@ import type {
   ContentKind,
   DirectoryRef,
   FileEntrySummary,
+  FileOperationBatchResult,
+  FileOperationItemOutcome,
+  FileMoveResult,
+  FileOperationConfirmation,
+  FileOperationPrompt,
+  FileOperationPromptResponse,
+  FileRemovalResult,
   LocationSummary,
   ManualSshTargetInput,
   NativeOpenOutcome,
@@ -13,12 +20,24 @@ import { createDemoPdf } from "./demo-pdf";
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
+  FileOperationOptions,
   ListDirectoryOptions,
   OpenEntryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RemoveEntryOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
+
+const localDirectoryCapabilities = {
+  acceptMove: true,
+  atomicReplace: false,
+} as const;
+
+const unavailableDirectoryCapabilities = {
+  acceptMove: false,
+  atomicReplace: false,
+} as const;
 
 const roots: Readonly<Record<string, DirectoryRef>> = {
   home: {
@@ -26,60 +45,70 @@ const roots: Readonly<Record<string, DirectoryRef>> = {
     locationId: "home",
     name: "Home",
     displayPath: "Home",
+    capabilities: localDirectoryCapabilities,
   },
   desktop: {
     id: "desktop",
     locationId: "desktop",
     name: "Desktop",
     displayPath: "Home/Desktop",
+    capabilities: localDirectoryCapabilities,
   },
   documents: {
     id: "documents",
     locationId: "documents",
     name: "Documents",
     displayPath: "Home/Documents",
+    capabilities: localDirectoryCapabilities,
   },
   downloads: {
     id: "downloads",
     locationId: "downloads",
     name: "Downloads",
     displayPath: "Home/Downloads",
+    capabilities: localDirectoryCapabilities,
   },
   pictures: {
     id: "pictures",
     locationId: "pictures",
     name: "Pictures",
     displayPath: "Home/Pictures",
+    capabilities: localDirectoryCapabilities,
   },
   music: {
     id: "music",
     locationId: "music",
     name: "Music",
     displayPath: "Home/Music",
+    capabilities: localDirectoryCapabilities,
   },
   videos: {
     id: "videos",
     locationId: "videos",
     name: "Movies",
     displayPath: "Home/Movies",
+    capabilities: localDirectoryCapabilities,
   },
   workspace: {
     id: "workspace",
     locationId: "workspace",
     name: "Workspace",
     displayPath: "Workspace",
+    capabilities: localDirectoryCapabilities,
   },
   "staging-box": {
     id: "staging-box",
     locationId: "staging-box",
     name: "staging-box",
     displayPath: "staging-box:~/projects",
+    capabilities: localDirectoryCapabilities,
   },
   "render-node": {
     id: "render-node",
     locationId: "render-node",
     name: "render-node",
     displayPath: "render-node:~",
+    capabilities: unavailableDirectoryCapabilities,
   },
 };
 
@@ -186,6 +215,8 @@ const locations: readonly LocationSummary[] = [
   },
 ];
 
+const remoteDemoLocationIds = new Set(["staging-box", "render-node"]);
+
 const makeEntry = (
   locationId: string,
   name: string,
@@ -194,31 +225,36 @@ const makeEntry = (
   size: number | null,
   modifiedAt: string,
   detail?: string,
-): FileEntrySummary => ({
-  reference: { id: `${locationId}:${name}`, locationId },
-  name,
-  kind,
-  contentKind,
-  size: size?.toString() ?? null,
-  modifiedAt: Date.parse(modifiedAt),
-  displayPath: `${roots[locationId].displayPath}/${name}`,
-  directory:
-    kind === "directory"
-      ? {
-          id: `${locationId}:${name}`,
-          locationId,
-          name,
-          displayPath: `${roots[locationId].displayPath}/${name}`,
-        }
-      : null,
-  detail,
-  nativeOpen:
-    kind === "directory"
-      ? "none"
-      : locationId === "staging-box" || locationId === "render-node"
-        ? "download"
-        : "direct",
-});
+): FileEntrySummary => {
+  const remote = remoteDemoLocationIds.has(locationId);
+  return {
+    reference: { id: `${locationId}:${name}`, locationId },
+    name,
+    kind,
+    contentKind,
+    size: size?.toString() ?? null,
+    modifiedAt: Date.parse(modifiedAt),
+    displayPath: `${roots[locationId].displayPath}/${name}`,
+    directory:
+      kind === "directory"
+        ? {
+            id: `${locationId}:${name}`,
+            locationId,
+            name,
+            displayPath: `${roots[locationId].displayPath}/${name}`,
+            capabilities: localDirectoryCapabilities,
+          }
+        : null,
+    detail,
+    capabilities: {
+      rename: true,
+      move: true,
+      trash: !remote,
+      deletePermanently: true,
+    },
+    nativeOpen: kind === "directory" ? "none" : remote ? "download" : "direct",
+  };
+};
 
 const entriesByLocation: Readonly<Record<string, readonly FileEntrySummary[]>> =
   {
@@ -502,13 +538,16 @@ const wait = (duration: number, signal: AbortSignal) =>
   });
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
+  private readonly renamedEntries = new Map<string, FileEntrySummary>();
+  private readonly movedParentIds = new Map<string, string>();
+  private readonly removedEntryIds = new Set<string>();
+
   async getNativeOpenStartupWarning(
     signal: AbortSignal,
   ): Promise<string | null> {
     if (signal.aborted) throw abortError();
     return null;
   }
-
   private sshTargets: SshTargetSummary[] = [
     {
       id: "demo:staging-box",
@@ -641,6 +680,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
         locationId,
         name: target.name,
         displayPath: `${target.name}:~`,
+        capabilities: localDirectoryCapabilities,
       };
       location = {
         id: locationId,
@@ -693,11 +733,25 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     const isKnownChild = Object.values(entriesByLocation)
       .flat()
       .some((entry) => entry.directory?.id === directory.id);
-    const entries =
-      rootEntries ??
-      (this.dynamicRoots.has(directory.locationId) || isKnownChild
-        ? []
-        : undefined);
+    const knownDirectory =
+      rootEntries !== undefined ||
+      this.dynamicRoots.has(directory.locationId) ||
+      isKnownChild;
+    const entries = knownDirectory
+      ? Object.entries(entriesByLocation)
+          .flatMap(([parentId, entries]) =>
+            entries.map((entry) => ({ entry, parentId })),
+          )
+          .filter(
+            ({ entry, parentId }) =>
+              !this.removedEntryIds.has(entry.reference.id) &&
+              (this.movedParentIds.get(entry.reference.id) ?? parentId) ===
+                directory.id,
+          )
+          .map(
+            ({ entry }) => this.renamedEntries.get(entry.reference.id) ?? entry,
+          )
+      : undefined;
 
     if (!entries || !root) {
       throw new Error(`Unknown demo directory: ${directory.id}`);
@@ -725,6 +779,451 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       onBatch({ entries: entries.slice(splitAt), replace: false });
     }
     onComplete({ skippedEntries: 0 });
+  }
+
+  async renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    await wait(40, signal);
+    if (!entry.capabilities.rename) {
+      throw new Error("This item cannot be renamed.");
+    }
+    if (
+      newName.length === 0 ||
+      new TextEncoder().encode(newName).length > 255 ||
+      newName === "." ||
+      newName === ".." ||
+      newName.includes("/") ||
+      newName.includes("\0")
+    ) {
+      throw new Error("Enter a valid file name between 1 and 255 bytes.");
+    }
+
+    const siblings = Object.values(entriesByLocation)
+      .find((entries) =>
+        entries.some(
+          (candidate) => candidate.reference.id === entry.reference.id,
+        ),
+      )
+      ?.filter((candidate) => !this.removedEntryIds.has(candidate.reference.id))
+      .map(
+        (candidate) =>
+          this.renamedEntries.get(candidate.reference.id) ?? candidate,
+      );
+    if (
+      siblings?.some(
+        (candidate) =>
+          candidate.reference.id !== entry.reference.id &&
+          candidate.name === newName,
+      )
+    ) {
+      throw new Error("An item with that name already exists.");
+    }
+
+    const separator = entry.displayPath.lastIndexOf("/");
+    const displayPath = `${entry.displayPath.slice(0, separator + 1)}${newName}`;
+    const renamed: FileEntrySummary = {
+      ...entry,
+      name: newName,
+      displayPath,
+      directory: entry.directory
+        ? { ...entry.directory, name: newName, displayPath }
+        : null,
+    };
+    this.renamedEntries.set(entry.reference.id, renamed);
+    return renamed;
+  }
+
+  async moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult> {
+    await wait(40, options.signal);
+    if (!entry.capabilities.move || !destination.capabilities.acceptMove) {
+      throw new Error("This item cannot be moved to that folder.");
+    }
+    const transferred = entry.reference.locationId !== destination.locationId;
+    if (
+      entry.directory &&
+      !transferred &&
+      (entry.directory.id === destination.id ||
+        destination.displayPath.startsWith(`${entry.displayPath}/`))
+    ) {
+      throw new Error(
+        "A folder cannot be moved into itself or one of its subfolders.",
+      );
+    }
+
+    const sourceParentId =
+      this.movedParentIds.get(entry.reference.id) ??
+      Object.entries(entriesByLocation).find(([, entries]) =>
+        entries.some(
+          (candidate) => candidate.reference.id === entry.reference.id,
+        ),
+      )?.[0];
+    if (!sourceParentId) throw new Error("The source is no longer available.");
+    const sourceParent = this.findDemoDirectory(sourceParentId);
+    if (!sourceParent) throw new Error("The source folder is unavailable.");
+    if (
+      sourceParent.locationId === destination.locationId &&
+      sourceParent.id === destination.id
+    ) {
+      return {
+        kind: "moved",
+        entry,
+        sourceParent,
+        destination,
+        rebasedEntryIds: [entry.reference.id],
+        invalidatedEntryIds: [],
+      };
+    }
+
+    const destinationEntries = Object.entries(entriesByLocation)
+      .flatMap(([parentId, entries]) =>
+        entries.map((candidate) => ({ candidate, parentId })),
+      )
+      .filter(
+        ({ candidate, parentId }) =>
+          !this.removedEntryIds.has(candidate.reference.id) &&
+          (this.movedParentIds.get(candidate.reference.id) ?? parentId) ===
+            destination.id,
+      )
+      .map(
+        ({ candidate }) =>
+          this.renamedEntries.get(candidate.reference.id) ?? candidate,
+      );
+    let name = entry.name;
+    if (destinationEntries.some((candidate) => candidate.name === name)) {
+      const response = await this.awaitMoveConflict(
+        entry,
+        destination,
+        options,
+      );
+      if (response === "cancel") throw abortError();
+      if (response === "skip") {
+        return {
+          kind: "moveSkipped",
+          entry: entry.reference,
+          name: entry.name,
+        };
+      }
+      if (response !== "keepBoth") {
+        throw new Error("The move conflict response was not valid.");
+      }
+      let attempt = 1;
+      do {
+        const suffix = attempt === 1 ? " copy" : ` copy ${attempt}`;
+        const dot =
+          entry.kind === "directory" ? -1 : entry.name.lastIndexOf(".");
+        name =
+          dot > 0
+            ? `${entry.name.slice(0, dot)}${suffix}${entry.name.slice(dot)}`
+            : `${entry.name}${suffix}`;
+        attempt += 1;
+      } while (destinationEntries.some((candidate) => candidate.name === name));
+    }
+
+    await wait(40, options.signal);
+    const displayPath = `${destination.displayPath}/${name}`;
+    const moved: FileEntrySummary = {
+      ...entry,
+      reference: transferred
+        ? { ...entry.reference, locationId: destination.locationId }
+        : entry.reference,
+      name,
+      displayPath,
+      directory: entry.directory
+        ? {
+            ...entry.directory,
+            locationId: transferred
+              ? destination.locationId
+              : entry.directory.locationId,
+            name,
+            displayPath,
+          }
+        : null,
+    };
+    this.renamedEntries.set(entry.reference.id, moved);
+    this.movedParentIds.set(entry.reference.id, destination.id);
+    return {
+      kind: "moved",
+      entry: moved,
+      sourceParent,
+      destination,
+      rebasedEntryIds: transferred ? [] : [entry.reference.id],
+      invalidatedEntryIds: transferred ? [entry.reference.id] : [],
+    };
+  }
+
+  async moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    return this.runBatch(entries, options, (entry) =>
+      this.moveEntry(entry, destination, options),
+    );
+  }
+
+  async trashEntry(
+    entry: FileEntrySummary,
+    { signal }: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    await wait(40, signal);
+    if (!entry.capabilities.trash) {
+      throw new Error("This item cannot be moved to Trash.");
+    }
+    return this.removeDemoEntry(entry, "trashed");
+  }
+
+  async trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    return this.runBatch(entries, options, (entry) =>
+      this.trashEntry(entry, options),
+    );
+  }
+
+  async deleteEntryPermanently(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    if (!entry.capabilities.deletePermanently) {
+      throw new Error("This item cannot be deleted permanently.");
+    }
+    const response = await this.awaitDeleteConfirmation([entry], options);
+    if (response === "cancel") throw abortError();
+    await wait(40, options.signal);
+    return this.removeDemoEntry(entry, "deletedPermanently");
+  }
+
+  async deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const response = await this.awaitDeleteConfirmation(entries, options);
+    if (response === "cancel") {
+      return {
+        kind: "batch",
+        status: "cancelled",
+        items: entries.map((entry) => ({
+          status: "notStarted",
+          source: entry.reference,
+        })),
+      };
+    }
+    return this.runBatch(entries, options, async (entry) => {
+      if (!entry.capabilities.deletePermanently) {
+        throw new Error("This item cannot be deleted permanently.");
+      }
+      await wait(40, options.signal);
+      return this.removeDemoEntry(entry, "deletedPermanently");
+    });
+  }
+
+  private async runBatch(
+    entries: readonly FileEntrySummary[],
+    options: FileOperationOptions,
+    run: (entry: FileEntrySummary) => Promise<FileOperationItemOutcome>,
+  ): Promise<FileOperationBatchResult> {
+    const items: FileOperationBatchResult["items"][number][] = [];
+    let completed = 0;
+    let failed = false;
+    options.onProgress?.({
+      completedItems: 0,
+      totalItems: entries.length,
+      completedBytes: null,
+      totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
+    });
+    for (const [index, entry] of entries.entries()) {
+      if (options.signal.aborted) {
+        items.push({ status: "cancelled", source: entry.reference });
+        items.push(
+          ...entries.slice(index + 1).map((remaining) => ({
+            status: "notStarted" as const,
+            source: remaining.reference,
+          })),
+        );
+        return { kind: "batch", status: "cancelled", items };
+      }
+      try {
+        const outcome = await run(entry);
+        items.push({ status: "completed", source: entry.reference, outcome });
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          items.push({ status: "cancelled", source: entry.reference });
+          items.push(
+            ...entries.slice(index + 1).map((remaining) => ({
+              status: "notStarted" as const,
+              source: remaining.reference,
+            })),
+          );
+          return { kind: "batch", status: "cancelled", items };
+        }
+        failed = true;
+        items.push({
+          status: "failed",
+          source: entry.reference,
+          error: {
+            code: "unexpected",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Explora could not complete this item.",
+          },
+        });
+      }
+      completed += 1;
+      options.onProgress?.({
+        completedItems: completed,
+        totalItems: entries.length,
+        completedBytes: null,
+        totalBytes: null,
+        currentItemCompleted: null,
+        currentItemTotal: null,
+      });
+    }
+    return {
+      kind: "batch",
+      status: failed ? "partial" : "completed",
+      items,
+    };
+  }
+
+  private removeDemoEntry(
+    entry: FileEntrySummary,
+    kind: FileRemovalResult["kind"],
+  ): FileRemovalResult {
+    const invalidatedEntryIds = Object.values(entriesByLocation)
+      .flat()
+      .filter(
+        (candidate) =>
+          candidate.reference.id === entry.reference.id ||
+          candidate.displayPath.startsWith(`${entry.displayPath}/`),
+      )
+      .map((candidate) => candidate.reference.id);
+    if (!invalidatedEntryIds.includes(entry.reference.id)) {
+      invalidatedEntryIds.unshift(entry.reference.id);
+    }
+    for (const id of invalidatedEntryIds) {
+      this.removedEntryIds.add(id);
+      this.renamedEntries.delete(id);
+      this.movedParentIds.delete(id);
+    }
+    return {
+      kind,
+      entry: entry.reference,
+      name: entry.name,
+      invalidatedEntryIds,
+    };
+  }
+
+  private awaitDeleteConfirmation(
+    entries: readonly FileEntrySummary[],
+    { signal, onPrompt }: RemoveEntryOptions,
+  ): Promise<FileOperationPromptResponse> {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      let answered = false;
+      const abort = () => {
+        if (answered) return;
+        answered = true;
+        reject(abortError());
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      const entry = entries[0];
+      const count = entries.length;
+      const location =
+        locations.find(({ id }) => id === entry.reference.locationId) ??
+        this.dynamicLocations.get(entry.reference.locationId);
+      const remote = location?.kind === "ssh";
+      const confirmation: FileOperationConfirmation = {
+        id: `demo-delete-${entries.map(({ reference }) => reference.id).join("-")}`,
+        kind: "permanentDelete",
+        title:
+          count === 1
+            ? `Delete “${entry.name}” permanently?`
+            : `Delete ${count} items permanently?`,
+        message: remote
+          ? count === 1
+            ? `This remote item on ${location.name} will be removed immediately. It cannot be recovered from Trash.`
+            : `These remote items on ${location.name} will be removed immediately. They cannot be recovered from Trash.`
+          : count === 1
+            ? "This item will be removed immediately and cannot be recovered from Trash."
+            : "These items will be removed immediately and cannot be recovered from Trash.",
+        targetName: count === 1 ? entry.name : `${count} selected items`,
+        locationName: location
+          ? remote
+            ? `${location.name} (${location.detail})`
+            : location.name
+          : "Local files",
+        confirmLabel: "Delete Permanently",
+      };
+      onPrompt(confirmation, async (response) => {
+        if (answered) {
+          throw new Error("This filesystem confirmation was already answered.");
+        }
+        answered = true;
+        signal.removeEventListener("abort", abort);
+        resolve(response);
+      });
+    });
+  }
+
+  private findDemoDirectory(id: string): DirectoryRef | undefined {
+    return (
+      Object.values(roots).find((directory) => directory.id === id) ??
+      Object.values(entriesByLocation)
+        .flat()
+        .find((entry) => entry.directory?.id === id)?.directory ??
+      [...this.dynamicRoots.values()].find((directory) => directory.id === id)
+    );
+  }
+
+  private awaitMoveConflict(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    { signal, onPrompt }: FileOperationOptions,
+  ): Promise<FileOperationPromptResponse> {
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(abortError());
+        return;
+      }
+      let answered = false;
+      const abort = () => {
+        if (answered) return;
+        answered = true;
+        reject(abortError());
+      };
+      signal.addEventListener("abort", abort, { once: true });
+      const prompt: FileOperationPrompt = {
+        id: `demo-move-${entry.reference.id}`,
+        kind: "moveConflict",
+        title: `“${entry.name}” already exists`,
+        message: `Choose how to handle the existing item in “${destination.name}”. Nothing will be replaced.`,
+        targetName: entry.name,
+        destinationName: destination.name,
+        decisions: ["keepBoth", "skip", "cancel"],
+      };
+      onPrompt(prompt, async (response) => {
+        if (answered) {
+          throw new Error("This filesystem decision was already answered.");
+        }
+        answered = true;
+        signal.removeEventListener("abort", abort);
+        resolve(response);
+      });
+    });
   }
 
   async getPreview(

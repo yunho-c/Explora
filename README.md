@@ -1,10 +1,13 @@
 # Explora
 
 Explora is a calm, modern desktop file explorer for local and SSH locations. The
-packaged Tauri application provides read-only local and SSH/SFTP navigation
-through Rust-owned backends. It opens at Home, streams directory listings,
+packaged Tauri application provides local and SSH/SFTP navigation through
+Rust-owned backends. It opens at Home, streams directory listings,
 supports folder, breadcrumb, Up, Back, Forward, and tab navigation, and provides
 bounded Quick Preview for local text, source, common raster-image, and PDF files.
+Local and SSH files, directories, and symlinks can be renamed, moved within one
+backend location, and permanently deleted through a capability-driven,
+cancellable Rust operation boundary. Local entries also use native Trash.
 Double-click, Enter, and the Open context action launch local files with their
 default native application while Space remains Quick Preview. SSH files open as
 bounded, cancellable, read-only local snapshots; large or unknown downloads
@@ -58,6 +61,31 @@ authoritative. See
 and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ssh-sftp-locations.md)
 for the authorization, trust, and credential-handling model.
 
+The local backend exposes safe single-entry rename, batch move, native Trash,
+and explicitly confirmed permanent deletion. Connected SFTP locations expose
+no-overwrite rename and batch move plus explicitly confirmed permanent deletion;
+remote Trash remains unavailable. Cross-location and cross-backend moves copy to
+an owned partial destination, finalize and verify the copy, then remove the
+source. Multi-selection, in-memory cut/paste, and internal drag-and-drop use the
+same typed operation lifecycle. SSH authentication supports agents, standard or
+configured identity files, encrypted-key passphrases, passwords, and
+keyboard-interactive prompts. Explora uses standard `known_hosts` files, requires
+confirmation for unknown keys, and blocks changed keys. `ProxyJump` and
+`ProxyCommand` are reported as unsupported and are never silently executed.
+Bounded keepalives detect dropped sessions, offline tabs retain their current
+folder and history, and an explicit reconnect resumes the same opaque directory
+reference when it is still valid. Refresh reloads the active folder without
+changing navigation history. Mounted local volumes are discovered in the Rust
+boundary and updated through native platform notifications with a bounded polling
+fallback. Sidebar layout, favorites, view mode, sorting, and SSH target visibility
+persist as versioned local preferences. File watching, hidden-file controls,
+remote content previews, and additional preview formats remain later vertical
+slices. See
+[`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
+and
+[`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)
+for the persistence and volume-lifecycle decisions.
+
 Native opening is authorized with those same opaque references. Local files and
 file symlinks are delegated to the operating system, local macOS `.app` bundles
 launch normally, and directories continue to navigate inside Explora. Remote
@@ -66,25 +94,10 @@ and are cleaned on the next launch. See
 [`docs/adr/0009-native-file-opening.md`](docs/adr/0009-native-file-opening.md)
 for the transfer, cleanup, and security decisions.
 
-The current filesystem backends are deliberately read-only. SSH authentication
-supports agents, standard or configured identity files, encrypted-key
-passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
-`known_hosts` files, requires confirmation for unknown keys, and blocks changed
-keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
-silently executed. Bounded keepalives detect dropped sessions, offline tabs retain
-their current folder and history, and an explicit reconnect resumes the same
-opaque directory reference when it is still valid. Refresh reloads the active
-folder without changing navigation history. Mounted local volumes are discovered
-in the Rust boundary and updated through native platform notifications with a
-bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
-target visibility persist as versioned local preferences. File watching,
-hidden-file controls, mutations, remote content previews, and additional preview
-formats remain later vertical slices. Native opening downloads SSH snapshots but
-does not add general remote copy or write operations. See
-[`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
-and
-[`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)
-for the persistence and volume-lifecycle decisions.
+Filesystem mutations use typed per-entry capabilities and a Rust-owned operation
+lifecycle. See [`docs/filesystem-action.md`](docs/filesystem-action.md) and
+[`docs/adr/0010-capability-driven-filesystem-actions.md`](docs/adr/0010-capability-driven-filesystem-actions.md)
+for the complete architecture and the accepted security boundary.
 
 Local preview reads are authorized by opaque entry references and performed in
 bounded Rust workers. Text previews are capped and decoded without rendering
@@ -106,7 +119,8 @@ for the limits, resource lifecycle, and security tradeoff.
 Rust integration tests start disposable loopback SSH/SFTP servers and cover host
 trust, supported authentication methods, secret-safe prompts and errors,
 permission and symlink behavior, missing SFTP, delayed-request cancellation,
-disconnect detection, and reconnect continuity. The disposable SSH-agent test is
+rename and move conflicts, bounded recursive deletion, partial and uncertain
+outcomes, disconnect detection, timeouts, and reconnect continuity. The disposable SSH-agent test is
 Unix-only; the Windows Pageant and named-pipe paths remain platform-gated code
 that require Windows validation.
 

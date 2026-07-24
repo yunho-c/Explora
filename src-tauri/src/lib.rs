@@ -1,13 +1,18 @@
 mod commands;
+mod file_operations;
 mod filesystem;
 mod local_filesystem;
+mod local_relocate;
 mod native_open;
+mod platform_trash;
 mod preferences;
 mod preview;
+mod remote_transfer;
 mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
+mod transfer;
 mod volumes;
 
 use commands::AppState;
@@ -179,6 +184,9 @@ pub fn run() {
             commands::disconnect_ssh_target,
             commands::list_directory,
             commands::cancel_listing,
+            commands::start_file_operation,
+            commands::respond_file_operation,
+            commands::cancel_file_operation,
             commands::prepare_preview,
             commands::cancel_preview,
             commands::read_preview_resource,

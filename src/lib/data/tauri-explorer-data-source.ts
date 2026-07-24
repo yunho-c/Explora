@@ -6,6 +6,10 @@ import type {
   DirectoryRef,
   EntryKind,
   FileEntrySummary,
+  FileOperationBatchResult,
+  FileMoveResult,
+  FileOperationPrompt,
+  FileRemovalResult,
   ImagePreviewMode,
   LocationKind,
   LocationRole,
@@ -29,10 +33,13 @@ import type {
 import type {
   ConnectSshOptions,
   ExplorerDataSource,
+  FileOperationOptions,
+  FileOperationProgress,
   ListDirectoryOptions,
   OpenEntryOptions,
   PreparePreviewOptions,
   PreparedPreview,
+  RemoveEntryOptions,
   WatchVolumesOptions,
 } from "$lib/data/explorer-data-source";
 import { formatFileSize } from "$lib/file-metadata";
@@ -125,6 +132,17 @@ const requireString = (
   return value;
 };
 
+const requireBoolean = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => {
+  const value = record[key];
+  if (typeof value !== "boolean") {
+    throw new Error(`Invalid filesystem response: ${key} must be a boolean.`);
+  }
+  return value;
+};
+
 const parseDirectoryRef = (value: unknown): DirectoryRef => {
   if (!isRecord(value)) {
     throw new Error(
@@ -132,11 +150,20 @@ const parseDirectoryRef = (value: unknown): DirectoryRef => {
     );
   }
 
+  if (!isRecord(value.capabilities)) {
+    throw new Error(
+      "Invalid filesystem response: directory capabilities are malformed.",
+    );
+  }
   return {
     id: requireString(value, "id"),
     locationId: requireString(value, "locationId"),
     name: requireString(value, "name"),
     displayPath: requireString(value, "displayPath"),
+    capabilities: {
+      acceptMove: requireBoolean(value.capabilities, "acceptMove"),
+      atomicReplace: requireBoolean(value.capabilities, "atomicReplace"),
+    },
   };
 };
 
@@ -307,7 +334,11 @@ const parseSshConnectionEvent = (value: unknown): SshConnectionEvent => {
 };
 
 const parseEntry = (value: unknown): FileEntrySummary => {
-  if (!isRecord(value) || !isRecord(value.reference)) {
+  if (
+    !isRecord(value) ||
+    !isRecord(value.reference) ||
+    !isRecord(value.capabilities)
+  ) {
     throw new Error("Invalid filesystem response: entry must be an object.");
   }
 
@@ -355,6 +386,13 @@ const parseEntry = (value: unknown): FileEntrySummary => {
   ) {
     throw new Error("Invalid filesystem response: entry detail is malformed.");
   }
+  const capabilities = value.capabilities;
+  const parsedCapabilities = {
+    rename: requireBoolean(capabilities, "rename"),
+    move: requireBoolean(capabilities, "moveEntry"),
+    trash: requireBoolean(capabilities, "trash"),
+    deletePermanently: requireBoolean(capabilities, "deletePermanently"),
+  };
 
   return {
     reference: {
@@ -370,7 +408,354 @@ const parseEntry = (value: unknown): FileEntrySummary => {
     directory:
       value.directory === null ? null : parseDirectoryRef(value.directory),
     detail: typeof value.detail === "string" ? value.detail : undefined,
+    capabilities: parsedCapabilities,
     nativeOpen: nativeOpen as NativeOpenCapability,
+  };
+};
+
+type FileOperationAction =
+  | { kind: "rename"; newName: string }
+  | { kind: "move"; destination: DirectoryRef }
+  | { kind: "trash" }
+  | { kind: "deletePermanently" };
+
+type FileOperationOutcome =
+  | { kind: "renamed"; entry: FileEntrySummary }
+  | FileMoveResult
+  | FileRemovalResult
+  | FileOperationBatchResult;
+
+const parseEntryRef = (value: unknown) => {
+  if (!isRecord(value)) {
+    throw new Error(
+      "Invalid filesystem response: entry reference is malformed.",
+    );
+  }
+  return {
+    id: requireString(value, "id"),
+    locationId: requireString(value, "locationId"),
+  };
+};
+
+const parseOperationProgress = (
+  value: Record<string, unknown>,
+): FileOperationProgress => {
+  const completedItems = value.completedItems;
+  const totalItems = value.totalItems;
+  if (
+    typeof completedItems !== "number" ||
+    !Number.isSafeInteger(completedItems) ||
+    completedItems < 0 ||
+    typeof totalItems !== "number" ||
+    !Number.isSafeInteger(totalItems) ||
+    totalItems < 1 ||
+    totalItems > 100_000 ||
+    completedItems > totalItems
+  ) {
+    throw new Error(
+      "Invalid filesystem response: operation progress is malformed.",
+    );
+  }
+  const completedBytes = value.completedBytes ?? null;
+  const totalBytes = value.totalBytes ?? null;
+  const rawCurrentItemCompleted = value.currentItemCompleted ?? null;
+  const rawCurrentItemTotal = value.currentItemTotal ?? null;
+  if (
+    (rawCurrentItemCompleted === null) !== (rawCurrentItemTotal === null) ||
+    (rawCurrentItemCompleted !== null &&
+      (typeof rawCurrentItemCompleted !== "number" ||
+        !Number.isSafeInteger(rawCurrentItemCompleted) ||
+        rawCurrentItemCompleted < 0 ||
+        typeof rawCurrentItemTotal !== "number" ||
+        !Number.isSafeInteger(rawCurrentItemTotal) ||
+        rawCurrentItemTotal < 1 ||
+        rawCurrentItemTotal > 1_000_000 ||
+        rawCurrentItemCompleted > rawCurrentItemTotal))
+  ) {
+    throw new Error(
+      "Invalid filesystem response: current-item progress is malformed.",
+    );
+  }
+  const currentItemCompleted =
+    typeof rawCurrentItemCompleted === "number"
+      ? rawCurrentItemCompleted
+      : null;
+  const currentItemTotal =
+    typeof rawCurrentItemTotal === "number" ? rawCurrentItemTotal : null;
+  const validByteValue = (candidate: unknown): candidate is string =>
+    typeof candidate === "string" && /^(0|[1-9][0-9]*)$/.test(candidate);
+  if (completedBytes === null && totalBytes === null) {
+    return {
+      completedItems,
+      totalItems,
+      completedBytes: null,
+      totalBytes: null,
+      currentItemCompleted,
+      currentItemTotal,
+    };
+  }
+  if (
+    !validByteValue(completedBytes) ||
+    !validByteValue(totalBytes) ||
+    BigInt(completedBytes) > BigInt(totalBytes)
+  ) {
+    throw new Error(
+      "Invalid filesystem response: operation byte progress is malformed.",
+    );
+  }
+  return {
+    completedItems,
+    totalItems,
+    completedBytes,
+    totalBytes,
+    currentItemCompleted,
+    currentItemTotal,
+  };
+};
+
+const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
+  if (!isRecord(value)) {
+    throw new Error(
+      "Invalid filesystem response: operation prompt is malformed.",
+    );
+  }
+  if (value.kind === "permanentDelete") {
+    return {
+      id: requireString(value, "id"),
+      kind: "permanentDelete",
+      title: requireString(value, "title"),
+      message: requireString(value, "message"),
+      targetName: requireString(value, "targetName"),
+      locationName: requireString(value, "locationName"),
+      confirmLabel: requireString(value, "confirmLabel"),
+    };
+  }
+  if (value.kind === "moveConflict") {
+    if (!Array.isArray(value.decisions)) {
+      throw new Error(
+        "Invalid filesystem response: conflict decisions are malformed.",
+      );
+    }
+    const decisions = value.decisions.map((decision) => {
+      if (
+        decision !== "keepBoth" &&
+        decision !== "skip" &&
+        decision !== "cancel"
+      ) {
+        throw new Error(
+          "Invalid filesystem response: conflict decision is unsupported.",
+        );
+      }
+      return decision;
+    });
+    if (
+      decisions.length !== new Set(decisions).size ||
+      !decisions.includes("cancel") ||
+      decisions.length === 0
+    ) {
+      throw new Error(
+        "Invalid filesystem response: conflict decisions are malformed.",
+      );
+    }
+    return {
+      id: requireString(value, "id"),
+      kind: "moveConflict",
+      title: requireString(value, "title"),
+      message: requireString(value, "message"),
+      targetName: requireString(value, "targetName"),
+      destinationName: requireString(value, "destinationName"),
+      decisions,
+    };
+  }
+  throw new Error("Invalid filesystem response: operation prompt is unknown.");
+};
+
+const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
+  if (!isRecord(value)) {
+    throw new Error(
+      "Invalid filesystem response: operation outcome is malformed.",
+    );
+  }
+  if (value.kind === "renamed") {
+    return { kind: "renamed", entry: parseEntry(value.entry) };
+  }
+  if (value.kind === "batch") {
+    if (
+      value.status !== "completed" &&
+      value.status !== "partial" &&
+      value.status !== "cancelled"
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch status is malformed.",
+      );
+    }
+    if (
+      !Array.isArray(value.items) ||
+      value.items.length < 2 ||
+      value.items.length > 1_000
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch items are malformed.",
+      );
+    }
+    const seen = new Set<string>();
+    const items = value.items.map((candidate) => {
+      if (!isRecord(candidate)) {
+        throw new Error(
+          "Invalid filesystem response: batch item is malformed.",
+        );
+      }
+      const source = parseEntryRef(candidate.source);
+      const sourceKey = `${source.locationId}\u0000${source.id}`;
+      if (seen.has(sourceKey)) {
+        throw new Error(
+          "Invalid filesystem response: batch source is duplicated.",
+        );
+      }
+      seen.add(sourceKey);
+      if (candidate.status === "completed") {
+        const outcome = parseOperationOutcome(candidate.outcome);
+        if (outcome.kind === "batch" || outcome.kind === "renamed") {
+          throw new Error(
+            "Invalid filesystem response: batch item outcome is unsupported.",
+          );
+        }
+        return { status: "completed" as const, source, outcome };
+      }
+      if (candidate.status === "failed") {
+        if (!isRecord(candidate.error)) {
+          throw new Error(
+            "Invalid filesystem response: batch item error is malformed.",
+          );
+        }
+        return {
+          status: "failed" as const,
+          source,
+          error: {
+            code: requireString(candidate.error, "code"),
+            message: requireString(candidate.error, "message"),
+          },
+        };
+      }
+      if (candidate.status === "cancelled") {
+        return { status: "cancelled" as const, source };
+      }
+      if (candidate.status === "notStarted") {
+        return { status: "notStarted" as const, source };
+      }
+      throw new Error(
+        "Invalid filesystem response: batch item status is malformed.",
+      );
+    });
+    const hasFailure = items.some((item) => item.status === "failed");
+    const hasUnfinished = items.some(
+      (item) => item.status === "cancelled" || item.status === "notStarted",
+    );
+    if (
+      (value.status === "completed" && (hasFailure || hasUnfinished)) ||
+      (value.status === "partial" && !hasFailure) ||
+      (value.status === "cancelled" && !hasUnfinished)
+    ) {
+      throw new Error(
+        "Invalid filesystem response: batch status does not match its items.",
+      );
+    }
+    return { kind: "batch", status: value.status, items };
+  }
+  if (value.kind === "moved") {
+    if (
+      !Array.isArray(value.rebasedEntryIds) ||
+      !Array.isArray(value.invalidatedEntryIds)
+    ) {
+      throw new Error(
+        "Invalid filesystem response: rebased entry references are malformed.",
+      );
+    }
+    const rebasedEntryIds = value.rebasedEntryIds.map((id: unknown) => {
+      if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+        throw new Error(
+          "Invalid filesystem response: rebased entry references are malformed.",
+        );
+      }
+      return id;
+    });
+    const invalidatedEntryIds = value.invalidatedEntryIds.map((id: unknown) => {
+      if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+        throw new Error(
+          "Invalid filesystem response: invalidated entry references are malformed.",
+        );
+      }
+      return id;
+    });
+    const entry = parseEntry(value.entry);
+    const sourceParent = parseDirectoryRef(value.sourceParent);
+    const destination = parseDirectoryRef(value.destination);
+    const transferred = sourceParent.locationId !== entry.reference.locationId;
+    if (
+      rebasedEntryIds.length > 100_000 ||
+      invalidatedEntryIds.length > 100_000 ||
+      (transferred
+        ? rebasedEntryIds.length !== 0 || invalidatedEntryIds.length === 0
+        : invalidatedEntryIds.length !== 0 ||
+          !rebasedEntryIds.includes(entry.reference.id))
+    ) {
+      throw new Error(
+        "Invalid filesystem response: rebased entry references are malformed.",
+      );
+    }
+    return {
+      kind: "moved",
+      entry,
+      sourceParent,
+      destination,
+      rebasedEntryIds: [...new Set(rebasedEntryIds)],
+      invalidatedEntryIds: [...new Set(invalidatedEntryIds)],
+    };
+  }
+  if (value.kind === "moveSkipped") {
+    return {
+      kind: "moveSkipped",
+      entry: parseEntryRef(value.entry),
+      name: requireString(value, "name"),
+    };
+  }
+  if (value.kind !== "trashed" && value.kind !== "deletedPermanently") {
+    throw new Error(
+      "Invalid filesystem response: operation outcome is unknown.",
+    );
+  }
+  if (!Array.isArray(value.invalidatedEntryIds)) {
+    throw new Error(
+      "Invalid filesystem response: invalidated entry references are malformed.",
+    );
+  }
+  const invalidatedEntryIds = value.invalidatedEntryIds.map((id: unknown) => {
+    if (typeof id !== "string" || id.length === 0 || id.length > 256) {
+      throw new Error(
+        "Invalid filesystem response: invalidated entry references are malformed.",
+      );
+    }
+    return id;
+  });
+  if (
+    invalidatedEntryIds.length === 0 ||
+    invalidatedEntryIds.length > 100_000
+  ) {
+    throw new Error(
+      "Invalid filesystem response: invalidated entry references are malformed.",
+    );
+  }
+  const entry = parseEntryRef(value.entry);
+  if (!invalidatedEntryIds.includes(entry.id)) {
+    throw new Error(
+      "Invalid filesystem response: removed entry was not invalidated.",
+    );
+  }
+  return {
+    kind: value.kind,
+    entry,
+    name: requireString(value, "name"),
+    invalidatedEntryIds: [...new Set(invalidatedEntryIds)],
   };
 };
 
@@ -673,16 +1058,26 @@ const abortError = () => {
   return error;
 };
 
-const commandError = (error: unknown): Error => {
-  if (isRecord(error) && typeof error.message === "string") {
-    const result = new Error(error.message);
-    result.name =
-      error.code === "cancelled" ? "AbortError" : "ExplorerFilesystemError";
-    return result;
+export class ExplorerFilesystemError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+  ) {
+    super(message);
+    this.name = "ExplorerFilesystemError";
   }
-  return error instanceof Error
-    ? error
-    : new Error("Explora could not complete the filesystem request.");
+}
+
+const commandError = (error: unknown): Error => {
+  if (error instanceof Error) return error;
+  if (isRecord(error) && typeof error.message === "string") {
+    if (error.code === "cancelled") return abortError();
+    return new ExplorerFilesystemError(
+      error.message,
+      typeof error.code === "string" ? error.code : "unexpected",
+    );
+  }
+  return new Error("Explora could not complete the filesystem request.");
 };
 
 const requestId = () =>
@@ -1005,6 +1400,309 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     } catch (error) {
       if (signal.aborted) throw abortError();
       if (payloadError) throw payloadError;
+      throw commandError(error);
+    } finally {
+      signal.removeEventListener("abort", cancel);
+    }
+  }
+
+  async renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    const outcome = await this.runFileOperation(
+      [entry],
+      { kind: "rename", newName },
+      {
+        signal,
+        onPrompt: () => {
+          throw new Error(
+            "Invalid filesystem response: rename requested a prompt.",
+          );
+        },
+      },
+    );
+    if (outcome.kind !== "renamed") {
+      throw new Error(
+        "Invalid filesystem response: rename returned the wrong outcome.",
+      );
+    }
+    return outcome.entry;
+  }
+
+  async moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult> {
+    const outcome = await this.runFileOperation(
+      [entry],
+      { kind: "move", destination },
+      options,
+    );
+    if (outcome.kind !== "moved" && outcome.kind !== "moveSkipped") {
+      throw new Error(
+        "Invalid filesystem response: move returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "move", destination },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch move returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async trashEntry(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    const outcome = await this.runFileOperation(
+      [entry],
+      { kind: "trash" },
+      options,
+    );
+    if (outcome.kind !== "trashed") {
+      throw new Error(
+        "Invalid filesystem response: Trash returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "trash" },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch Trash returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async deleteEntryPermanently(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult> {
+    const outcome = await this.runFileOperation(
+      [entry],
+      { kind: "deletePermanently" },
+      options,
+    );
+    if (outcome.kind !== "deletedPermanently") {
+      throw new Error(
+        "Invalid filesystem response: permanent delete returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  async deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "deletePermanently" },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch permanent delete returned the wrong outcome.",
+      );
+    }
+    return outcome;
+  }
+
+  private async runFileOperation(
+    entries: readonly FileEntrySummary[],
+    action: FileOperationAction,
+    { signal, onProgress, onPrompt }: FileOperationOptions,
+  ): Promise<FileOperationOutcome> {
+    if (signal.aborted) throw abortError();
+
+    const channel = new Channel<unknown>();
+    let operationId: string | null = null;
+    let cancelRequested = false;
+    let cancellationSentFor: string | null = null;
+    let observedOperationId: string | null = null;
+    let lastSequence = -1;
+    let settled = false;
+    let resolveCompletion: (outcome: FileOperationOutcome) => void = () => {};
+    let rejectCompletion: (error: Error) => void = () => {};
+    const completion = new Promise<FileOperationOutcome>((resolve, reject) => {
+      resolveCompletion = resolve;
+      rejectCompletion = reject;
+    });
+    const cancel = () => {
+      cancelRequested = true;
+      if (!operationId || cancellationSentFor === operationId) return;
+      cancellationSentFor = operationId;
+      void invoke("cancel_file_operation", { operationId }).catch(() => {
+        // Cancellation is best-effort; terminal operation events stay authoritative.
+      });
+    };
+
+    channel.onmessage = (payload) => {
+      if (settled) return;
+      try {
+        if (!isRecord(payload)) {
+          throw new Error(
+            "Invalid filesystem response: operation event is malformed.",
+          );
+        }
+        const eventOperationId = requireString(payload, "operationId");
+        if (
+          observedOperationId !== null &&
+          observedOperationId !== eventOperationId
+        ) {
+          throw new Error(
+            "Invalid filesystem response: operation identity changed.",
+          );
+        }
+        observedOperationId = eventOperationId;
+        if (
+          typeof payload.sequence !== "number" ||
+          !Number.isSafeInteger(payload.sequence) ||
+          payload.sequence <= lastSequence
+        ) {
+          throw new Error(
+            "Invalid filesystem response: operation sequence is stale.",
+          );
+        }
+        lastSequence = payload.sequence;
+        if (payload.action !== action.kind) {
+          throw new Error(
+            "Invalid filesystem response: operation action changed.",
+          );
+        }
+        const progress = parseOperationProgress(payload);
+        onProgress?.(progress);
+
+        if (payload.event === "queued" || payload.event === "running") return;
+        if (
+          payload.event === "awaitingConfirmation" ||
+          payload.event === "awaitingConflict"
+        ) {
+          const prompt = parseOperationPrompt(payload.prompt);
+          if (
+            (payload.event === "awaitingConfirmation" &&
+              prompt.kind !== "permanentDelete") ||
+            (payload.event === "awaitingConflict" &&
+              prompt.kind !== "moveConflict")
+          ) {
+            throw new Error(
+              "Invalid filesystem response: operation prompt state is inconsistent.",
+            );
+          }
+          let responded = false;
+          onPrompt(prompt, async (response) => {
+            if (responded) {
+              throw new Error("This filesystem decision was already answered.");
+            }
+            responded = true;
+            try {
+              await invoke("respond_file_operation", {
+                operationId: eventOperationId,
+                promptId: prompt.id,
+                response,
+              });
+            } catch (error) {
+              responded = false;
+              throw commandError(error);
+            }
+          });
+          return;
+        }
+
+        settled = true;
+        if (payload.event === "completed") {
+          resolveCompletion(parseOperationOutcome(payload.outcome));
+        } else if (payload.event === "cancelled") {
+          if (payload.outcome === null || payload.outcome === undefined) {
+            rejectCompletion(abortError());
+          } else {
+            const outcome = parseOperationOutcome(payload.outcome);
+            if (outcome.kind !== "batch" || outcome.status !== "cancelled") {
+              throw new Error(
+                "Invalid filesystem response: cancelled batch outcome is inconsistent.",
+              );
+            }
+            resolveCompletion(outcome);
+          }
+        } else if (payload.event === "failed") {
+          if (payload.outcome === null || payload.outcome === undefined) {
+            rejectCompletion(commandError(payload.error));
+          } else {
+            const outcome = parseOperationOutcome(payload.outcome);
+            if (outcome.kind !== "batch" || outcome.status !== "partial") {
+              throw new Error(
+                "Invalid filesystem response: failed batch outcome is inconsistent.",
+              );
+            }
+            resolveCompletion(outcome);
+          }
+        } else {
+          throw new Error(
+            "Invalid filesystem response: unknown operation event.",
+          );
+        }
+      } catch (error) {
+        settled = true;
+        cancel();
+        rejectCompletion(
+          error instanceof Error
+            ? error
+            : new Error("Invalid filesystem operation response."),
+        );
+      }
+    };
+
+    signal.addEventListener("abort", cancel, { once: true });
+    try {
+      const started = await invoke<unknown>("start_file_operation", {
+        request: {
+          sources: entries.map((entry) => entry.reference),
+          action,
+        },
+        onEvent: channel,
+      });
+      if (typeof started !== "string" || started.length === 0) {
+        throw new Error(
+          "Invalid filesystem response: operation ID is malformed.",
+        );
+      }
+      operationId = started;
+      if (cancelRequested) cancel();
+      if (observedOperationId !== null && observedOperationId !== operationId) {
+        throw new Error(
+          "Invalid filesystem response: operation ID does not match.",
+        );
+      }
+      return await completion;
+    } catch (error) {
+      if (operationId === null && signal.aborted) throw abortError();
       throw commandError(error);
     } finally {
       signal.removeEventListener("abort", cancel);

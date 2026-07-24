@@ -100,21 +100,32 @@
   compact: boolean,
   contextMenuTrigger: boolean,
 )}
+  {@const location = state.locations.find(({ id }) => id === target.locationId)}
   <Button
     variant={target.locationId === state.activeLocation?.id
       ? "secondary"
       : "ghost"}
     size={compact ? "icon" : "sm"}
-    class={compact
-      ? "relative w-full"
-      : contextMenuTrigger
-        ? "w-full min-w-0 justify-start gap-2"
-        : "min-w-0 flex-1 justify-start gap-2"}
+    class={cn(
+      compact
+        ? "relative w-full"
+        : contextMenuTrigger
+          ? "w-full min-w-0 justify-start gap-2"
+          : "min-w-0 flex-1 justify-start gap-2",
+      location &&
+        state.isDirectoryDropTarget(location.root) &&
+        "ring-2 ring-ring",
+    )}
     aria-current={target.locationId === state.activeLocation?.id
       ? "page"
       : undefined}
     title={`${target.name} · ${target.endpoint} · ${target.status}`}
     onclick={() => void state.selectSshTarget(target.id)}
+    ondragover={(event) =>
+      location && state.dragOverDirectory(location.root, event)}
+    ondragleave={() => location && state.leaveDropDirectory(location.root)}
+    ondrop={(event) =>
+      location && void state.dropDraggedEntries(location.root, event)}
   >
     <ServerIcon />
     {#if !compact}
@@ -224,14 +235,21 @@
                   ? "secondary"
                   : "ghost"}
                 size={compact ? "icon" : "sm"}
-                class={compact
-                  ? "w-full"
-                  : "min-w-0 flex-1 justify-start gap-2"}
+                class={cn(
+                  compact ? "w-full" : "min-w-0 flex-1 justify-start gap-2",
+                  state.isDirectoryDropTarget(location.root) &&
+                    "ring-2 ring-ring",
+                )}
                 aria-current={state.activeLocation?.id === location.id
                   ? "page"
                   : undefined}
                 title={compact ? location.name : undefined}
                 onclick={() => void state.selectLocation(location.id)}
+                ondragover={(event) =>
+                  state.dragOverDirectory(location.root, event)}
+                ondragleave={() => state.leaveDropDirectory(location.root)}
+                ondrop={(event) =>
+                  void state.dropDraggedEntries(location.root, event)}
               >
                 <Icon />
                 {#if !compact}<span class="truncate">{location.name}</span>{/if}
@@ -281,12 +299,20 @@
               ? "secondary"
               : "ghost"}
             size={compact ? "icon" : "sm"}
-            class={compact ? "w-full" : "w-full justify-start gap-2"}
+            class={cn(
+              compact ? "w-full" : "w-full justify-start gap-2",
+              state.isDirectoryDropTarget(location.root) && "ring-2 ring-ring",
+            )}
             aria-current={state.activeLocation?.id === location.id
               ? "page"
               : undefined}
             title={compact ? location.name : undefined}
             onclick={() => void state.selectLocation(location.id)}
+            ondragover={(event) =>
+              state.dragOverDirectory(location.root, event)}
+            ondragleave={() => state.leaveDropDirectory(location.root)}
+            ondrop={(event) =>
+              void state.dropDraggedEntries(location.root, event)}
           >
             <Icon />
             {#if !compact}<span class="truncate">{location.name}</span>{/if}

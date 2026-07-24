@@ -9,6 +9,10 @@ use std::{
 use tauri::{ipc::Channel, State};
 
 use crate::{
+    file_operations::{
+        FileOperationCoordinator, FileOperationEventDto, FileOperationPromptResponseDto,
+        FileOperationRequestDto,
+    },
     filesystem::{
         DirectoryListingEvent, ExplorerError, ExplorerErrorDto, ImagePreviewMode,
         LocationSummaryDto, PreviewResultDto, PreviewUnavailableReason,
@@ -36,6 +40,7 @@ pub struct AppState {
     volumes: Arc<VolumeManager>,
     native_open: Arc<NativeOpenManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    operations: Arc<FileOperationCoordinator>,
 }
 
 impl AppState {
@@ -55,6 +60,7 @@ impl AppState {
             volumes,
             native_open: Arc::new(native_open),
             listings: Mutex::new(HashMap::new()),
+            operations: Arc::new(FileOperationCoordinator::default()),
         }
     }
 
@@ -315,6 +321,45 @@ pub fn cancel_listing(
 ) -> Result<(), ExplorerErrorDto> {
     state
         .cancel_listing(&request_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn start_file_operation(
+    state: State<'_, AppState>,
+    request: FileOperationRequestDto,
+    on_event: Channel<FileOperationEventDto>,
+) -> Result<String, ExplorerErrorDto> {
+    state
+        .operations
+        .start_with_backends(state.local.clone(), state.ssh.clone(), request, on_event)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn cancel_file_operation(
+    state: State<'_, AppState>,
+    operation_id: String,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&operation_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .operations
+        .cancel(&operation_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn respond_file_operation(
+    state: State<'_, AppState>,
+    operation_id: String,
+    prompt_id: String,
+    response: FileOperationPromptResponseDto,
+) -> Result<(), ExplorerErrorDto> {
+    validate_request_id(&operation_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&prompt_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .operations
+        .respond(&operation_id, &prompt_id, response)
         .map_err(ExplorerErrorDto::from)
 }
 

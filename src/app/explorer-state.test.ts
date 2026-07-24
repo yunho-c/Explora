@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type {
   DirectoryRef,
   FileEntrySummary,
+  FileOperationBatchResult,
   LocationSummary,
   SshConnectionEvent,
   VolumeSnapshot,
@@ -15,6 +16,7 @@ import type {
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
 import type {
   ConnectSshOptions,
+  FileOperationOptions,
   ListDirectoryOptions,
   OpenEntryOptions,
   PreparePreviewOptions,
@@ -49,6 +51,7 @@ class StaleResultDataSource extends DemoExplorerDataSource {
         locationId: "home",
         name: "Home",
         displayPath: "Home",
+        capabilities: { acceptMove: true, atomicReplace: false },
       },
       breadcrumbs: [{ label: directory.name, directory }],
     });
@@ -185,7 +188,377 @@ class ControllableVolumeDataSource extends DemoExplorerDataSource {
   }
 }
 
+class PartialBatchMoveDataSource extends DemoExplorerDataSource {
+  override async moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    const moved = await super.moveEntry(entries[0], destination, options);
+    return {
+      kind: "batch",
+      status: "partial",
+      items: [
+        {
+          status: "completed",
+          source: entries[0].reference,
+          outcome: moved,
+        },
+        {
+          status: "failed",
+          source: entries[1].reference,
+          error: {
+            code: "permissionDenied",
+            message: "The second item is read-only.",
+          },
+        },
+      ],
+    };
+  }
+}
+
 describe("ExplorerState", () => {
+  it("renames an entry while preserving selection and opaque identity", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry?.capabilities.rename).toBe(true);
+    state.selectEntry(entry!.reference.id);
+    state.startRename();
+    state.renameDraft = "renamed-notes.md";
+
+    await state.commitRename();
+
+    const renamed = state.entries.find(
+      ({ reference }) => reference.id === entry!.reference.id,
+    );
+    expect(renamed).toMatchObject({
+      name: "renamed-notes.md",
+      reference: entry!.reference,
+    });
+    expect(state.selectedEntryId).toBe(entry!.reference.id);
+    expect(state.renamingEntryId).toBeNull();
+    expect(state.renameErrorMessage).toBeNull();
+  });
+
+  it("keeps rename active after a conflict so the user can correct it", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    state.startRename(projects!.reference.id);
+    state.renameDraft = "Photos";
+
+    await state.commitRename();
+
+    expect(state.renamingEntryId).toBe(projects!.reference.id);
+    expect(state.renameErrorMessage).toBe(
+      "An item with that name already exists.",
+    );
+    expect(state.entries.some(({ name }) => name === "Projects")).toBe(true);
+    state.cancelRename();
+    expect(state.renamingEntryId).toBeNull();
+  });
+
+  it("moves a local entry to Trash and advances selection without prompting", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+    await state.openPreview();
+
+    await state.moveSelectedToTrash();
+
+    expect(
+      state.entries.some(
+        ({ reference }) => reference.id === entry!.reference.id,
+      ),
+    ).toBe(false);
+    expect(state.selectedEntryId).not.toBe(entry!.reference.id);
+    expect(state.previewOpen).toBe(false);
+    expect(state.fileOperations.pendingPrompt).toBeNull();
+    expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("moves a local entry through the destination chooser and refreshes both folders", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(entry).toBeDefined();
+    expect(projects?.directory).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    await state.openMoveSelected();
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Home");
+    expect(state.fileOperations.canConfirmMove).toBe(false);
+    await state.fileOperations.browseMoveDestination(projects!.directory!);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Projects");
+    expect(state.fileOperations.canConfirmMove).toBe(true);
+
+    await state.confirmMoveSelected();
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      false,
+    );
+    expect(state.selectedEntryId).not.toBe(entry!.reference.id);
+    expect(state.fileOperations.errorMessage).toBeNull();
+
+    await state.openDirectory(projects!.directory!);
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      true,
+    );
+  });
+
+  it("supports replace, toggle, range, and select-all selection semantics", async () => {
+    const state = await initializedState();
+    const entries = state.visibleEntries;
+    expect(entries.length).toBeGreaterThan(3);
+
+    state.selectEntry(entries[0].reference.id);
+    state.selectEntry(entries[2].reference.id, { range: true });
+    expect(state.selectedEntryIds).toEqual(
+      entries.slice(0, 3).map(({ reference }) => reference.id),
+    );
+    expect(state.selectedEntryId).toBe(entries[2].reference.id);
+
+    state.selectEntry(entries[1].reference.id, { toggle: true });
+    expect(state.selectedEntryIds).toEqual([
+      entries[0].reference.id,
+      entries[2].reference.id,
+    ]);
+
+    state.selectAllEntries();
+    expect(state.selectedEntryIds).toEqual(
+      entries.map(({ reference }) => reference.id),
+    );
+    state.clearSelection();
+    expect(state.selectedEntryIds).toEqual([]);
+    expect(state.selectedEntryId).toBeNull();
+  });
+
+  it("intersects capabilities across every selected entry", async () => {
+    const state = await initializedState();
+    const [first, second] = state.visibleEntries;
+    state.entries = state.entries.map((entry) =>
+      entry.reference.id === second.reference.id
+        ? {
+            ...entry,
+            capabilities: { ...entry.capabilities, trash: false },
+          }
+        : entry,
+    );
+
+    state.selectEntry(first.reference.id);
+    state.selectEntry(second.reference.id, { toggle: true });
+
+    expect(state.canMoveSelection).toBe(true);
+    expect(state.canTrashSelection).toBe(false);
+    expect(state.canRenameSelection).toBe(false);
+    expect(state.canDeleteSelectionPermanently).toBe(true);
+  });
+
+  it("moves multiple selected entries through one batch operation", async () => {
+    const state = await initializedState();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    state.selectEntry(image.reference.id, { toggle: true });
+
+    await state.openMoveSelected();
+    expect(state.fileOperations.moveChooser?.entries).toHaveLength(2);
+    await state.fileOperations.browseMoveDestination(projects.directory!);
+    await state.confirmMoveSelected();
+
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(false);
+    expect(state.entries.some(({ name }) => name === image.name)).toBe(false);
+    expect(state.fileOperations.errorMessage).toBeNull();
+
+    await state.openDirectory(projects.directory!);
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+    expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
+  });
+
+  it("cuts a multi-selection and pastes it through the batch move API", async () => {
+    const state = await initializedState();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    state.selectEntry(image.reference.id, { toggle: true });
+
+    state.cutSelected();
+    expect(state.cutEntries.map(({ name }) => name)).toEqual(
+      expect.arrayContaining([notes.name, image.name]),
+    );
+    expect(state.cutEntries).toHaveLength(2);
+    expect(state.canPasteCutEntries).toBe(false);
+
+    await state.openDirectory(projects.directory!);
+    expect(state.canPasteCutEntries).toBe(true);
+    await state.pasteCutEntries();
+
+    expect(state.cutEntries).toEqual([]);
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+    expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
+    expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("keeps failed cut items available after a partial paste", async () => {
+    const state = new ExplorerState(new PartialBatchMoveDataSource());
+    await state.initialize();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    state.selectEntry(image.reference.id, { toggle: true });
+    state.cutSelected();
+    const attempted = [...state.cutEntries];
+
+    await state.openDirectory(projects.directory!);
+    await state.pasteCutEntries();
+
+    expect(state.cutEntries).toHaveLength(1);
+    expect(state.cutEntries[0].reference).toEqual(attempted[1].reference);
+    expect(state.fileOperations.errorMessage).toContain(
+      "1 of 2 items could not be completed",
+    );
+    expect(state.fileOperations.errorMessage).toContain(
+      "The second item is read-only.",
+    );
+  });
+
+  it("drops an internal opaque-reference drag onto a capable directory", async () => {
+    const state = await initializedState();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    const dataTransfer = {
+      effectAllowed: "none",
+      dropEffect: "none",
+      setData: vi.fn(),
+    };
+    const preventDefault = vi.fn();
+    const event = { dataTransfer, preventDefault } as unknown as DragEvent;
+
+    state.startEntryDrag(notes.reference.id, event);
+    expect(dataTransfer.effectAllowed).toBe("move");
+    expect(dataTransfer.setData).toHaveBeenCalledWith(
+      "application/x-explora-entry",
+      "internal",
+    );
+    expect(state.canDropOnDirectory(projects.directory!)).toBe(true);
+    state.dragOverDirectory(projects.directory!, event);
+    expect(state.isDirectoryDropTarget(projects.directory!)).toBe(true);
+    await state.dropDraggedEntries(projects.directory!, event);
+
+    expect(preventDefault).toHaveBeenCalled();
+    expect(state.isDirectoryDropTarget(projects.directory!)).toBe(false);
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(false);
+    await state.openDirectory(projects.directory!);
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+  });
+
+  it("moves an entry to another capable location through the transfer path", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    const workspace = state.locations.find(({ id }) => id === "workspace");
+    expect(entry).toBeDefined();
+    expect(workspace).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    await state.openMoveSelected();
+    await state.fileOperations.browseMoveDestination(workspace!.root);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Workspace");
+    expect(state.fileOperations.canConfirmMove).toBe(true);
+    await state.confirmMoveSelected();
+
+    expect(state.entries.some(({ name }) => name === "explora-notes.md")).toBe(
+      false,
+    );
+    expect(state.fileOperations.errorMessage).toBeNull();
+    await state.openDirectory(workspace!.root);
+    const moved = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(moved?.reference.locationId).toBe("workspace");
+  });
+
+  it("does not allow a directory to be chosen as its own move destination", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(projects?.directory).toBeDefined();
+    state.selectEntry(projects!.reference.id);
+
+    await state.openMoveSelected();
+    expect(
+      state.fileOperations.isCompatibleDestination(projects!.directory!),
+    ).toBe(false);
+    await state.fileOperations.browseMoveDestination(projects!.directory!);
+    expect(state.fileOperations.moveChooser?.directory.name).toBe("Home");
+    expect(state.fileOperations.canConfirmMove).toBe(false);
+    state.fileOperations.closeMoveChooser();
+  });
+
+  it("cancels permanent deletion without changing the source", async () => {
+    const state = await initializedState();
+    const entry = state.entries.find(({ name }) => name === "explora-notes.md");
+    expect(entry).toBeDefined();
+    state.selectEntry(entry!.reference.id);
+
+    const deletion = state.deleteSelectedPermanently();
+    await vi.waitFor(() =>
+      expect(state.fileOperations.pendingPrompt?.prompt).toMatchObject({
+        targetName: "explora-notes.md",
+        locationName: "Home",
+      }),
+    );
+    await state.fileOperations.answerPrompt("cancel");
+    await deletion;
+
+    expect(
+      state.entries.some(
+        ({ reference }) => reference.id === entry!.reference.id,
+      ),
+    ).toBe(true);
+    expect(state.fileOperations.pendingPrompt).toBeNull();
+    expect(state.fileOperations.errorMessage).toBeNull();
+  });
+
+  it("repairs open tabs and histories after confirmed permanent deletion", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects");
+    expect(projects?.directory).toBeDefined();
+    const homeTabId = state.activeTabId;
+    await state.openTab();
+    const projectsTabId = state.activeTabId;
+    await state.openDirectory(projects!.directory!);
+    await state.activateTab(homeTabId);
+    state.selectEntry(projects!.reference.id);
+
+    const deletion = state.deleteSelectedPermanently();
+    await vi.waitFor(() =>
+      expect(state.fileOperations.pendingPrompt).not.toBeNull(),
+    );
+    await state.fileOperations.answerPrompt("confirm");
+    await deletion;
+
+    expect(state.entries.some(({ name }) => name === "Projects")).toBe(false);
+    const repairedTab = state.tabs.find(({ id }) => id === projectsTabId);
+    expect(repairedTab?.directory.name).toBe("Home");
+    expect(
+      repairedTab?.history.some(({ id }) => id === projects!.reference.id),
+    ).toBe(false);
+  });
+
   it("loads locations and directory batches through the data-source boundary", async () => {
     const state = await initializedState();
 
@@ -418,6 +791,7 @@ describe("ExplorerState", () => {
       locationId: "home",
       name: "Missing",
       displayPath: "Home/Missing",
+      capabilities: { acceptMove: true, atomicReplace: false },
     });
 
     expect(state.activeDirectory?.name).toBe("Home");

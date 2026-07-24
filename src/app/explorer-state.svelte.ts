@@ -3,6 +3,9 @@ import type {
   DirectoryRef,
   ExplorerTab,
   FileEntrySummary,
+  FileOperationBatchResult,
+  FileMoveResult,
+  FileRemovalResult,
   ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
@@ -16,6 +19,7 @@ import type {
   ViewMode,
   VolumeSnapshot,
 } from "$lib/contracts/explorer";
+import { SvelteSet } from "svelte/reactivity";
 import type { ExplorerDataSource } from "$lib/data/explorer-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 import type { PreferencesDataSource } from "$lib/data/preferences-data-source";
@@ -27,6 +31,7 @@ import {
   type LayoutPreferencesPatch,
 } from "$lib/contracts/preferences";
 import { compareFileSizes } from "$lib/file-metadata";
+import { FileOperationStore } from "../features/file-operations/file-operation-store.svelte";
 
 const nameCollator = new Intl.Collator(undefined, {
   numeric: true,
@@ -57,6 +62,12 @@ const withTimeout = <T>(promise: Promise<T>, timeoutMs: number): Promise<T> =>
     );
   });
 
+const isSameDirectory = (left: DirectoryRef, right: DirectoryRef) =>
+  left.locationId === right.locationId && left.id === right.id;
+
+const directoryKey = (directory: DirectoryRef) =>
+  `${directory.locationId}\u0000${directory.id}`;
+
 type SshPromptEvent = Extract<
   SshConnectionEvent,
   { event: "hostKeyPrompt" | "authenticationPrompt" }
@@ -85,6 +96,7 @@ export interface PendingNativeOpenConfirmation {
 }
 
 export class ExplorerState {
+  readonly fileOperations: FileOperationStore;
   locations = $state<LocationSummary[]>([]);
   sshTargets = $state<SshTargetSummary[]>([]);
   tabs = $state<ExplorerTab[]>([]);
@@ -93,6 +105,14 @@ export class ExplorerState {
   breadcrumbs = $state<BreadcrumbSegment[]>([]);
   parentDirectory = $state<DirectoryRef | null>(null);
   selectedEntryId = $state<string | null>(null);
+  selectedEntryIds = $state<string[]>([]);
+  cutEntries = $state<FileEntrySummary[]>([]);
+  cutSourceParent = $state<DirectoryRef | null>(null);
+  dropTargetDirectoryKey = $state<string | null>(null);
+  renamingEntryId = $state<string | null>(null);
+  renameDraft = $state("");
+  renameSaving = $state(false);
+  renameErrorMessage = $state<string | null>(null);
   searchQuery = $state("");
   viewMode = $state<ViewMode>("list");
   sort = $state<SortDescriptor>({ column: "name", direction: "ascending" });
@@ -126,6 +146,7 @@ export class ExplorerState {
   sshConnectionMessage = $state<string | null>(null);
 
   private directoryController: AbortController | null = null;
+  private renameController: AbortController | null = null;
   private previewController: AbortController | null = null;
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
@@ -136,11 +157,16 @@ export class ExplorerState {
   private nativeOpenSequence = 0;
   private preferencesInitialization: Promise<void> | null = null;
   private preferenceWriteQueue: Promise<void> = Promise.resolve();
+  private selectionAnchorId: string | null = null;
+  private draggedEntries: FileEntrySummary[] = [];
+  private dragSourceParent: DirectoryRef | null = null;
 
   constructor(
     private readonly dataSource: ExplorerDataSource,
     private readonly preferencesDataSource: PreferencesDataSource = new MemoryPreferencesDataSource(),
-  ) {}
+  ) {
+    this.fileOperations = new FileOperationStore(dataSource);
+  }
 
   get activeTab(): ExplorerTab | undefined {
     return this.tabs.find(({ id }) => id === this.activeTabId);
@@ -168,6 +194,64 @@ export class ExplorerState {
   get selectedEntry(): FileEntrySummary | undefined {
     return this.entries.find(
       ({ reference }) => reference.id === this.selectedEntryId,
+    );
+  }
+
+  get selectedEntries(): FileEntrySummary[] {
+    const selected = new SvelteSet(this.selectedEntryIds);
+    return this.visibleEntries.filter(({ reference }) =>
+      selected.has(reference.id),
+    );
+  }
+
+  get canRenameSelection(): boolean {
+    return (
+      this.selectedEntries.length === 1 &&
+      this.selectedEntries[0].capabilities.rename
+    );
+  }
+
+  get canMoveSelection(): boolean {
+    return (
+      this.selectedEntries.length > 0 &&
+      this.selectedEntries.every((entry) => entry.capabilities.move)
+    );
+  }
+
+  get canTrashSelection(): boolean {
+    return (
+      this.selectedEntries.length > 0 &&
+      this.selectedEntries.every((entry) => entry.capabilities.trash)
+    );
+  }
+
+  get canDeleteSelectionPermanently(): boolean {
+    return (
+      this.selectedEntries.length > 0 &&
+      this.selectedEntries.every(
+        (entry) => entry.capabilities.deletePermanently,
+      )
+    );
+  }
+
+  get canCutSelection(): boolean {
+    return this.canMoveSelection;
+  }
+
+  get canPasteCutEntries(): boolean {
+    const destination = this.activeDirectory;
+    const sourceParent = this.cutSourceParent;
+    return Boolean(
+      destination &&
+      sourceParent &&
+      this.cutEntries.length > 0 &&
+      destination.capabilities.acceptMove &&
+      !isSameDirectory(destination, sourceParent) &&
+      this.cutEntries.every(
+        (entry) =>
+          entry.capabilities.move &&
+          (!entry.directory || !isSameDirectory(entry.directory, destination)),
+      ),
     );
   }
 
@@ -284,6 +368,7 @@ export class ExplorerState {
 
   dispose(): void {
     this.directoryController?.abort();
+    this.renameController?.abort();
     this.previewController?.abort();
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();
@@ -824,7 +909,7 @@ export class ExplorerState {
     );
     if (!entry) return;
 
-    this.selectedEntryId = entry.reference.id;
+    this.setSingleSelection(entry.reference.id);
     if (entry.nativeOpen !== "none") {
       await this.openWithNativeApplication(entry, false);
     } else if (entry.directory) {
@@ -966,8 +1051,600 @@ export class ExplorerState {
     this.persistLayoutPreferences({ hiddenSshTargetIds });
   }
 
-  selectEntry(entryId: string): void {
-    this.selectedEntryId = entryId;
+  isEntrySelected(entryId: string): boolean {
+    return this.selectedEntryIds.includes(entryId);
+  }
+
+  selectEntry(
+    entryId: string,
+    options: { toggle?: boolean; range?: boolean } = {},
+  ): void {
+    const entries = this.visibleEntries;
+    if (!entries.some(({ reference }) => reference.id === entryId)) return;
+
+    if (options.range && this.selectionAnchorId) {
+      const anchorIndex = entries.findIndex(
+        ({ reference }) => reference.id === this.selectionAnchorId,
+      );
+      const targetIndex = entries.findIndex(
+        ({ reference }) => reference.id === entryId,
+      );
+      if (anchorIndex >= 0 && targetIndex >= 0) {
+        const [start, end] =
+          anchorIndex <= targetIndex
+            ? [anchorIndex, targetIndex]
+            : [targetIndex, anchorIndex];
+        this.selectedEntryIds = entries
+          .slice(start, end + 1)
+          .map(({ reference }) => reference.id);
+        this.selectedEntryId = entryId;
+        return;
+      }
+    }
+
+    if (options.toggle) {
+      if (this.isEntrySelected(entryId)) {
+        const remaining = this.selectedEntryIds.filter((id) => id !== entryId);
+        this.selectedEntryIds = remaining;
+        this.selectedEntryId = remaining.at(-1) ?? null;
+      } else {
+        this.selectedEntryIds = [...this.selectedEntryIds, entryId];
+        this.selectedEntryId = entryId;
+      }
+      this.selectionAnchorId = entryId;
+      return;
+    }
+
+    this.setSingleSelection(entryId);
+  }
+
+  selectEntryForContextMenu(entryId: string): void {
+    if (!this.isEntrySelected(entryId)) this.setSingleSelection(entryId);
+  }
+
+  selectAllEntries(): void {
+    const ids = this.visibleEntries.map(({ reference }) => reference.id);
+    this.selectedEntryIds = ids;
+    this.selectedEntryId = ids.at(-1) ?? null;
+    this.selectionAnchorId = ids[0] ?? null;
+  }
+
+  clearSelection(): void {
+    this.selectedEntryId = null;
+    this.selectedEntryIds = [];
+    this.selectionAnchorId = null;
+  }
+
+  isEntryCut(entryId: string): boolean {
+    return this.cutEntries.some(({ reference }) => reference.id === entryId);
+  }
+
+  cutSelected(entryId = this.selectedEntryId): void {
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      this.fileOperations.activeEntryId !== null ||
+      !sourceParent ||
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.move)
+    )
+      return;
+    this.cutEntries = entries.map((entry) => ({ ...entry }));
+    this.cutSourceParent = sourceParent;
+    this.fileOperations.clearError();
+  }
+
+  clearCutEntries(): void {
+    this.cutEntries = [];
+    this.cutSourceParent = null;
+  }
+
+  async pasteCutEntries(): Promise<void> {
+    const destination = this.activeDirectory;
+    if (!destination || !this.canPasteCutEntries) return;
+    const entries = [...this.cutEntries];
+    await this.fileOperations.moveEntriesTo(
+      entries,
+      destination,
+      async (result) => {
+        await this.reconcileMoveOperationResult(result);
+        this.retainUnmovedCutEntries(result, entries);
+      },
+    );
+  }
+
+  startEntryDrag(entryId: string, event: DragEvent): void {
+    if (!this.isEntrySelected(entryId)) this.setSingleSelection(entryId);
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      !sourceParent ||
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.move) ||
+      !event.dataTransfer
+    ) {
+      event.preventDefault();
+      this.endEntryDrag();
+      return;
+    }
+    this.draggedEntries = entries;
+    this.dragSourceParent = sourceParent;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-explora-entry", "internal");
+  }
+
+  canDropOnDirectory(directory: DirectoryRef): boolean {
+    return Boolean(
+      this.dragSourceParent &&
+      this.draggedEntries.length > 0 &&
+      directory.capabilities.acceptMove &&
+      !isSameDirectory(directory, this.dragSourceParent) &&
+      this.draggedEntries.every(
+        (entry) =>
+          entry.capabilities.move &&
+          (!entry.directory || !isSameDirectory(entry.directory, directory)),
+      ),
+    );
+  }
+
+  dragOverDirectory(directory: DirectoryRef, event: DragEvent): void {
+    if (!this.canDropOnDirectory(directory)) return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    this.dropTargetDirectoryKey = directoryKey(directory);
+  }
+
+  leaveDropDirectory(directory: DirectoryRef): void {
+    if (this.dropTargetDirectoryKey === directoryKey(directory)) {
+      this.dropTargetDirectoryKey = null;
+    }
+  }
+
+  isDirectoryDropTarget(directory: DirectoryRef): boolean {
+    return this.dropTargetDirectoryKey === directoryKey(directory);
+  }
+
+  async dropDraggedEntries(
+    directory: DirectoryRef,
+    event: DragEvent,
+  ): Promise<void> {
+    if (!this.canDropOnDirectory(directory)) return;
+    event.preventDefault();
+    const entries = [...this.draggedEntries];
+    this.endEntryDrag();
+    await this.fileOperations.moveEntriesTo(entries, directory, (result) =>
+      this.reconcileMoveOperationResult(result),
+    );
+  }
+
+  endEntryDrag(): void {
+    this.draggedEntries = [];
+    this.dragSourceParent = null;
+    this.dropTargetDirectoryKey = null;
+  }
+
+  startRename(entryId = this.selectedEntryId): void {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    if (!entry?.capabilities.rename || this.renameSaving) return;
+
+    this.setSingleSelection(entry.reference.id);
+    this.renamingEntryId = entry.reference.id;
+    this.renameDraft = entry.name;
+    this.renameErrorMessage = null;
+  }
+
+  cancelRename(): void {
+    this.renameController?.abort();
+    this.renameController = null;
+    this.renamingEntryId = null;
+    this.renameDraft = "";
+    this.renameSaving = false;
+    this.renameErrorMessage = null;
+  }
+
+  async commitRename(): Promise<void> {
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === this.renamingEntryId,
+    );
+    if (!entry || this.renameSaving) return;
+    if (this.renameDraft === entry.name) {
+      this.cancelRename();
+      return;
+    }
+    if (this.renameDraft.length === 0) {
+      this.renameErrorMessage = "Enter a file name.";
+      return;
+    }
+
+    this.renameController?.abort();
+    const controller = new AbortController();
+    this.renameController = controller;
+    this.renameSaving = true;
+    this.renameErrorMessage = null;
+    try {
+      const renamed = await this.dataSource.renameEntry(
+        entry,
+        this.renameDraft,
+        controller.signal,
+      );
+      if (this.renameController !== controller) return;
+
+      this.entries = this.entries.map((candidate) =>
+        candidate.reference.id === renamed.reference.id ? renamed : candidate,
+      );
+      this.replaceKnownDirectoryReference(renamed);
+      if (this.preview?.entryId === renamed.reference.id) {
+        this.preview = {
+          ...this.preview,
+          title: renamed.name,
+          accessibilityDescription: renamed.displayPath,
+        };
+      }
+      this.renamingEntryId = null;
+      this.renameDraft = "";
+    } catch (error) {
+      if (!isAbortError(error) && this.renameController === controller) {
+        this.renameErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not rename this item.";
+      }
+    } finally {
+      if (this.renameController === controller) {
+        this.renameController = null;
+        this.renameSaving = false;
+      }
+    }
+  }
+
+  async moveSelectedToTrash(entryId = this.selectedEntryId): Promise<void> {
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.trash) ||
+      !sourceParent
+    )
+      return;
+    this.cancelRename();
+    await this.fileOperations.moveToTrash(entries, (result) =>
+      this.reconcileRemovalOperationResult(result, sourceParent),
+    );
+  }
+
+  async openMoveSelected(entryId = this.selectedEntryId): Promise<void> {
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.move) ||
+      !sourceParent
+    )
+      return;
+    this.cancelRename();
+    this.closePreview();
+    await this.fileOperations.openMoveChooser(
+      entries,
+      sourceParent,
+      this.locations,
+    );
+  }
+
+  async confirmMoveSelected(): Promise<void> {
+    await this.fileOperations.confirmMove((result) =>
+      this.reconcileMoveOperationResult(result),
+    );
+  }
+
+  async deleteSelectedPermanently(
+    entryId = this.selectedEntryId,
+  ): Promise<void> {
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.deletePermanently) ||
+      !sourceParent
+    )
+      return;
+    this.cancelRename();
+    await this.fileOperations.deletePermanently(entries, (result) =>
+      this.reconcileRemovalOperationResult(result, sourceParent),
+    );
+  }
+
+  private entriesForSelectionAction(
+    entryId: string | null,
+  ): FileEntrySummary[] {
+    const selected = this.selectedEntries;
+    if (
+      entryId === null ||
+      selected.some(({ reference }) => reference.id === entryId)
+    ) {
+      return selected;
+    }
+    const entry = this.entries.find(
+      ({ reference }) => reference.id === entryId,
+    );
+    return entry ? [entry] : [];
+  }
+
+  private async reconcileRemovalOperationResult(
+    result: FileRemovalResult | FileOperationBatchResult,
+    sourceParent: DirectoryRef,
+  ): Promise<void> {
+    if (result.kind !== "batch") {
+      await this.reconcileRemovedEntry(result, sourceParent);
+      return;
+    }
+    for (const item of result.items) {
+      if (
+        item.status === "completed" &&
+        (item.outcome.kind === "trashed" ||
+          item.outcome.kind === "deletedPermanently")
+      ) {
+        await this.reconcileRemovedEntry(item.outcome, sourceParent);
+      }
+    }
+  }
+
+  private async reconcileMoveOperationResult(
+    result: FileMoveResult | FileOperationBatchResult,
+  ): Promise<void> {
+    if (result.kind !== "batch") {
+      await this.reconcileMovedEntry(result);
+      return;
+    }
+    for (const item of result.items) {
+      if (
+        item.status === "completed" &&
+        (item.outcome.kind === "moved" || item.outcome.kind === "moveSkipped")
+      ) {
+        await this.reconcileMovedEntry(item.outcome);
+      }
+    }
+  }
+
+  private retainUnmovedCutEntries(
+    result: FileMoveResult | FileOperationBatchResult,
+    attempted: readonly FileEntrySummary[],
+  ): void {
+    const moved = new SvelteSet<string>();
+    if (result.kind === "moved") {
+      for (const entry of attempted) {
+        moved.add(`${entry.reference.locationId}\u0000${entry.reference.id}`);
+      }
+    } else if (result.kind === "batch") {
+      for (const item of result.items) {
+        if (item.status === "completed" && item.outcome.kind === "moved") {
+          moved.add(`${item.source.locationId}\u0000${item.source.id}`);
+        }
+      }
+    }
+    this.cutEntries = this.cutEntries.filter(
+      (entry) =>
+        !moved.has(`${entry.reference.locationId}\u0000${entry.reference.id}`),
+    );
+    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+  }
+
+  private async reconcileRemovedEntry(
+    result: FileRemovalResult,
+    sourceParent: DirectoryRef,
+  ): Promise<void> {
+    const invalidated = new SvelteSet(result.invalidatedEntryIds);
+    this.cutEntries = this.cutEntries.filter(
+      (entry) =>
+        entry.reference.locationId !== result.entry.locationId ||
+        !invalidated.has(entry.reference.id),
+    );
+    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+    const orderedEntries = this.visibleEntries;
+    const removedIndex = orderedEntries.findIndex(({ reference }) =>
+      invalidated.has(reference.id),
+    );
+    const remainingOrdered = orderedEntries.filter(
+      ({ reference }) => !invalidated.has(reference.id),
+    );
+    const activeDirectoryWasRemoved = Boolean(
+      this.activeTab && invalidated.has(this.activeTab.directory.id),
+    );
+
+    this.entries = this.entries.filter(
+      ({ reference }) => !invalidated.has(reference.id),
+    );
+    this.selectedEntryIds = this.selectedEntryIds.filter(
+      (id) => !invalidated.has(id),
+    );
+    if (this.selectedEntryId && invalidated.has(this.selectedEntryId)) {
+      const retainedSelection = this.selectedEntryIds.at(-1);
+      const neighbor =
+        remainingOrdered[
+          Math.min(Math.max(removedIndex, 0), remainingOrdered.length - 1)
+        ]?.reference.id ?? null;
+      this.selectedEntryId = retainedSelection ?? neighbor;
+      if (this.selectedEntryIds.length === 0 && neighbor) {
+        this.selectedEntryIds = [neighbor];
+      }
+      this.selectionAnchorId = this.selectedEntryId;
+    }
+    if (this.preview?.entryId && invalidated.has(this.preview.entryId)) {
+      this.closePreview();
+    }
+
+    this.tabs = this.tabs.map((tab) => {
+      const history = tab.history.filter(
+        (directory) => !invalidated.has(directory.id),
+      );
+      if (invalidated.has(tab.directory.id)) {
+        const fallbackHistory = [
+          ...history.filter((directory) => directory.id !== sourceParent.id),
+          sourceParent,
+        ];
+        return {
+          ...tab,
+          directory: sourceParent,
+          history: fallbackHistory,
+          historyIndex: fallbackHistory.length - 1,
+          title: sourceParent.name,
+        };
+      }
+      const historyIndex = history.findIndex(
+        (directory) => directory.id === tab.directory.id,
+      );
+      return {
+        ...tab,
+        history,
+        historyIndex: historyIndex >= 0 ? historyIndex : history.length - 1,
+      };
+    });
+
+    this.breadcrumbs = this.breadcrumbs.filter(
+      ({ directory }) => !invalidated.has(directory.id),
+    );
+    if (this.parentDirectory && invalidated.has(this.parentDirectory.id)) {
+      this.parentDirectory = null;
+    }
+    if (activeDirectoryWasRemoved) {
+      const tab = this.activeTab;
+      if (tab) {
+        await this.loadDirectory(sourceParent, (directory) => {
+          tab.directory = directory;
+          tab.history[tab.historyIndex] = directory;
+          tab.title = directory.name;
+        });
+      }
+    }
+  }
+
+  private async reconcileMovedEntry(result: FileMoveResult): Promise<void> {
+    if (result.kind === "moveSkipped") return;
+
+    const activeDirectory = this.activeDirectory;
+    const activeTab = this.activeTab;
+    const rebased = new SvelteSet(result.rebasedEntryIds);
+    const invalidated = new SvelteSet(result.invalidatedEntryIds);
+    this.cutEntries = this.cutEntries.filter(
+      (entry) =>
+        entry.reference.locationId !== result.sourceParent.locationId ||
+        (entry.reference.id !== result.entry.reference.id &&
+          !invalidated.has(entry.reference.id)),
+    );
+    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+    const sourceIndex = this.visibleEntries.findIndex(
+      ({ reference }) =>
+        reference.id === result.entry.reference.id ||
+        invalidated.has(reference.id),
+    );
+    const sourceRemaining = this.visibleEntries.filter(
+      ({ reference }) =>
+        reference.id !== result.entry.reference.id &&
+        !invalidated.has(reference.id),
+    );
+    let desiredSelection = this.selectedEntryId;
+
+    if (activeDirectory?.id === result.sourceParent.id) {
+      this.entries = this.entries.filter(
+        ({ reference }) =>
+          reference.id !== result.entry.reference.id &&
+          !invalidated.has(reference.id),
+      );
+      this.selectedEntryIds = this.selectedEntryIds.filter(
+        (id) => id !== result.entry.reference.id && !invalidated.has(id),
+      );
+      desiredSelection =
+        (desiredSelection && this.selectedEntryIds.includes(desiredSelection)
+          ? desiredSelection
+          : this.selectedEntryIds.at(-1)) ??
+        sourceRemaining[
+          Math.min(Math.max(sourceIndex, 0), sourceRemaining.length - 1)
+        ]?.reference.id ??
+        null;
+      if (this.selectedEntryIds.length === 0 && desiredSelection) {
+        this.selectedEntryIds = [desiredSelection];
+      }
+    } else if (activeDirectory?.id === result.destination.id) {
+      this.entries = [
+        ...this.entries.filter(
+          ({ reference }) => reference.id !== result.entry.reference.id,
+        ),
+        result.entry,
+      ];
+      desiredSelection = result.entry.reference.id;
+      if (!this.selectedEntryIds.includes(result.entry.reference.id)) {
+        this.selectedEntryIds = [
+          ...this.selectedEntryIds,
+          result.entry.reference.id,
+        ];
+      }
+    }
+
+    this.replaceKnownDirectoryReference(result.entry);
+    if (this.preview && invalidated.has(this.preview.entryId)) {
+      this.closePreview();
+    } else if (this.preview?.entryId === result.entry.reference.id) {
+      this.preview = {
+        ...this.preview,
+        title: result.entry.name,
+        accessibilityDescription: result.entry.displayPath,
+      };
+    }
+
+    const activeDirectoryNeedsRefresh = Boolean(
+      activeDirectory &&
+      (activeDirectory.id === result.sourceParent.id ||
+        activeDirectory.id === result.destination.id ||
+        rebased.has(activeDirectory.id)),
+    );
+    if (!activeDirectoryNeedsRefresh || !activeDirectory || !activeTab) {
+      this.selectedEntryId = desiredSelection;
+      this.selectionAnchorId = desiredSelection;
+      return;
+    }
+
+    await this.loadDirectory(activeDirectory, (directory) => {
+      activeTab.directory = directory;
+      activeTab.history[activeTab.historyIndex] = directory;
+      activeTab.title = directory.name;
+    });
+    const available = new SvelteSet(
+      this.entries.map(({ reference }) => reference.id),
+    );
+    this.selectedEntryIds = this.selectedEntryIds.filter((id) =>
+      available.has(id),
+    );
+    this.selectedEntryId =
+      desiredSelection && available.has(desiredSelection)
+        ? desiredSelection
+        : (this.selectedEntryIds.at(-1) ?? null);
+    if (this.selectedEntryId && this.selectedEntryIds.length === 0) {
+      this.selectedEntryIds = [this.selectedEntryId];
+    }
+    this.selectionAnchorId = this.selectedEntryId;
+  }
+
+  private replaceKnownDirectoryReference(renamed: FileEntrySummary): void {
+    const directory = renamed.directory;
+    if (!directory) return;
+
+    const replace = (candidate: DirectoryRef) =>
+      candidate.id === directory.id ? directory : candidate;
+    this.tabs = this.tabs.map((tab) => ({
+      ...tab,
+      directory: replace(tab.directory),
+      history: tab.history.map(replace),
+      title: tab.directory.id === directory.id ? directory.name : tab.title,
+    }));
+    this.breadcrumbs = this.breadcrumbs.map((breadcrumb) =>
+      breadcrumb.directory.id === directory.id
+        ? { label: directory.name, directory }
+        : breadcrumb,
+    );
+    if (this.parentDirectory?.id === directory.id) {
+      this.parentDirectory = directory;
+    }
   }
 
   private persistLayoutPreferences(patch: LayoutPreferencesPatch): void {
@@ -989,7 +1666,11 @@ export class ExplorerState {
     );
     if (!entry) return;
 
-    this.selectedEntryId = entry.reference.id;
+    if (this.isEntrySelected(entry.reference.id)) {
+      this.selectedEntryId = entry.reference.id;
+    } else {
+      this.setSingleSelection(entry.reference.id);
+    }
     this.previewOpen = true;
     this.previewLoading = true;
     this.preview = null;
@@ -1070,7 +1751,7 @@ export class ExplorerState {
     this.previewDisposer = null;
   }
 
-  moveSelection(delta: number): void {
+  moveSelection(delta: number, extend = false): void {
     const entries = this.visibleEntries;
     if (entries.length === 0) return;
 
@@ -1081,9 +1762,15 @@ export class ExplorerState {
       currentIndex < 0
         ? 0
         : Math.min(Math.max(currentIndex + delta, 0), entries.length - 1);
-    this.selectedEntryId = entries[nextIndex].reference.id;
+    this.selectEntry(entries[nextIndex].reference.id, { range: extend });
 
     if (this.previewOpen) void this.openPreview(this.selectedEntryId);
+  }
+
+  private setSingleSelection(entryId: string): void {
+    this.selectedEntryId = entryId;
+    this.selectedEntryIds = [entryId];
+    this.selectionAnchorId = entryId;
   }
 
   private createTab(locationId: string, directory: DirectoryRef): ExplorerTab {
@@ -1107,7 +1794,7 @@ export class ExplorerState {
 
   private resetTransientState(): void {
     this.searchQuery = "";
-    this.selectedEntryId = null;
+    this.clearSelection();
     this.closePreview();
   }
 
@@ -1120,6 +1807,7 @@ export class ExplorerState {
       this.warningMessage = `“${location.name}” is no longer available. Reconnect the volume to continue.`;
       return false;
     }
+    this.cancelRename();
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;

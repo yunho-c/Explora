@@ -5,7 +5,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/svelte";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
 import {
@@ -63,6 +63,329 @@ describe("ExplorerShell", () => {
 
     await fireEvent.click(screen.getByRole("button", { name: "Grid view" }));
     expect(screen.getByRole("grid", { name: "Files" })).toBeInTheDocument();
+  });
+
+  it("exposes pointer and keyboard multi-selection semantics", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const [first, second, third] = state.visibleEntries;
+    const table = screen.getByRole("table");
+    const rowFor = (name: string) => {
+      const row = within(table).getByText(name).closest("tr");
+      expect(row).not.toBeNull();
+      return row!;
+    };
+
+    await fireEvent.click(rowFor(first.name));
+    await fireEvent.click(rowFor(second.name), { ctrlKey: true });
+    expect(state.selectedEntryIds).toEqual([
+      first.reference.id,
+      second.reference.id,
+    ]);
+    expect(rowFor(first.name)).toHaveAttribute("aria-selected", "true");
+    expect(rowFor(second.name)).toHaveAttribute("aria-selected", "true");
+
+    await fireEvent.click(rowFor(third.name), { shiftKey: true });
+    expect(state.selectedEntryIds).toEqual(
+      state.visibleEntries.slice(1, 3).map(({ reference }) => reference.id),
+    );
+
+    await fireEvent.keyDown(window, { key: "a", ctrlKey: true });
+    expect(state.selectedEntryIds).toHaveLength(state.visibleEntries.length);
+    await fireEvent.keyDown(window, { key: "Escape" });
+    expect(state.selectedEntryIds).toEqual([]);
+  });
+
+  it("cuts and pastes multiple entries with complete keyboard alternatives", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    const table = screen.getByRole("table");
+    await fireEvent.click(within(table).getByText(notes.name).closest("tr")!);
+    await fireEvent.click(within(table).getByText(image.name).closest("tr")!, {
+      ctrlKey: true,
+    });
+
+    await fireEvent.keyDown(window, { key: "x", ctrlKey: true });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "2 items are ready to move",
+    );
+    expect(within(table).getByText(notes.name).closest("tr")).toHaveAttribute(
+      "data-cut",
+      "true",
+    );
+
+    await state.openDirectory(projects.directory!);
+    await fireEvent.keyDown(window, { key: "v", ctrlKey: true });
+    await waitFor(() => {
+      expect(state.cutEntries).toEqual([]);
+      expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+      expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
+    });
+  });
+
+  it("moves a dragged selection onto a capable directory target", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const table = screen.getByRole("table");
+    const source = within(table).getByText("explora-notes.md").closest("tr")!;
+    const destination = within(table).getByText("Projects").closest("tr")!;
+    const dataTransfer = {
+      effectAllowed: "none",
+      dropEffect: "none",
+      setData: vi.fn(),
+    };
+
+    await fireEvent.dragStart(source, { dataTransfer });
+    await fireEvent.dragOver(destination, { dataTransfer });
+    expect(destination).toHaveAttribute("data-drop-target", "true");
+    await fireEvent.drop(destination, { dataTransfer });
+
+    await waitFor(() =>
+      expect(
+        state.entries.some(({ name }) => name === "explora-notes.md"),
+      ).toBe(false),
+    );
+  });
+
+  it("announces item-based progress for a recursive filesystem action", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+
+    state.fileOperations.activeEntryId = "demo-directory";
+    state.fileOperations.activeEntryName = "Projects";
+    state.fileOperations.activeAction = "Deleting permanently";
+    state.fileOperations.progress = {
+      completedItems: 2,
+      totalItems: 7,
+      completedBytes: null,
+      totalBytes: null,
+      currentItemCompleted: null,
+      currentItemTotal: null,
+    };
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Deleting permanently “Projects” · 2 of 7 items",
+    );
+
+    state.fileOperations.progress = {
+      completedItems: 0,
+      totalItems: 1,
+      completedBytes: "2000",
+      totalBytes: "10000",
+      currentItemCompleted: null,
+      currentItemTotal: null,
+    };
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Deleting permanently “Projects” · 2 KB of 10 KB",
+      ),
+    );
+    expect(
+      screen.getByRole("progressbar", { name: "File transfer progress" }),
+    ).toHaveAttribute("aria-valuenow", "20");
+  });
+
+  it("provides an accessible inline rename workflow from the keyboard", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const original = screen.getByText("explora-notes.md");
+    const row = original.closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+
+    await fireEvent.keyDown(window, { key: "F2" });
+    const input = screen.getByRole("textbox", {
+      name: "Rename explora-notes.md",
+    });
+    expect(input).toHaveFocus();
+    await fireEvent.input(input, { target: { value: "renamed-notes.md" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(screen.getByText("renamed-notes.md")).toBeInTheDocument(),
+    );
+    expect(state.selectedEntry?.name).toBe("renamed-notes.md");
+    expect(
+      screen.queryByRole("textbox", { name: "Rename explora-notes.md" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the inline editor open for a rename conflict", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("Projects").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    await fireEvent.keyDown(window, { key: "F2" });
+    const input = screen.getByRole("textbox", { name: "Rename Projects" });
+    await fireEvent.input(input, { target: { value: "Photos" } });
+    await fireEvent.keyDown(input, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("An item with that name already exists."),
+      ).toBeInTheDocument(),
+    );
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    await fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+  });
+
+  it("moves the selected item to Trash without a confirmation dialog", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the Rust-shaped permanent-delete decision and honors cancel", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.click(row!);
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+      altKey: mac,
+      shiftKey: !mac,
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Delete “explora-notes.md” permanently?",
+      }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("In Home")).toBeInTheDocument();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    await fireEvent.click(cancel);
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByText("explora-notes.md")).toBeInTheDocument();
+  });
+
+  it("uses one explicit confirmation for a permanent-delete batch", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const first = screen.getByText("explora-notes.md").closest("tr");
+    const second = screen.getByText("summer-light.jpg").closest("tr");
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    await fireEvent.click(first!);
+    await fireEvent.click(second!, { ctrlKey: true });
+    const mac = /Mac|iPhone|iPad/.test(
+      navigator.platform || navigator.userAgent,
+    );
+
+    await fireEvent.keyDown(window, {
+      key: mac ? "Backspace" : "Delete",
+      metaKey: mac,
+      altKey: mac,
+      shiftKey: !mac,
+    });
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Delete 2 items permanently?",
+      }),
+    ).toBeInTheDocument();
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Delete Permanently" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument();
+      expect(screen.queryByText("summer-light.jpg")).not.toBeInTheDocument();
+    });
+  });
+
+  it("provides a keyboard-accessible destination chooser for local moves", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const row = screen.getByText("explora-notes.md").closest("tr");
+    expect(row).not.toBeNull();
+    await fireEvent.contextMenu(row!);
+    await fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Move…" }),
+    );
+
+    const dialog = await screen.findByRole("dialog");
+    expect(
+      within(dialog).getByRole("heading", {
+        name: "Move “explora-notes.md”",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Workspace" }),
+    ).toBeEnabled();
+    expect(
+      within(dialog).getByRole("button", { name: "staging-box" }),
+    ).toBeEnabled();
+    const cancel = within(dialog).getByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(cancel).toHaveFocus());
+    expect(
+      within(dialog).getByRole("button", { name: "Move Here" }),
+    ).toBeDisabled();
+
+    await fireEvent.click(
+      await within(dialog).findByRole("button", { name: "Projects" }),
+    );
+    await waitFor(() =>
+      expect(
+        within(dialog).getByText("Destination: Home/Projects"),
+      ).toBeInTheDocument(),
+    );
+    const moveHere = within(dialog).getByRole("button", {
+      name: "Move Here",
+    });
+    await waitFor(() => expect(moveHere).toBeEnabled());
+    await fireEvent.click(moveHere);
+
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("explora-notes.md")).not.toBeInTheDocument(),
+    );
   });
 
   it("uses distinct semantic icons for default favorite folders", async () => {

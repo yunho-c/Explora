@@ -7,12 +7,16 @@
   import { Input } from "$lib/components/ui/input";
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
+  import { deletionShortcut, isRenameShortcut } from "$lib/platform-shortcuts";
+  import { formatFileSize } from "$lib/file-metadata";
 
   import ExplorerSidebar from "./ExplorerSidebar.svelte";
   import ExplorerTabs from "./ExplorerTabs.svelte";
   import ExplorerToolbar from "./ExplorerToolbar.svelte";
   import FileGrid from "./FileGrid.svelte";
   import FileList from "./FileList.svelte";
+  import FileOperationConfirmationDialog from "./FileOperationConfirmationDialog.svelte";
+  import MoveDestinationDialog from "./MoveDestinationDialog.svelte";
   import NativeOpenConfirmation from "./NativeOpenConfirmation.svelte";
   import NativeOpenOperations from "./NativeOpenOperations.svelte";
   import QuickPreview from "./QuickPreview.svelte";
@@ -28,6 +32,16 @@
   } = $props();
 
   const handleKeydown = (event: KeyboardEvent) => {
+    if (
+      isRenameShortcut(event) &&
+      state.canRenameSelection &&
+      state.fileOperations.activeEntryId === null
+    ) {
+      event.preventDefault();
+      state.startRename();
+      return;
+    }
+
     const refreshShortcut =
       event.key === "F5" ||
       (event.key.toLocaleLowerCase() === "r" &&
@@ -70,17 +84,74 @@
     if (isInteractiveControl && !isPreviewText && event.key !== "Escape")
       return;
 
-    if (event.key === " " && state.selectedEntryId) {
+    const modifier = event.metaKey || event.ctrlKey;
+    const key = event.key.toLocaleLowerCase();
+    if (
+      modifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      key === "x" &&
+      state.canCutSelection &&
+      state.fileOperations.activeEntryId === null &&
+      !isPreviewText
+    ) {
+      event.preventDefault();
+      state.cutSelected();
+      return;
+    }
+    if (
+      modifier &&
+      !event.altKey &&
+      !event.shiftKey &&
+      key === "v" &&
+      state.canPasteCutEntries &&
+      state.fileOperations.activeEntryId === null &&
+      !isPreviewText
+    ) {
+      event.preventDefault();
+      void state.pasteCutEntries();
+      return;
+    }
+
+    if (key === "a" && modifier && !isPreviewText && !isPreviewDocument) {
+      event.preventDefault();
+      state.selectAllEntries();
+      return;
+    }
+
+    const deletion = deletionShortcut(event);
+    if (
+      deletion === "trash" &&
+      state.canTrashSelection &&
+      state.fileOperations.activeEntryId === null
+    ) {
+      event.preventDefault();
+      void state.moveSelectedToTrash();
+      return;
+    }
+    if (
+      deletion === "deletePermanently" &&
+      state.canDeleteSelectionPermanently &&
+      state.fileOperations.activeEntryId === null
+    ) {
+      event.preventDefault();
+      void state.deleteSelectedPermanently();
+      return;
+    }
+
+    if (event.key === " " && state.selectedEntries.length === 1) {
       event.preventDefault();
       void state.openPreview();
     } else if (event.key === "Escape" && state.previewOpen) {
       state.closePreview();
+    } else if (event.key === "Escape" && state.selectedEntries.length > 0) {
+      state.clearSelection();
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
-      state.moveSelection(1);
+      state.moveSelection(1, event.shiftKey);
     } else if (event.key === "ArrowUp") {
       event.preventDefault();
-      state.moveSelection(-1);
+      state.moveSelection(-1, event.shiftKey);
     }
   };
 </script>
@@ -103,7 +174,7 @@
     <ExplorerToolbar {state} />
 
     <div class="relative min-h-0 flex-1 overflow-auto">
-      {#if state.loading}
+      {#if state.loading || state.fileOperations.activeEntryId}
         <Progress class="absolute inset-x-0 top-0 z-10 h-0.5" />
       {/if}
 
@@ -159,6 +230,80 @@
         </div>
       {/if}
 
+      {#if state.cutEntries.length > 0}
+        <div
+          class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <span>
+            {state.cutEntries.length === 1
+              ? `“${state.cutEntries[0].name}” is ready to move.`
+              : `${state.cutEntries.length} items are ready to move.`}
+            Navigate to a destination and paste.
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onclick={() => state.clearCutEntries()}>Cancel</Button
+          >
+        </div>
+      {/if}
+
+      {#if state.fileOperations.errorMessage}
+        <div
+          class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive"
+          role="alert"
+        >
+          <span>{state.fileOperations.errorMessage}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            class="text-destructive hover:text-destructive"
+            onclick={() => state.fileOperations.clearError()}>Dismiss</Button
+          >
+        </div>
+      {/if}
+
+      {#if state.fileOperations.activeAction && state.fileOperations.activeEntryName && state.fileOperations.progress && (state.fileOperations.progress.totalItems > 1 || state.fileOperations.progress.totalBytes !== null)}
+        <div
+          class="mx-4 mt-4 rounded-lg border bg-muted/50 p-3 text-sm"
+          role="status"
+          aria-live="polite"
+        >
+          <span class="font-medium">{state.fileOperations.activeAction}</span>
+          <span class="text-muted-foreground">
+            “{state.fileOperations.activeEntryName}” ·
+            {#if state.fileOperations.progress.totalItems > 1}
+              {state.fileOperations.progress.completedItems} of {state
+                .fileOperations.progress.totalItems} items
+            {/if}
+            {#if state.fileOperations.progress.totalItems > 1 && state.fileOperations.activeItemName && (state.fileOperations.progress.totalBytes !== null || state.fileOperations.progress.currentItemTotal !== null)}
+              · “{state.fileOperations.activeItemName}”
+            {/if}
+            {#if state.fileOperations.progress.totalBytes !== null}
+              {state.fileOperations.progress.totalItems > 1
+                ? " · "
+                : ""}{formatFileSize(
+                state.fileOperations.progress.completedBytes,
+              )} of {formatFileSize(state.fileOperations.progress.totalBytes)}
+            {:else if state.fileOperations.progress.currentItemTotal !== null}
+              {state.fileOperations.progress.totalItems > 1 ? " · " : ""}{state
+                .fileOperations.progress.currentItemCompleted} of {state
+                .fileOperations.progress.currentItemTotal} entries in the current
+              item
+            {/if}
+          </span>
+          {#if state.fileOperations.byteProgressPercent !== null}
+            <Progress
+              class="mt-2 h-1"
+              value={state.fileOperations.byteProgressPercent}
+              aria-label="File transfer progress"
+            />
+          {/if}
+        </div>
+      {/if}
+
       {#if !state.errorMessage && !state.loading && state.visibleEntries.length === 0}
         <div class="grid min-h-72 place-items-center p-8 text-center">
           <div>
@@ -195,6 +340,8 @@
   </main>
 
   <QuickPreview {state} />
+  <FileOperationConfirmationDialog {state} />
+  <MoveDestinationDialog {state} />
   <NativeOpenOperations {state} />
   <NativeOpenConfirmation {state} />
   <SshTargetDialog {state} />

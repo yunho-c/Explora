@@ -40,6 +40,118 @@ test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await expect(page.getByRole("grid", { name: "Files" })).toBeVisible();
 });
 
+test("renames a selected local entry inline", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("explora-notes.md").click();
+  await page.keyboard.press("F2");
+  const editor = page.getByRole("textbox", {
+    name: "Rename explora-notes.md",
+  });
+  await expect(editor).toBeFocused();
+  await editor.fill("renamed-notes.md");
+  await editor.press("Enter");
+
+  await expect(page.getByText("renamed-notes.md")).toBeVisible();
+  await expect(editor).toBeHidden();
+});
+
+test("moves a local entry with the destination chooser", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByText("explora-notes.md").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Move…" }).click();
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("heading", { name: "Move “explora-notes.md”" }),
+  ).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await expect(
+    dialog.getByRole("button", { name: "Move Here" }),
+  ).toBeDisabled();
+  await dialog.getByRole("button", { name: "Projects" }).click();
+  await expect(dialog.getByText("Destination: Home/Projects")).toBeVisible();
+  await dialog.getByRole("button", { name: "Move Here" }).click();
+
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+  await page.getByText("Projects").dblclick();
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+});
+
+test("renames, moves, and permanently deletes remote entries", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .click();
+
+  await page.getByText("service.log").click();
+  await page.keyboard.press("F2");
+  const editor = page.getByRole("textbox", { name: "Rename service.log" });
+  await editor.fill("service-archived.log");
+  await editor.press("Enter");
+  await expect(page.getByText("service-archived.log")).toBeVisible();
+
+  await page.getByText("README.md").click({ button: "right" });
+  await expect(
+    page.getByRole("menuitem", { name: "Move to Trash" }),
+  ).toBeDisabled();
+  await page.getByRole("menuitem", { name: "Move…" }).click();
+  const moveDialog = page.getByRole("dialog");
+  await moveDialog.getByRole("button", { name: "deploy" }).click();
+  await moveDialog.getByRole("button", { name: "Move Here" }).click();
+  await expect(page.getByText("README.md")).toBeHidden();
+  await page.getByText("deploy").dblclick();
+  await expect(page.getByText("README.md")).toBeVisible();
+
+  await page.getByText("README.md").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Delete Permanently" }).click();
+  const deleteDialog = page.getByRole("dialog");
+  await expect(deleteDialog).toContainText("remote item on staging-box");
+  await expect(deleteDialog).toContainText("In staging-box");
+  await deleteDialog
+    .getByRole("button", { name: "Delete Permanently" })
+    .click();
+  await expect(page.getByText("README.md")).toBeHidden();
+});
+
+test("trashes locally and confirms permanent deletion with platform shortcuts", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const isMac = await page.evaluate(() =>
+    /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent),
+  );
+
+  await page.getByText("explora-notes.md").click();
+  await page.keyboard.press(isMac ? "Meta+Backspace" : "Delete");
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+  await expect(page.getByRole("dialog")).toBeHidden();
+
+  await page.reload();
+  await page.getByText("explora-notes.md").click();
+  const permanentShortcut = isMac ? "Meta+Alt+Backspace" : "Shift+Delete";
+  await page.keyboard.press(permanentShortcut);
+  const dialog = page.getByRole("dialog");
+  await expect(
+    dialog.getByRole("heading", {
+      name: "Delete “explora-notes.md” permanently?",
+    }),
+  ).toBeVisible();
+  await expect(dialog.getByText("In Home")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Cancel" })).toBeFocused();
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+
+  await page.keyboard.press(permanentShortcut);
+  await dialog.getByRole("button", { name: "Delete Permanently" }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("explora-notes.md")).toBeHidden();
+});
+
 test("previews a multipage PDF with custom canvas controls", async ({
   page,
 }) => {
