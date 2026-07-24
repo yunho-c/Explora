@@ -1,6 +1,6 @@
 # Filesystem actions
 
-- Status: Accepted; phased implementation in progress
+- Status: Accepted; phases 1–8 implemented; native platform validation pending
 - Scope: Rename, move, trash, and permanent deletion for local and SSH/SFTP
   locations
 
@@ -66,7 +66,6 @@ The following are deferred:
 - Undo beyond recovery through the operating system's trash facility.
 - Resuming operations after the application restarts.
 - Automatic retry of an operation with an uncertain outcome.
-- Drag-and-drop and cut/paste as initial interaction requirements.
 - Background operation persistence or a durable transfer journal.
 
 ## Current implementation

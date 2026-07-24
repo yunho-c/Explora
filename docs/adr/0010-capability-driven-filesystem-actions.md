@@ -1,4 +1,4 @@
-# ADR 0009: Capability-driven filesystem actions
+# ADR 0010: Capability-driven filesystem actions
 
 - Status: Accepted
 - Date: 2026-07-22
@@ -27,10 +27,10 @@ an action, and bounded options. They never contain authoritative paths or backen
 implementation details.
 
 Every entry advertises typed capabilities for rename, move, trash, and permanent
-delete. Directory destinations will advertise move-acceptance and replacement
-capabilities when those phases are implemented. The frontend uses these values to
-present actions, while Rust revalidates references, capabilities, identity, and
-filesystem state immediately before execution.
+delete. Directory destinations advertise move acceptance and atomic-replacement
+capabilities independently. The frontend uses these values to present actions,
+while Rust revalidates references, capabilities, identity, and filesystem state
+immediately before execution.
 
 Operations use opaque IDs and monotonically sequenced events. The lifecycle
 supports queued, running, awaiting-confirmation, awaiting-conflict, completed,
@@ -38,8 +38,8 @@ cancelled, and failed states. Terminal states are immutable. Cancellation is
 best-effort; an atomic or remotely acknowledged mutation is never described as
 cancelled merely because its result arrived after a cancellation request.
 
-Local and SFTP implementations will converge on a shared backend mutation
-contract. Same-filesystem rename and move use an explicit no-replace relocation
+Local and SFTP implementations converge on a shared backend mutation contract.
+Same-filesystem rename and move use an explicit no-replace relocation
 primitive. Cross-filesystem and cross-backend moves are coordinated copy,
 finalize, verify, and delete operations. The source is removed only after the
 destination succeeds and is verified.
@@ -140,9 +140,9 @@ The third implementation enables single-entry moves within one local location:
   incompatible locations, and keeps the final command unavailable until the
   destination capability and relationship checks pass.
 
-Cross-location and cross-volume moves remain Phase 6 transfer operations. They
-must allocate new identities, copy to an owned partial target, verify and
-finalize it, and only then remove the source.
+At this stage, cross-location and cross-volume moves were reserved for Phase 6.
+They require new identities, an owned partial target, verification and
+finalization, and source removal only after those steps succeed.
 
 ## Fourth vertical slice
 
@@ -172,8 +172,52 @@ remote location:
   permissions, symlinks, recursive partial completion, latency, timeout, and
   disconnect uncertainty over the real protocol.
 
-Cross-location and cross-backend moves remain Phase 6 transfer operations and
-cannot use the relocation path.
+At this stage, cross-location and cross-backend moves were reserved for Phase 6
+because they cannot use the relocation path.
+
+## Fifth vertical slice
+
+The fifth implementation enables verified moves across local volumes, connected
+SFTP locations, and backend boundaries:
+
+- The coordinator copies each source to an exclusively created, least-privilege
+  partial artifact owned by the operation. Finalization uses no-replace
+  relocation and never overwrites a destination created concurrently.
+- Regular files stream in bounded chunks and are compared byte for byte before
+  source removal. Directory manifests are deterministic, limited to 100,000
+  entries and 256 levels, preserve empty directories, and never follow symlinks.
+- Source identity and content are revalidated after copying and immediately
+  before cleanup. A changed source invalidates the copy rather than applying the
+  original intent to new content.
+- Cancellation and pre-finalization failures clean only operation-owned partial
+  artifacts and preserve the source. A verified destination is preserved if
+  source removal fails, with `partialCompletion` identifying the remaining
+  source.
+- Remote finalization and deletion are never replayed after a lost
+  acknowledgement. The operation reports `outcomeUncertain`, takes the affected
+  session offline where appropriate, and requires an explicit refresh.
+- Cross-backend symlinks are recreated as links without traversing their targets.
+  Unsupported Windows remote-link cases return a typed error instead of guessing
+  a target type.
+
+## Sixth vertical slice
+
+The sixth implementation adds bounded batches and direct interaction surfaces:
+
+- Move, Trash, and permanent deletion accept at most 1,000 unique entries from
+  one source location. Requests containing both a directory and its descendant
+  are rejected before mutation.
+- Entries execute sequentially under one operation ID. Ordered per-entry results
+  distinguish completed, failed, cancelled, and unstarted work, and cancellation
+  is checked between entries.
+- Permanent deletion uses one Rust-authoritative confirmation for the selected
+  batch. Move conflicts remain per entry and expose only decisions supported by
+  the active backend.
+- Cut/paste stores typed opaque entry references only in frontend memory.
+  Browser drag data carries only an internal marker; authoritative references
+  remain in application state and are revalidated by Rust at execution time.
+- Capability intersections gate every multi-entry action and drop destination.
+  Explicit Move and cut/paste commands remain complete keyboard alternatives.
 
 ## Security review
 
@@ -191,19 +235,30 @@ cannot use the relocation path.
   creates the destination after preflight validation.
 - The case-only intermediate path is random, owned by the operation, and restored
   to the original path if finalization fails.
-- The transfer phase still requires focused review of partial-resource lifecycle,
-  verification, and cross-backend uncertain-outcome behavior before its
-  capabilities are enabled.
+- Transfer partials have an explicit owned lifecycle, bounded creation and
+  cleanup, no-replace finalization, byte or tree verification, and source
+  revalidation before deletion.
+- Remote acknowledgement loss is never retried automatically. Uncertain outcomes
+  remain explicit, preserve any known-good side of the transfer, and require
+  user-led reconnect and refresh.
+- Batch bounds, same-location source requirements, overlap rejection, ordered
+  outcomes, and capability intersections prevent frontend selection state from
+  widening the authority of an operation.
+- Browser cut and drag payloads never contain authoritative local or remote
+  paths. Rust accepts only bounded, location-scoped opaque references and
+  revalidates them immediately before mutation.
 
 ## Consequences
 
-- Quick local actions use the same lifecycle that will support long-running
-  transfers, avoiding a second mutation API later.
+- Quick local actions and long-running transfers use the same lifecycle rather
+  than separate mutation APIs.
 - The frontend receives explicit feature availability but cannot use capabilities
   to bypass Rust authorization or execution-time validation.
 - Registered tabs and histories can remain valid through same-backend directory
   relocation.
-- Remote Trash and transfer-based moves remain visibly unavailable rather than
-  silently degrading.
-- Each subsequent phase must add backend contract coverage and native validation
-  before enabling its capability.
+- Remote Trash remains visibly unavailable rather than silently degrading.
+  Transfer-based moves are capability-gated and report unsupported destination
+  semantics explicitly.
+- Backend contract coverage is required before enabling a capability. Packaged
+  native Trash and local-move validation remains required on macOS, Linux, and
+  Windows.
