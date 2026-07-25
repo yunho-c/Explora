@@ -11,7 +11,7 @@ use rand::rng;
 use russh::{
     keys::{ssh_key::LineEnding, Algorithm, PrivateKey, PublicKey},
     server::{self, Auth, ChannelOpenHandle, Msg, Response, Session},
-    Channel, ChannelId, Disconnect, MethodKind, MethodSet,
+    Channel, ChannelId, Disconnect, MethodKind, MethodSet, Pty,
 };
 use russh_sftp::protocol::{
     Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
@@ -279,6 +279,8 @@ async fn run_session(
     let handler = TestSshHandler {
         state,
         channels: HashMap::new(),
+        pty_channels: HashSet::new(),
+        shell_channels: HashSet::new(),
     };
     if let Ok(session) = server::run_stream(config, stream, handler).await {
         handles.lock().await.push(session.handle());
@@ -289,6 +291,8 @@ async fn run_session(
 struct TestSshHandler {
     state: Arc<ServerState>,
     channels: HashMap<ChannelId, Channel<Msg>>,
+    pty_channels: HashSet<ChannelId>,
+    shell_channels: HashSet<ChannelId>,
 }
 
 impl server::Handler for TestSshHandler {
@@ -383,6 +387,78 @@ impl server::Handler for TestSshHandler {
             TestSftpHandler::new(self.state.listing_delay),
         )
         .await;
+        Ok(())
+    }
+
+    async fn pty_request(
+        &mut self,
+        channel_id: ChannelId,
+        term: &str,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        _modes: &[(Pty, u32)],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if term != "xterm-256color" || col_width == 0 || row_height == 0 {
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        }
+        self.pty_channels.insert(channel_id);
+        session.channel_success(channel_id)?;
+        Ok(())
+    }
+
+    async fn shell_request(
+        &mut self,
+        channel_id: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self.pty_channels.contains(&channel_id) {
+            session.channel_failure(channel_id)?;
+            return Ok(());
+        }
+        self.shell_channels.insert(channel_id);
+        session.channel_success(channel_id)?;
+        session.data(channel_id, b"remote-shell-ready\r\n".to_vec())?;
+        Ok(())
+    }
+
+    async fn window_change_request(
+        &mut self,
+        channel_id: ChannelId,
+        col_width: u32,
+        row_height: u32,
+        _pix_width: u32,
+        _pix_height: u32,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if self.shell_channels.contains(&channel_id) {
+            session.data(
+                channel_id,
+                format!("remote-resize-{col_width}x{row_height}\r\n").into_bytes(),
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn data(
+        &mut self,
+        channel_id: ChannelId,
+        data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if !self.shell_channels.contains(&channel_id) {
+            return Ok(());
+        }
+        session.data(channel_id, data.to_vec())?;
+        if data.windows(b"exit".len()).any(|window| window == b"exit") {
+            session.exit_status_request(channel_id, 17)?;
+            session.eof(channel_id)?;
+            session.close(channel_id)?;
+            self.shell_channels.remove(&channel_id);
+        }
         Ok(())
     }
 }

@@ -32,8 +32,17 @@ export interface LayoutPreferences {
   hiddenSshTargetIds: string[];
 }
 
+export interface TerminalPreferences {
+  visible: boolean;
+  paneHeightPercent: number;
+  fontSize: number;
+  scrollback: number;
+  screenReaderMode: boolean;
+}
+
 export interface UserPreferences {
   layout: LayoutPreferences;
+  terminal: TerminalPreferences;
 }
 
 export interface LayoutPreferencesPatch {
@@ -44,8 +53,11 @@ export interface LayoutPreferencesPatch {
   hiddenSshTargetIds?: string[];
 }
 
+export type TerminalPreferencesPatch = Partial<TerminalPreferences>;
+
 export interface UserPreferencesPatch {
   layout: LayoutPreferencesPatch;
+  terminal?: TerminalPreferencesPatch;
 }
 
 export type PreferencesWarningCode =
@@ -68,5 +80,12 @@ export const defaultUserPreferences = (): UserPreferences => ({
     sort: { column: "name", direction: "ascending" },
     favoriteRoles: [...DEFAULT_FAVORITE_ROLES],
     hiddenSshTargetIds: [],
+  },
+  terminal: {
+    visible: false,
+    paneHeightPercent: 32,
+    fontSize: 13,
+    scrollback: 5_000,
+    screenReaderMode: true,
   },
 });

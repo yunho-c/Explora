@@ -10,9 +10,15 @@ use tempfile::NamedTempFile;
 
 use crate::filesystem::ExplorerError;
 
-const PREFERENCES_FILE_VERSION: u32 = 3;
+const PREFERENCES_FILE_VERSION: u32 = 4;
 const MAX_HIDDEN_SSH_TARGETS: usize = 512;
 const MAX_SSH_TARGET_ID_LENGTH: usize = 512;
+const MIN_TERMINAL_PANE_HEIGHT_PERCENT: u16 = 20;
+const MAX_TERMINAL_PANE_HEIGHT_PERCENT: u16 = 70;
+const MIN_TERMINAL_FONT_SIZE: u16 = 10;
+const MAX_TERMINAL_FONT_SIZE: u16 = 24;
+const MIN_TERMINAL_SCROLLBACK: u32 = 1_000;
+const MAX_TERMINAL_SCROLLBACK: u32 = 50_000;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -90,10 +96,33 @@ impl Default for LayoutPreferencesDto {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalPreferencesDto {
+    pub visible: bool,
+    pub pane_height_percent: u16,
+    pub font_size: u16,
+    pub scrollback: u32,
+    pub screen_reader_mode: bool,
+}
+
+impl Default for TerminalPreferencesDto {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            pane_height_percent: 32,
+            font_size: 13,
+            scrollback: 5_000,
+            screen_reader_mode: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserPreferencesDto {
     pub layout: LayoutPreferencesDto,
+    pub terminal: TerminalPreferencesDto,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -108,8 +137,19 @@ pub struct LayoutPreferencesPatchDto {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalPreferencesPatchDto {
+    pub visible: Option<bool>,
+    pub pane_height_percent: Option<u16>,
+    pub font_size: Option<u16>,
+    pub scrollback: Option<u32>,
+    pub screen_reader_mode: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UserPreferencesPatchDto {
     pub layout: LayoutPreferencesPatchDto,
+    pub terminal: Option<TerminalPreferencesPatchDto>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -131,6 +171,7 @@ pub struct PreferencesSnapshotDto {
 struct StoredPreferencesDocument {
     version: u32,
     layout: LayoutPreferencesDto,
+    terminal: TerminalPreferencesDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +203,13 @@ struct LayoutPreferencesV2 {
     view_mode: ViewMode,
     sort: SortDescriptorDto,
     favorite_roles: Vec<FavoriteRole>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredPreferencesDocumentV3 {
+    version: u32,
+    layout: LayoutPreferencesDto,
 }
 
 #[derive(Debug, Deserialize)]
@@ -228,6 +276,24 @@ impl PreferencesStore {
             updated.layout.hidden_ssh_target_ids =
                 canonical_hidden_ssh_target_ids(&hidden_ssh_target_ids)?;
         }
+        if let Some(terminal) = patch.terminal {
+            if let Some(visible) = terminal.visible {
+                updated.terminal.visible = visible;
+            }
+            if let Some(pane_height_percent) = terminal.pane_height_percent {
+                updated.terminal.pane_height_percent = pane_height_percent;
+            }
+            if let Some(font_size) = terminal.font_size {
+                updated.terminal.font_size = font_size;
+            }
+            if let Some(scrollback) = terminal.scrollback {
+                updated.terminal.scrollback = scrollback;
+            }
+            if let Some(screen_reader_mode) = terminal.screen_reader_mode {
+                updated.terminal.screen_reader_mode = screen_reader_mode;
+            }
+            validate_terminal_preferences(&updated.terminal)?;
+        }
 
         persist_preferences(&self.storage_path, &updated)?;
         state.preferences = updated.clone();
@@ -270,6 +336,7 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
                         favorite_roles: DEFAULT_FAVORITE_ROLES.to_vec(),
                         hidden_ssh_target_ids: Vec::new(),
                     },
+                    terminal: TerminalPreferencesDto::default(),
                 },
                 None,
             ),
@@ -287,30 +354,58 @@ fn load_preferences(path: &Path) -> (UserPreferencesDto, Option<PreferencesWarni
                         ),
                         hidden_ssh_target_ids: Vec::new(),
                     },
+                    terminal: TerminalPreferencesDto::default(),
                 },
                 None,
             ),
             _ => malformed_recovery(),
         },
+        3 => match serde_json::from_slice::<StoredPreferencesDocumentV3>(&bytes) {
+            Ok(document) if document.version == 3 => match canonical_hidden_ssh_target_ids(
+                &document.layout.hidden_ssh_target_ids,
+            ) {
+                Ok(hidden_ssh_target_ids) => (
+                    UserPreferencesDto {
+                        layout: LayoutPreferencesDto {
+                            favorite_roles: canonical_favorite_roles(
+                                &document.layout.favorite_roles,
+                            ),
+                            hidden_ssh_target_ids,
+                            ..document.layout
+                        },
+                        terminal: TerminalPreferencesDto::default(),
+                    },
+                    None,
+                ),
+                Err(_) => malformed_recovery(),
+            },
+            _ => malformed_recovery(),
+        },
         PREFERENCES_FILE_VERSION => {
             match serde_json::from_slice::<StoredPreferencesDocument>(&bytes) {
-                Ok(document) => match canonical_hidden_ssh_target_ids(
-                    &document.layout.hidden_ssh_target_ids,
-                ) {
-                    Ok(hidden_ssh_target_ids) => (
-                        UserPreferencesDto {
-                            layout: LayoutPreferencesDto {
-                                favorite_roles: canonical_favorite_roles(
-                                    &document.layout.favorite_roles,
-                                ),
-                                hidden_ssh_target_ids,
-                                ..document.layout
+                Ok(document) => {
+                    match (
+                        canonical_hidden_ssh_target_ids(
+                            &document.layout.hidden_ssh_target_ids,
+                        ),
+                        validate_terminal_preferences(&document.terminal),
+                    ) {
+                        (Ok(hidden_ssh_target_ids), Ok(())) => (
+                            UserPreferencesDto {
+                                layout: LayoutPreferencesDto {
+                                    favorite_roles: canonical_favorite_roles(
+                                        &document.layout.favorite_roles,
+                                    ),
+                                    hidden_ssh_target_ids,
+                                    ..document.layout
+                                },
+                                terminal: document.terminal,
                             },
-                        },
-                        None,
-                    ),
-                    Err(_) => malformed_recovery(),
-                },
+                            None,
+                        ),
+                        _ => malformed_recovery(),
+                    }
+                }
                 Err(_) => malformed_recovery(),
             }
         }
@@ -355,6 +450,21 @@ fn canonical_hidden_ssh_target_ids(ids: &[String]) -> Result<Vec<String>, Explor
     Ok(canonical)
 }
 
+fn validate_terminal_preferences(
+    preferences: &TerminalPreferencesDto,
+) -> Result<(), ExplorerError> {
+    if !(MIN_TERMINAL_PANE_HEIGHT_PERCENT..=MAX_TERMINAL_PANE_HEIGHT_PERCENT)
+        .contains(&preferences.pane_height_percent)
+        || !(MIN_TERMINAL_FONT_SIZE..=MAX_TERMINAL_FONT_SIZE).contains(&preferences.font_size)
+        || !(MIN_TERMINAL_SCROLLBACK..=MAX_TERMINAL_SCROLLBACK).contains(&preferences.scrollback)
+    {
+        return Err(ExplorerError::InvalidConfiguration(
+            "The terminal preferences are outside the supported range.".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn recovery(
     code: &'static str,
     message: &str,
@@ -377,6 +487,7 @@ fn persist_preferences(path: &Path, preferences: &UserPreferencesDto) -> Result<
     let document = StoredPreferencesDocument {
         version: PREFERENCES_FILE_VERSION,
         layout: preferences.layout.clone(),
+        terminal: preferences.terminal.clone(),
     };
     let bytes = serde_json::to_vec_pretty(&document).map_err(|_| {
         ExplorerError::Unexpected("Explora could not encode its preferences.".to_owned())
@@ -422,6 +533,7 @@ mod tests {
                 favorite_roles: None,
                 hidden_ssh_target_ids: None,
             },
+            terminal: None,
         }
     }
 
@@ -434,6 +546,7 @@ mod tests {
                 favorite_roles: Some(favorite_roles),
                 hidden_ssh_target_ids: None,
             },
+            terminal: None,
         }
     }
 
@@ -451,6 +564,32 @@ mod tests {
                         .collect(),
                 ),
             },
+            terminal: None,
+        }
+    }
+
+    fn terminal_patch(
+        visible: Option<bool>,
+        pane_height_percent: Option<u16>,
+        font_size: Option<u16>,
+        scrollback: Option<u32>,
+        screen_reader_mode: Option<bool>,
+    ) -> UserPreferencesPatchDto {
+        UserPreferencesPatchDto {
+            layout: LayoutPreferencesPatchDto {
+                sidebar_collapsed: None,
+                view_mode: None,
+                sort: None,
+                favorite_roles: None,
+                hidden_ssh_target_ids: None,
+            },
+            terminal: Some(TerminalPreferencesPatchDto {
+                visible,
+                pane_height_percent,
+                font_size,
+                scrollback,
+                screen_reader_mode,
+            }),
         }
     }
 
@@ -544,6 +683,75 @@ mod tests {
         );
         assert!(snapshot.preferences.layout.hidden_ssh_target_ids.is_empty());
         assert_eq!(snapshot.warning, None);
+    }
+
+    #[test]
+    fn migrates_version_three_layout_with_terminal_defaults() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        fs::write(
+            &path,
+            br#"{"version":3,"layout":{"sidebarCollapsed":false,"viewMode":"list","sort":{"column":"name","direction":"ascending"},"favoriteRoles":["home","documents"],"hiddenSshTargetIds":["manual:target-1"]}}"#,
+        )
+        .expect("version three preferences");
+
+        let snapshot = PreferencesStore::new(path)
+            .snapshot()
+            .expect("migrated preferences");
+        assert_eq!(
+            snapshot.preferences.layout.hidden_ssh_target_ids,
+            vec!["manual:target-1"]
+        );
+        assert_eq!(
+            snapshot.preferences.terminal,
+            TerminalPreferencesDto::default()
+        );
+        assert_eq!(snapshot.warning, None);
+    }
+
+    #[test]
+    fn terminal_preferences_round_trip_and_reject_invalid_ranges() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("preferences.json");
+        let store = PreferencesStore::new(path.clone());
+
+        store
+            .update(terminal_patch(
+                Some(true),
+                Some(40),
+                Some(16),
+                Some(10_000),
+                Some(false),
+            ))
+            .expect("terminal preference update");
+        let reloaded = PreferencesStore::new(path)
+            .snapshot()
+            .expect("reloaded preferences");
+        assert_eq!(
+            reloaded.preferences.terminal,
+            TerminalPreferencesDto {
+                visible: true,
+                pane_height_percent: 40,
+                font_size: 16,
+                scrollback: 10_000,
+                screen_reader_mode: false,
+            }
+        );
+
+        let result = store.update(terminal_patch(None, Some(90), None, None, None));
+        assert!(matches!(
+            result,
+            Err(ExplorerError::InvalidConfiguration(_))
+        ));
+        assert_eq!(
+            store
+                .snapshot()
+                .expect("unchanged preferences")
+                .preferences
+                .terminal
+                .pane_height_percent,
+            40
+        );
     }
 
     #[test]

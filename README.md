@@ -10,6 +10,15 @@ Saved SSH targets and concrete aliases from
 application retains deterministic local and remote demo assets for UI development
 and tests.
 
+Explora also includes a window-scoped integrated terminal pane powered by
+xterm.js. Local shells start in the currently authorized directory through
+`portable-pty`; remote shells reuse an authenticated, host-verified SSH
+connection and start in the account's server-selected home directory. Sessions
+support tabs, bounded byte streaming and scrollback, resize, paste confirmation,
+structured exit state, and versioned pane preferences. See
+[`docs/terminal.md`](docs/terminal.md) and
+[`docs/adr/0009-integrated-terminal.md`](docs/adr/0009-integrated-terminal.md).
+
 The packaged application integrates its tab strip into a guarded custom
 titlebar. macOS keeps native traffic lights, Windows 11 retains the native Snap
 Layout menu, and supported GNOME/KDE Wayland sessions receive GTK-themed window
@@ -21,8 +30,9 @@ for the dependency, security, and fallback decision.
 
 ## Technology
 
-- Tauri 2 and stable Rust for the desktop application boundary
+- Tauri 2 and stable Rust for the desktop, PTY, and SSH boundaries
 - Svelte 5, TypeScript, and Vite for the frontend
+- xterm.js and `portable-pty` for integrated terminals
 - Bun for dependencies and repository-level commands
 - Tailwind CSS 4 and stock shadcn-svelte Vega components
 
@@ -34,15 +44,15 @@ it does not maintain a custom component theme.
 
 ```text
 src/
-├── app/                 application entry and reactive explorer state
-├── features/explorer/   file-explorer shell and feature components
+├── app/                 application entry and reactive explorer/terminal state
+├── features/            explorer and integrated-terminal components
 └── lib/
     ├── components/ui/   generated shadcn-svelte components
     ├── contracts/       frontend domain summaries and state types
     ├── data/            replaceable data-source boundary and demo adapter
     └── hooks/           generated component hooks
 
-src-tauri/               Tauri configuration, typed IPC, local filesystem, and SSH/SFTP
+src-tauri/               Tauri IPC, filesystem, SSH/SFTP, and terminal transports
 tests/                   browser-level shell smoke tests
 docs/adr/                consequential architecture and security decisions
 ```
@@ -54,8 +64,10 @@ authoritative. See
 and [`docs/adr/0002-read-only-ssh-sftp-locations.md`](docs/adr/0002-read-only-ssh-sftp-locations.md)
 for the authorization, trust, and credential-handling model.
 
-The current filesystem backends are deliberately read-only. SSH authentication
-supports agents, standard or configured identity files, encrypted-key
+The current filesystem-management backends are deliberately read-only; the
+integrated terminal intentionally has interactive shell authority only inside
+explicit, window-owned sessions. SSH authentication supports agents, standard or
+configured identity files, encrypted-key
 passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
 `known_hosts` files, requires confirmation for unknown keys, and blocks changed
 keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
@@ -64,8 +76,9 @@ their current folder and history, and an explicit reconnect resumes the same
 opaque directory reference when it is still valid. Refresh reloads the active
 folder without changing navigation history. Mounted local volumes are discovered
 in the Rust boundary and updated through native platform notifications with a
-bounded polling fallback. Sidebar layout, favorites, view mode, sorting, and SSH
-target visibility persist as versioned local preferences. File watching,
+bounded polling fallback. Sidebar layout, favorites, view mode, sorting, SSH
+target visibility, and terminal-pane presentation persist as versioned local
+preferences. File watching,
 hidden-file controls, mutations, remote content previews, and additional preview
 formats remain later vertical slices. See
 [`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
@@ -96,6 +109,13 @@ permission and symlink behavior, missing SFTP, delayed-request cancellation,
 disconnect detection, and reconnect continuity. The disposable SSH-agent test is
 Unix-only; the Windows Pageant and named-pipe paths remain platform-gated code
 that require Windows validation.
+
+Terminal tests additionally exercise a real local PTY, byte preservation,
+resize, exit status, process-group cleanup, verified SSH PTY negotiation,
+backpressure acknowledgements, disconnect-to-exit behavior, and no input replay.
+The macOS release app and DMG build in the current development environment.
+Interactive packaged WebView smoke testing and Linux/Windows terminal packaging
+remain required before terminal support is considered cross-platform complete.
 
 ## Prerequisites
 

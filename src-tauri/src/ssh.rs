@@ -35,7 +35,15 @@ use crate::{
         SSH_KEEPALIVE_MAX,
     },
     ssh_targets::{location_id, ResolvedSshTarget, SshTargetSummaryDto},
+    terminal::types::TerminalSizeDto,
 };
+
+pub(crate) struct OpenedSshTerminal {
+    pub location_id: String,
+    pub title: String,
+    pub context_label: String,
+    pub channel: russh::Channel<client::Msg>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(
@@ -512,6 +520,87 @@ impl SshConnectionManager {
                 target.status = "connecting";
             }
         }
+    }
+
+    pub(crate) async fn open_terminal(
+        &self,
+        location_id: &str,
+        size: TerminalSizeDto,
+    ) -> Result<OpenedSshTerminal, ExplorerError> {
+        let size = size.validate()?;
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .values()
+            .find(|session| session.location_id == location_id)
+            .cloned()
+            .ok_or_else(|| {
+                ExplorerError::Offline(
+                    "Reconnect this SSH location before opening a terminal.".to_owned(),
+                )
+            })?;
+        if session.lifecycle.load(Ordering::SeqCst) != SESSION_ACTIVE {
+            return Err(ExplorerError::Offline(
+                "Reconnect this SSH location before opening a terminal.".to_owned(),
+            ));
+        }
+
+        let handle = session.handle.lock().await;
+        let channel = tokio::time::timeout(CONNECTION_TIMEOUT, handle.channel_open_session())
+            .await
+            .map_err(|_| {
+                ExplorerError::Offline(
+                    "The SSH server timed out while opening a terminal channel.".to_owned(),
+                )
+            })?
+            .map_err(|_| {
+                ExplorerError::Offline("The SSH server did not open a terminal channel.".to_owned())
+            })?;
+        drop(handle);
+        tokio::time::timeout(
+            CONNECTION_TIMEOUT,
+            channel.request_pty(
+                true,
+                "xterm-256color",
+                u32::from(size.columns),
+                u32::from(size.rows),
+                u32::from(size.pixel_width.unwrap_or_default()),
+                u32::from(size.pixel_height.unwrap_or_default()),
+                &[],
+            ),
+        )
+        .await
+        .map_err(|_| {
+            ExplorerError::Offline(
+                "The SSH server timed out while opening a pseudo-terminal.".to_owned(),
+            )
+        })?
+        .map_err(|_| {
+            ExplorerError::Unsupported(
+                "The SSH server did not accept a pseudo-terminal request.".to_owned(),
+            )
+        })?;
+        let _ = channel.set_env(false, "COLORTERM", "truecolor").await;
+        tokio::time::timeout(CONNECTION_TIMEOUT, channel.request_shell(true))
+            .await
+            .map_err(|_| {
+                ExplorerError::Offline(
+                    "The SSH server timed out while starting its default shell.".to_owned(),
+                )
+            })?
+            .map_err(|_| {
+                ExplorerError::Unsupported(
+                    "The SSH server did not start the account's default shell.".to_owned(),
+                )
+            })?;
+
+        Ok(OpenedSshTerminal {
+            location_id: session.location_id.clone(),
+            title: session.target.name.clone(),
+            context_label: format!("{} · server home", session.target.name),
+            channel,
+        })
     }
 
     pub async fn connect(
@@ -1183,12 +1272,17 @@ fn content_kind(name: &str, is_directory: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use russh::ChannelMsg;
+    use std::{sync::mpsc, time::Duration};
 
     use serde_json::Value;
-    use tauri::ipc::InvokeResponseBody;
+    use tauri::ipc::{InvokeResponseBody, Response};
 
     use crate::ssh_test_server::{TestAuthMode, TestSshServer};
+    use crate::terminal::{
+        types::{TerminalCloseReason, TERMINAL_OUTPUT_FRAME_HEADER_BYTES},
+        SshTerminalLaunch, TerminalCoordinator,
+    };
 
     #[cfg(unix)]
     static SSH_AGENT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -1506,6 +1600,276 @@ mod tests {
             .any(|entry| entry.name == "notes.txt"));
 
         manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_connection_opens_an_interactive_pty_channel() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (events, _) = event_channel(manager.clone(), "terminal-connect", answers);
+        let location = manager
+            .connect(target, "terminal-connect".to_owned(), events)
+            .await
+            .expect("connect through verified SSH");
+        let opened = manager
+            .open_terminal(
+                &location.id,
+                TerminalSizeDto {
+                    columns: 80,
+                    rows: 24,
+                    pixel_width: None,
+                    pixel_height: None,
+                },
+            )
+            .await
+            .expect("open remote PTY");
+        assert_eq!(opened.location_id, location.id);
+        assert_eq!(opened.title, "Test server");
+        assert_eq!(opened.context_label, "Test server · server home");
+
+        let mut channel = opened.channel;
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(ChannelMsg::Data { data }) = channel.wait().await {
+                    break data;
+                }
+            }
+        })
+        .await
+        .expect("remote shell banner");
+        assert_eq!(ready.as_ref(), b"remote-shell-ready\r\n");
+
+        channel
+            .window_change(120, 40, 0, 0)
+            .await
+            .expect("resize remote PTY");
+        channel
+            .data_bytes(b"exit\n".to_vec())
+            .await
+            .expect("write remote PTY");
+        let (mut output, mut exit_code) = (Vec::new(), None);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match channel.wait().await {
+                    Some(ChannelMsg::Data { data }) => output.extend_from_slice(&data),
+                    Some(ChannelMsg::ExitStatus { exit_status }) => {
+                        exit_code = Some(exit_status);
+                    }
+                    Some(ChannelMsg::Close) | None => break,
+                    Some(_) => {}
+                }
+            }
+        })
+        .await
+        .expect("remote shell exit");
+        assert!(output
+            .windows(b"remote-resize-120x40".len())
+            .any(|part| part == b"remote-resize-120x40"));
+        assert!(output.windows(4).any(|part| part == b"exit"));
+        assert_eq!(exit_code, Some(17));
+
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_terminal_coordinator_streams_and_accounts_for_output() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (events, _) = event_channel(manager.clone(), "coordinator-connect", answers);
+        let location = manager
+            .connect(target, "coordinator-connect".to_owned(), events)
+            .await
+            .expect("connect through verified SSH");
+        let opened = manager
+            .open_terminal(
+                &location.id,
+                TerminalSizeDto {
+                    columns: 80,
+                    rows: 24,
+                    pixel_width: None,
+                    pixel_height: None,
+                },
+            )
+            .await
+            .expect("open remote PTY");
+        let (event_sender, event_receiver) = mpsc::channel();
+        let terminal_channel: Channel<Response> = Channel::new(move |body| {
+            let _ = event_sender.send(body);
+            Ok(())
+        });
+        let coordinator = TerminalCoordinator::default();
+        let summary = coordinator
+            .create_ssh(SshTerminalLaunch {
+                window_label: "main",
+                location_id: &opened.location_id,
+                title: &opened.title,
+                context_label: &opened.context_label,
+                channel: opened.channel,
+                on_event: terminal_channel,
+            })
+            .expect("register remote terminal");
+        assert_eq!(
+            summary.kind,
+            crate::terminal::types::TerminalSessionKind::Ssh
+        );
+
+        coordinator
+            .resize(
+                "main",
+                &summary.id,
+                TerminalSizeDto {
+                    columns: 120,
+                    rows: 40,
+                    pixel_width: Some(1_200),
+                    pixel_height: Some(800),
+                },
+            )
+            .expect("queue remote resize");
+        coordinator
+            .write("main", &summary.id, 0, b"exit\n")
+            .expect("queue remote input");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut output = Vec::new();
+        let mut started = false;
+        let mut exit_code = None;
+        while std::time::Instant::now() < deadline && exit_code.is_none() {
+            match event_receiver
+                .recv_timeout(Duration::from_millis(100))
+                .expect("remote terminal event")
+            {
+                InvokeResponseBody::Json(json) => {
+                    let event: Value = serde_json::from_str(&json).expect("control event");
+                    match event["event"].as_str() {
+                        Some("started") => started = true,
+                        Some("exited") => exit_code = event["exitCode"].as_u64(),
+                        other => panic!("unexpected remote control event: {other:?}"),
+                    }
+                }
+                InvokeResponseBody::Raw(frame) => {
+                    let sequence =
+                        u64::from_be_bytes(frame[2..10].try_into().expect("sequence bytes"));
+                    output.extend_from_slice(&frame[TERMINAL_OUTPUT_FRAME_HEADER_BYTES..]);
+                    coordinator
+                        .acknowledge("main", &summary.id, sequence)
+                        .expect("acknowledge remote output");
+                }
+            }
+        }
+        assert!(started);
+        assert_eq!(exit_code, Some(17));
+        assert!(output
+            .windows(b"remote-shell-ready".len())
+            .any(|part| part == b"remote-shell-ready"));
+        assert!(output
+            .windows(b"remote-resize-120x40".len())
+            .any(|part| part == b"remote-resize-120x40"));
+        assert!(output.windows(4).any(|part| part == b"exit"));
+        assert!(matches!(
+            coordinator.write("other-window", &summary.id, 1, b"x"),
+            Err(ExplorerError::InvalidReference)
+        ));
+        coordinator
+            .close("main", &summary.id, TerminalCloseReason::User)
+            .expect("close completed remote terminal");
+        manager.disconnect("test-target").await.expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ssh_disconnect_ends_remote_terminal_without_replay() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let manager = Arc::new(SshConnectionManager::default());
+        let target = target_for(&server, vec![server.identity_file().to_owned()], true);
+        let answers = PromptAnswers {
+            accept_host_key: true,
+            ..PromptAnswers::default()
+        };
+        let (connection_channel, connection_events) =
+            event_channel(manager.clone(), "disconnect-terminal", answers);
+        let location = manager
+            .connect(target, "disconnect-terminal".to_owned(), connection_channel)
+            .await
+            .expect("connect through verified SSH");
+        let opened = manager
+            .open_terminal(
+                &location.id,
+                TerminalSizeDto {
+                    columns: 80,
+                    rows: 24,
+                    pixel_width: None,
+                    pixel_height: None,
+                },
+            )
+            .await
+            .expect("open remote PTY");
+        let (event_sender, event_receiver) = mpsc::channel();
+        let terminal_channel: Channel<Response> = Channel::new(move |body| {
+            let _ = event_sender.send(body);
+            Ok(())
+        });
+        let coordinator = TerminalCoordinator::default();
+        let summary = coordinator
+            .create_ssh(SshTerminalLaunch {
+                window_label: "main",
+                location_id: &opened.location_id,
+                title: &opened.title,
+                context_label: &opened.context_label,
+                channel: opened.channel,
+                on_event: terminal_channel,
+            })
+            .expect("register remote terminal");
+
+        server.disconnect_clients().await;
+        wait_for_event(&connection_events, "disconnected").await;
+        let reason = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let body = event_receiver
+                    .recv_timeout(Duration::from_millis(100))
+                    .expect("remote disconnect event");
+                match body {
+                    InvokeResponseBody::Json(json) => {
+                        let event: Value = serde_json::from_str(&json).expect("control event");
+                        if event["event"] == "exited" {
+                            break event["reason"]
+                                .as_str()
+                                .expect("remote exit reason")
+                                .to_owned();
+                        }
+                    }
+                    InvokeResponseBody::Raw(frame) => {
+                        let sequence =
+                            u64::from_be_bytes(frame[2..10].try_into().expect("sequence bytes"));
+                        coordinator
+                            .acknowledge("main", &summary.id, sequence)
+                            .expect("acknowledge remote output");
+                    }
+                }
+            }
+        })
+        .await
+        .expect("terminal disconnect lifecycle");
+        assert_eq!(reason, "transportClosed");
+        assert!(matches!(
+            coordinator.write("main", &summary.id, 0, b"not replayed"),
+            Err(ExplorerError::InvalidReference)
+        ));
+
+        coordinator
+            .close("main", &summary.id, TerminalCloseReason::User)
+            .expect("close disconnected terminal");
         server.shutdown().await;
     }
 

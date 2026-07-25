@@ -14,6 +14,7 @@ const clonePreferences = (preferences: UserPreferences): UserPreferences => ({
     favoriteRoles: [...preferences.layout.favoriteRoles],
     hiddenSshTargetIds: [...preferences.layout.hiddenSshTargetIds],
   },
+  terminal: { ...preferences.terminal },
 });
 
 export class MemoryPreferencesDataSource implements PreferencesDataSource {
@@ -48,6 +49,10 @@ export class MemoryPreferencesDataSource implements PreferencesDataSource {
         hiddenSshTargetIds: patch.layout.hiddenSshTargetIds
           ? [...patch.layout.hiddenSshTargetIds]
           : [...this.#preferences.layout.hiddenSshTargetIds],
+      },
+      terminal: {
+        ...this.#preferences.terminal,
+        ...patch.terminal,
       },
     };
     return clonePreferences(this.#preferences);

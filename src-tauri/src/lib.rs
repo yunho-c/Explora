@@ -7,6 +7,7 @@ mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
+mod terminal;
 mod volumes;
 
 use commands::AppState;
@@ -169,11 +170,23 @@ pub fn run() {
             commands::disconnect_ssh_target,
             commands::list_directory,
             commands::cancel_listing,
+            commands::create_terminal,
+            commands::write_terminal,
+            commands::resize_terminal,
+            commands::acknowledge_terminal_output,
+            commands::close_terminal,
             commands::prepare_preview,
             commands::cancel_preview,
             commands::read_preview_resource,
             commands::discard_preview_resource,
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .state::<AppState>()
+                    .close_terminals_for_window(window.label());
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

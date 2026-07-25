@@ -1,7 +1,8 @@
 # Integrated terminal design
 
 - Product decision: Accepted by [ADR 0009](adr/0009-integrated-terminal.md)
-- Implementation status: Not started
+- Implementation status: Local, multi-session, preferences, and verified SSH
+  transport slices implemented; packaged cross-platform validation in progress
 - Target: Initial stable release
 
 ## Purpose
@@ -21,8 +22,43 @@ preserving Explora's core boundaries:
 - terminal output never becomes filesystem authority; and
 - process, PTY, SSH, and cleanup work stays in Rust.
 
-This document defines the intended architecture and delivery strategy. It does
-not describe functionality that exists in the current codebase yet.
+This document defines the intended architecture and delivery strategy.
+
+## Current implementation checkpoint
+
+The implementation checkpoint now includes:
+
+- pinned xterm.js core, fit addon, and `portable-pty` dependencies;
+- opaque local-directory revalidation without a path-string IPC escape hatch;
+- a window-owned Rust coordinator with validated dimensions, bounded input and
+  output, ordered sequence numbers, acknowledgements, and deterministic close;
+- a real PTY fixture covering arbitrary bytes, resize, exit status, and process
+  group cleanup;
+- a Windows-gated ConPTY fixture for output, resize, and exit that still requires
+  execution on a Windows host;
+- runtime-validated frontend events, ordered input batching, a separate
+  `TerminalState`, and a deterministic browser demo;
+- an accessible xterm surface in a stock resizable bottom pane;
+- multiline-paste, running-session close, and grouped close-all confirmations;
+- independent terminal tabs with keyboard switching, restart, sanitized rename,
+  and a six-session per-window limit;
+- versioned, range-validated preferences for pane visibility and height, font
+  size, scrollback, and screen-reader mode;
+- remote PTY channels opened only through an authenticated, host-verified SSH
+  connection, starting the account's default shell in its server-selected home;
+  and
+- focused Rust, state, IPC, component, shell-composition, preferences migration,
+  real PTY, and disposable SSH server tests.
+
+This checkpoint is not cross-platform or packaged-native completion. A macOS app
+bundle builds and launches, but interactive WKWebView proof remains open; Linux
+and Windows PTY, WebView, cleanup, and packaging evidence must still be gathered.
+An attempted macOS-to-Windows compile reached the native cryptography dependency
+but cannot substitute for a Windows build because this host has no Windows SDK.
+The SSH slice covers verified connection reuse, PTY negotiation, byte I/O,
+resize, bounded output accounting, and exit status in the disposable server. It
+still needs latency, reconnect-after-terminal-loss, all-auth-path terminal, and
+packaged native smoke coverage before Phase 4 is complete.
 
 ## Product behavior
 
@@ -190,11 +226,7 @@ The frontend receives a `TerminalSessionSummary` suitable for display:
 
 ```ts
 type TerminalSessionState =
-  | "starting"
-  | "running"
-  | "exited"
-  | "failed"
-  | "closing";
+  "starting" | "running" | "exited" | "failed" | "closing";
 
 interface TerminalSessionSummary {
   id: string;
@@ -313,6 +345,14 @@ WebSocket server merely for convenience.
 Output is raw bytes because UTF-8 characters and terminal escape sequences may
 cross read boundaries. The frontend writes `Uint8Array` chunks directly to
 xterm.js. Neither side performs lossy, chunk-local string decoding.
+
+The implemented Tauri channel carries control events as typed JSON and output as
+a versioned binary frame on that same ordered channel. Version 1 output frames
+contain a one-byte version, one-byte frame kind, an unsigned 64-bit big-endian
+sequence number, and the untouched PTY bytes. The frontend rejects unknown,
+truncated, or unsafe frames and closes the affected session. This avoids JSON
+expansion for sustained terminal output without adding a socket, listener, or
+new origin.
 
 ### Ordering and backpressure
 
@@ -534,7 +574,7 @@ Goal: make the local terminal a supported Explora capability everywhere.
 Exit criteria: packaged local-terminal smoke matrices pass on macOS, Linux, and
 Windows with documented evidence and no silent degraded target.
 
-### Phase 3: multiple sessions and polished pane behavior
+### Phase 3: multiple sessions and polished pane behavior (implemented slice)
 
 Goal: reach the intended daily-driver interaction.
 
@@ -549,7 +589,10 @@ Goal: reach the intended daily-driver interaction.
 Exit criteria: sessions remain independent, window-scoped lifecycle is clear, and
 resource limits hold under concurrency.
 
-### Phase 4: SSH terminal transport
+The functional slice above is implemented. Maximum-session sustained-output
+profiling remains part of the exit criteria.
+
+### Phase 4: SSH terminal transport (implemented slice)
 
 Goal: add remote shells without weakening SFTP or trust boundaries.
 
@@ -569,6 +612,12 @@ Goal: add remote shells without weakening SFTP or trust boundaries.
 Exit criteria: remote terminals behave consistently with local presentation,
 retain explicit host identity, and pass packaged native smoke tests without using
 shell output for filesystem work.
+
+Verified connection reuse, PTY/default-shell negotiation, honest server-home
+labeling, output accounting, resize, exit status, and close are implemented.
+Disconnect-to-terminal-exit and no-input-replay are covered. High-latency and
+reconnect matrices, all-auth-path terminal coverage, and packaged native smoke
+evidence remain open.
 
 ### Deferred enhancements
 
