@@ -76,23 +76,43 @@
 <div
   bind:this={mount}
   class:hidden={!active}
-  class="explora-terminal-mount h-full min-h-0 w-full overflow-hidden bg-background"
+  class="explora-terminal-mount h-full min-h-0 w-full overflow-hidden"
   data-terminal-surface
   aria-label={`${session.title} terminal`}
 ></div>
 
 <style>
+  .explora-terminal-mount {
+    --terminal-background: #111318;
+    --terminal-foreground: #eef1f5;
+    --terminal-cursor: #f8fafc;
+    --terminal-cursor-accent: #111318;
+    --terminal-selection-background: #34435a;
+    --terminal-selection-foreground: #ffffff;
+    --terminal-focus-ring: #7dd3fc;
+    --terminal-scrollbar-thumb: #4a5361;
+
+    background-color: var(--terminal-background);
+  }
+
   :global(.explora-terminal-mount .xterm) {
+    box-sizing: border-box;
     height: 100%;
     padding: 0.5rem 0.625rem;
+    background-color: var(--terminal-background);
   }
 
   :global(.explora-terminal-mount .xterm-viewport) {
+    /* xterm writes its default black viewport background inline. Keep the
+       scroll gutter and padded renderer on the same intentional surface. */
+    background-color: var(--terminal-background) !important;
     scrollbar-width: thin;
+    scrollbar-color: var(--terminal-scrollbar-thumb) var(--terminal-background);
   }
 
   :global(.explora-terminal-mount .xterm:focus-within) {
-    outline: 1px solid color-mix(in oklch, var(--ring) 70%, transparent);
+    outline: 1px solid
+      color-mix(in oklch, var(--terminal-focus-ring) 72%, transparent);
     outline-offset: -1px;
   }
 
