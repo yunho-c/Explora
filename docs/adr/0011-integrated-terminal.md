@@ -1,4 +1,4 @@
-# ADR 0009: Add location-scoped integrated terminals
+# ADR 0011: Add location-scoped integrated terminals
 
 - Status: Accepted
 - Date: 2026-07-22

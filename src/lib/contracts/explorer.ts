@@ -27,6 +27,7 @@ export type ViewMode = "list" | "grid";
 export type SortColumn = "name" | "modifiedAt" | "size";
 export type SortDirection = "ascending" | "descending";
 export type ImagePreviewMode = "direct" | "sanitized";
+export type NativeOpenCapability = "none" | "direct" | "download";
 export type PreviewImageMediaType =
   "image/bmp" | "image/jpeg" | "image/png" | "image/webp";
 
@@ -38,6 +39,12 @@ export interface EntryRef {
 export interface DirectoryRef extends EntryRef {
   name: string;
   displayPath: string;
+  capabilities: DirectoryCapabilities;
+}
+
+export interface DirectoryCapabilities {
+  acceptMove: boolean;
+  atomicReplace: boolean;
 }
 
 export interface BreadcrumbSegment {
@@ -121,6 +128,13 @@ export type SshPromptResponse =
   | { response: "reject" }
   | { response: "answers"; answers: string[] };
 
+export interface EntryCapabilities {
+  rename: boolean;
+  move: boolean;
+  trash: boolean;
+  deletePermanently: boolean;
+}
+
 export interface FileEntrySummary {
   reference: EntryRef;
   name: string;
@@ -131,7 +145,102 @@ export interface FileEntrySummary {
   displayPath: string;
   directory: DirectoryRef | null;
   detail?: string;
+  capabilities: EntryCapabilities;
+  nativeOpen: NativeOpenCapability;
 }
+
+export type FileOperationPrompt =
+  | {
+      id: string;
+      kind: "permanentDelete";
+      title: string;
+      message: string;
+      targetName: string;
+      locationName: string;
+      confirmLabel: string;
+    }
+  | {
+      id: string;
+      kind: "moveConflict";
+      title: string;
+      message: string;
+      targetName: string;
+      destinationName: string;
+      decisions: readonly Extract<
+        FileOperationPromptResponse,
+        "keepBoth" | "skip" | "cancel"
+      >[];
+    };
+
+export type FileOperationConfirmation = Extract<
+  FileOperationPrompt,
+  { kind: "permanentDelete" }
+>;
+
+export type FileOperationPromptResponse =
+  "confirm" | "keepBoth" | "skip" | "cancel";
+
+export type FileMoveResult =
+  | {
+      kind: "moved";
+      entry: FileEntrySummary;
+      sourceParent: DirectoryRef;
+      destination: DirectoryRef;
+      rebasedEntryIds: readonly string[];
+      invalidatedEntryIds: readonly string[];
+    }
+  | {
+      kind: "moveSkipped";
+      entry: EntryRef;
+      name: string;
+    };
+
+export interface FileRemovalResult {
+  kind: "trashed" | "deletedPermanently";
+  entry: EntryRef;
+  name: string;
+  invalidatedEntryIds: readonly string[];
+}
+
+export interface FileOperationItemError {
+  code: string;
+  message: string;
+}
+
+export type FileOperationItemOutcome = FileMoveResult | FileRemovalResult;
+
+export type FileOperationBatchItem =
+  | {
+      status: "completed";
+      source: EntryRef;
+      outcome: FileOperationItemOutcome;
+    }
+  | {
+      status: "failed";
+      source: EntryRef;
+      error: FileOperationItemError;
+    }
+  | { status: "cancelled"; source: EntryRef }
+  | { status: "notStarted"; source: EntryRef };
+
+export interface FileOperationBatchResult {
+  kind: "batch";
+  status: "completed" | "partial" | "cancelled";
+  items: readonly FileOperationBatchItem[];
+}
+
+export type NativeOpenProgress =
+  | { phase: "queued" }
+  | {
+      phase: "downloading";
+      transferredBytes: string;
+      totalBytes: string | null;
+    }
+  | { phase: "launching" };
+
+export type NativeOpenOutcome =
+  | { outcome: "opened" }
+  | { outcome: "confirmationRequired"; size: string | null };
 
 export interface ExplorerTab {
   id: string;

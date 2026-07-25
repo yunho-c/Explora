@@ -14,12 +14,12 @@ use russh::{
     Channel, ChannelId, Disconnect, MethodKind, MethodSet, Pty,
 };
 use russh_sftp::protocol::{
-    Attrs, File, FileAttributes, Handle, Name, Status, StatusCode, Version,
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 use tempfile::TempDir;
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{watch, Mutex},
+    sync::{watch, Mutex, Notify},
     task::{JoinHandle, JoinSet},
 };
 
@@ -41,6 +41,200 @@ struct ServerState {
     user_public_key: PublicKey,
     sftp_enabled: bool,
     listing_delay: Duration,
+    mutation_delay: Duration,
+    mutation_started: Arc<Notify>,
+    filesystem: Arc<Mutex<TestRemoteFilesystem>>,
+}
+
+#[derive(Clone)]
+enum TestNode {
+    Directory,
+    File(Vec<u8>),
+    Symlink(String),
+}
+
+struct TestRemoteFilesystem {
+    nodes: HashMap<String, TestNode>,
+}
+
+impl Default for TestRemoteFilesystem {
+    fn default() -> Self {
+        Self {
+            nodes: HashMap::from([
+                ("/".to_owned(), TestNode::Directory),
+                ("/projects".to_owned(), TestNode::Directory),
+                ("/projects/explora".to_owned(), TestNode::Directory),
+                (
+                    "/projects/notes.txt".to_owned(),
+                    TestNode::File(vec![0; 42]),
+                ),
+                ("/README.md".to_owned(), TestNode::File(vec![0; 128])),
+                (
+                    "/project-link".to_owned(),
+                    TestNode::Symlink("/projects".to_owned()),
+                ),
+                ("/private".to_owned(), TestNode::Directory),
+                (
+                    "/private/secret.txt".to_owned(),
+                    TestNode::File(vec![0; 16]),
+                ),
+                ("/slow".to_owned(), TestNode::Directory),
+                (
+                    "/slow/eventually.txt".to_owned(),
+                    TestNode::File(vec![0; 7]),
+                ),
+                ("/partial".to_owned(), TestNode::Directory),
+                ("/partial/a.txt".to_owned(), TestNode::File(vec![0; 4])),
+                ("/partial/locked.txt".to_owned(), TestNode::File(vec![0; 8])),
+                ("/locked.txt".to_owned(), TestNode::File(vec![0; 8])),
+            ]),
+        }
+    }
+}
+
+impl TestRemoteFilesystem {
+    fn metadata(&self, path: &str, follow_symlink: bool) -> Option<FileAttributes> {
+        let path = canonical_path(path);
+        let node = self.nodes.get(&path)?;
+        match node {
+            TestNode::Directory => Some(directory_attrs()),
+            TestNode::File(bytes) => Some(file_attrs(bytes.len() as u64)),
+            TestNode::Symlink(target) if follow_symlink => self.metadata(target, true),
+            TestNode::Symlink(_) => Some(symlink_attrs()),
+        }
+    }
+
+    fn entries(&self, directory: &str) -> Option<Vec<File>> {
+        let directory = canonical_path(directory);
+        if !matches!(self.nodes.get(&directory), Some(TestNode::Directory)) {
+            return None;
+        }
+        let mut entries = self
+            .nodes
+            .iter()
+            .filter(|(path, _)| {
+                *path != &directory && test_parent(path).as_deref() == Some(directory.as_str())
+            })
+            .map(|(path, node)| {
+                let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+                let attrs = match node {
+                    TestNode::Directory => directory_attrs(),
+                    TestNode::File(bytes) => file_attrs(bytes.len() as u64),
+                    TestNode::Symlink(_) => symlink_attrs(),
+                };
+                File::new(name, attrs)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.filename.cmp(&right.filename));
+        Some(entries)
+    }
+
+    fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), StatusCode> {
+        let old_path = canonical_path(old_path);
+        let new_path = canonical_path(new_path);
+        if old_path == "/" || is_mutation_denied(&old_path) || is_mutation_denied(&new_path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if !self.nodes.contains_key(&old_path) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        if self.nodes.contains_key(&new_path)
+            || remote_test_is_same_or_descendant(&new_path, &old_path)
+        {
+            return Err(StatusCode::Failure);
+        }
+        let parent = test_parent(&new_path).ok_or(StatusCode::Failure)?;
+        if !matches!(self.nodes.get(&parent), Some(TestNode::Directory)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        let moved = self
+            .nodes
+            .iter()
+            .filter(|(path, _)| remote_test_is_same_or_descendant(path, &old_path))
+            .map(|(path, node)| {
+                let suffix = path.strip_prefix(&old_path).unwrap_or_default();
+                (path.clone(), format!("{new_path}{suffix}"), node.clone())
+            })
+            .collect::<Vec<_>>();
+        if moved.iter().any(|(_, destination, _)| {
+            self.nodes.contains_key(destination)
+                && !moved.iter().any(|(source, _, _)| source == destination)
+        }) {
+            return Err(StatusCode::Failure);
+        }
+        for (source, _, _) in &moved {
+            self.nodes.remove(source);
+        }
+        for (_, destination, node) in moved {
+            self.nodes.insert(destination, node);
+        }
+        Ok(())
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), StatusCode> {
+        let path = canonical_path(path);
+        if is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        match self.nodes.get(&path) {
+            Some(TestNode::Directory) => Err(StatusCode::Failure),
+            Some(_) => {
+                self.nodes.remove(&path);
+                Ok(())
+            }
+            None => Err(StatusCode::NoSuchFile),
+        }
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), StatusCode> {
+        let path = canonical_path(path);
+        if path == "/" || is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if !matches!(self.nodes.get(&path), Some(TestNode::Directory)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        if self.nodes.keys().any(|candidate| {
+            candidate != &path && remote_test_is_same_or_descendant(candidate, &path)
+        }) {
+            return Err(StatusCode::Failure);
+        }
+        self.nodes.remove(&path);
+        Ok(())
+    }
+
+    fn create_dir(&mut self, path: &str) -> Result<(), StatusCode> {
+        let path = canonical_path(path);
+        if is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if self.nodes.contains_key(&path) {
+            return Err(StatusCode::Failure);
+        }
+        let parent = test_parent(&path).ok_or(StatusCode::Failure)?;
+        if !matches!(self.nodes.get(&parent), Some(TestNode::Directory)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        self.nodes.insert(path, TestNode::Directory);
+        Ok(())
+    }
+
+    fn create_symlink(&mut self, link: &str, target: &str) -> Result<(), StatusCode> {
+        let link = canonical_path(link);
+        if is_mutation_denied(&link) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if self.nodes.contains_key(&link) {
+            return Err(StatusCode::Failure);
+        }
+        let parent = test_parent(&link).ok_or(StatusCode::Failure)?;
+        if !matches!(self.nodes.get(&parent), Some(TestNode::Directory)) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        self.nodes
+            .insert(link, TestNode::Symlink(target.to_owned()));
+        Ok(())
+    }
 }
 
 pub struct TestSshServer {
@@ -66,6 +260,15 @@ impl TestSshServer {
         sftp_enabled: bool,
         listing_delay: Duration,
     ) -> Self {
+        Self::start_with_delays(auth_mode, sftp_enabled, listing_delay, Duration::ZERO).await
+    }
+
+    pub async fn start_with_delays(
+        auth_mode: TestAuthMode,
+        sftp_enabled: bool,
+        listing_delay: Duration,
+        mutation_delay: Duration,
+    ) -> Self {
         let temp_dir = tempfile::tempdir().expect("test SSH directory");
         let user_key =
             PrivateKey::random(&mut rng(), Algorithm::Ed25519).expect("test SSH user key");
@@ -85,6 +288,9 @@ impl TestSshServer {
             user_public_key: user_key.public_key().clone(),
             sftp_enabled,
             listing_delay,
+            mutation_delay,
+            mutation_started: Arc::new(Notify::new()),
+            filesystem: Arc::new(Mutex::new(TestRemoteFilesystem::default())),
         });
         let config = Arc::new(Mutex::new(Arc::new(server_config(
             auth_mode,
@@ -197,6 +403,76 @@ impl TestSshServer {
                     "en".to_owned(),
                 )
                 .await;
+        }
+    }
+
+    pub async fn wait_for_mutation(&self) {
+        self.state.mutation_started.notified().await;
+    }
+
+    pub async fn path_exists(&self, path: &str) -> bool {
+        self.state
+            .filesystem
+            .lock()
+            .await
+            .nodes
+            .contains_key(&canonical_path(path))
+    }
+
+    pub async fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        match self
+            .state
+            .filesystem
+            .lock()
+            .await
+            .nodes
+            .get(&canonical_path(path))
+        {
+            Some(TestNode::File(bytes)) => Some(bytes.clone()),
+            _ => None,
+        }
+    }
+
+    pub async fn write_file(&self, path: &str, bytes: Vec<u8>) {
+        let path = canonical_path(path);
+        let parent = test_parent(&path).expect("test file parent");
+        let mut filesystem = self.state.filesystem.lock().await;
+        assert!(matches!(
+            filesystem.nodes.get(&parent),
+            Some(TestNode::Directory)
+        ));
+        filesystem.nodes.insert(path, TestNode::File(bytes));
+    }
+
+    pub async fn create_symlink(&self, path: &str, target: &str) {
+        self.state
+            .filesystem
+            .lock()
+            .await
+            .create_symlink(path, target)
+            .expect("create test symbolic link");
+    }
+
+    pub async fn create_dir(&self, path: &str) {
+        self.state
+            .filesystem
+            .lock()
+            .await
+            .create_dir(path)
+            .expect("create test directory");
+    }
+
+    pub async fn read_link(&self, path: &str) -> Option<String> {
+        match self
+            .state
+            .filesystem
+            .lock()
+            .await
+            .nodes
+            .get(&canonical_path(path))
+        {
+            Some(TestNode::Symlink(target)) => Some(target.clone()),
+            _ => None,
         }
     }
 
@@ -384,7 +660,12 @@ impl server::Handler for TestSshHandler {
         session.channel_success(channel_id)?;
         russh_sftp::server::run(
             channel.into_stream(),
-            TestSftpHandler::new(self.state.listing_delay),
+            TestSftpHandler::new(
+                self.state.listing_delay,
+                self.state.mutation_delay,
+                self.state.mutation_started.clone(),
+                self.state.filesystem.clone(),
+            ),
         )
         .await;
         Ok(())
@@ -466,13 +747,31 @@ impl server::Handler for TestSshHandler {
 struct TestSftpHandler {
     completed_directories: HashSet<String>,
     listing_delay: Duration,
+    mutation_delay: Duration,
+    mutation_started: Arc<Notify>,
+    filesystem: Arc<Mutex<TestRemoteFilesystem>>,
 }
 
 impl TestSftpHandler {
-    fn new(listing_delay: Duration) -> Self {
+    fn new(
+        listing_delay: Duration,
+        mutation_delay: Duration,
+        mutation_started: Arc<Notify>,
+        filesystem: Arc<Mutex<TestRemoteFilesystem>>,
+    ) -> Self {
         Self {
             completed_directories: HashSet::new(),
             listing_delay,
+            mutation_delay,
+            mutation_started,
+            filesystem,
+        }
+    }
+
+    async fn before_mutation(&self) {
+        self.mutation_started.notify_one();
+        if !self.mutation_delay.is_zero() {
+            tokio::time::sleep(self.mutation_delay).await;
         }
     }
 }
@@ -492,6 +791,102 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         Ok(Version::new())
     }
 
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
+        let path = canonical_path(&filename);
+        if is_mutation_denied(&path) && pflags.contains(OpenFlags::WRITE) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        let mut filesystem = self.filesystem.lock().await;
+        let exists = filesystem.nodes.contains_key(&path);
+        if pflags.contains(OpenFlags::CREATE) {
+            if pflags.contains(OpenFlags::EXCLUDE) && exists {
+                return Err(StatusCode::Failure);
+            }
+            if !exists {
+                let parent = test_parent(&path).ok_or(StatusCode::Failure)?;
+                if !matches!(filesystem.nodes.get(&parent), Some(TestNode::Directory)) {
+                    return Err(StatusCode::NoSuchFile);
+                }
+                filesystem
+                    .nodes
+                    .insert(path.clone(), TestNode::File(Vec::new()));
+            }
+        }
+        let Some(TestNode::File(bytes)) = filesystem.nodes.get_mut(&path) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        if pflags.contains(OpenFlags::TRUNCATE) {
+            bytes.clear();
+        }
+        Ok(Handle { id, handle: path })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        let filesystem = self.filesystem.lock().await;
+        let Some(TestNode::File(bytes)) = filesystem.nodes.get(&canonical_path(&handle)) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        let offset = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+        if offset >= bytes.len() {
+            return Err(StatusCode::Eof);
+        }
+        let end = offset.saturating_add(len as usize).min(bytes.len());
+        Ok(Data {
+            id,
+            data: bytes[offset..end].to_vec(),
+        })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        let path = canonical_path(&handle);
+        if is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        let offset = usize::try_from(offset).map_err(|_| StatusCode::Failure)?;
+        let end = offset.checked_add(data.len()).ok_or(StatusCode::Failure)?;
+        let mut filesystem = self.filesystem.lock().await;
+        let Some(TestNode::File(bytes)) = filesystem.nodes.get_mut(&path) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        if bytes.len() < end {
+            bytes.resize(end, 0);
+        }
+        bytes[offset..end].copy_from_slice(&data);
+        Ok(ok_status(id))
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+        let path = canonical_path(&handle);
+        Ok(Attrs {
+            id,
+            attrs: self
+                .filesystem
+                .lock()
+                .await
+                .metadata(&path, false)
+                .ok_or(StatusCode::NoSuchFile)?,
+        })
+    }
+
     async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
         Ok(ok_status(id))
     }
@@ -501,7 +896,10 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         if path == "/private" {
             return Err(StatusCode::PermissionDenied);
         }
-        if !matches!(path.as_str(), "/" | "/projects" | "/slow") {
+        if !matches!(
+            self.filesystem.lock().await.nodes.get(&path),
+            Some(TestNode::Directory)
+        ) {
             return Err(StatusCode::NoSuchFile);
         }
         if path == "/slow" && !self.listing_delay.is_zero() {
@@ -517,13 +915,18 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         }
         Ok(Name {
             id,
-            files: entries_for(&handle).ok_or(StatusCode::NoSuchFile)?,
+            files: self
+                .filesystem
+                .lock()
+                .await
+                .entries(&handle)
+                .ok_or(StatusCode::NoSuchFile)?,
         })
     }
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         let path = canonical_path(&path);
-        if metadata_for(&path, true).is_none() {
+        if self.filesystem.lock().await.metadata(&path, true).is_none() {
             return Err(StatusCode::NoSuchFile);
         }
         Ok(Name {
@@ -536,7 +939,12 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         let path = canonical_path(&path);
         Ok(Attrs {
             id,
-            attrs: metadata_for(&path, true).ok_or(StatusCode::NoSuchFile)?,
+            attrs: self
+                .filesystem
+                .lock()
+                .await
+                .metadata(&path, true)
+                .ok_or(StatusCode::NoSuchFile)?,
         })
     }
 
@@ -544,8 +952,90 @@ impl russh_sftp::server::Handler for TestSftpHandler {
         let path = canonical_path(&path);
         Ok(Attrs {
             id,
-            attrs: metadata_for(&path, false).ok_or(StatusCode::NoSuchFile)?,
+            attrs: self
+                .filesystem
+                .lock()
+                .await
+                .metadata(&path, false)
+                .ok_or(StatusCode::NoSuchFile)?,
         })
+    }
+
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        let path = canonical_path(&path);
+        if is_mutation_denied(&path) {
+            return Err(StatusCode::PermissionDenied);
+        }
+        if !self.filesystem.lock().await.nodes.contains_key(&path) {
+            return Err(StatusCode::NoSuchFile);
+        }
+        Ok(ok_status(id))
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        self.filesystem.lock().await.rename(&oldpath, &newpath)?;
+        Ok(ok_status(id))
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        self.filesystem.lock().await.remove_file(&filename)?;
+        Ok(ok_status(id))
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        self.filesystem.lock().await.create_dir(&path)?;
+        Ok(ok_status(id))
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        self.filesystem.lock().await.remove_dir(&path)?;
+        Ok(ok_status(id))
+    }
+
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let path = canonical_path(&path);
+        let filesystem = self.filesystem.lock().await;
+        let Some(TestNode::Symlink(target)) = filesystem.nodes.get(&path) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        Ok(Name {
+            id,
+            files: vec![File::dummy(target.clone())],
+        })
+    }
+
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, Self::Error> {
+        self.before_mutation().await;
+        self.filesystem
+            .lock()
+            .await
+            .create_symlink(&linkpath, &targetpath)?;
+        Ok(ok_status(id))
     }
 }
 
@@ -557,34 +1047,30 @@ fn canonical_path(path: &str) -> String {
     }
 }
 
-fn entries_for(path: &str) -> Option<Vec<File>> {
-    match path {
-        "/" => Some(vec![
-            File::new("projects", directory_attrs()),
-            File::new("README.md", file_attrs(128)),
-            File::new("project-link", symlink_attrs()),
-            File::new("private", directory_attrs()),
-            File::new("slow", directory_attrs()),
-        ]),
-        "/projects" => Some(vec![
-            File::new("explora", directory_attrs()),
-            File::new("notes.txt", file_attrs(42)),
-        ]),
-        "/slow" => Some(vec![File::new("eventually.txt", file_attrs(7))]),
-        _ => None,
+fn test_parent(path: &str) -> Option<String> {
+    let path = canonical_path(path);
+    if path == "/" {
+        return None;
     }
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    Some(if parent.is_empty() { "/" } else { parent }.to_owned())
 }
 
-fn metadata_for(path: &str, follow_symlink: bool) -> Option<FileAttributes> {
-    match path {
-        "/" | "/projects" | "/projects/explora" | "/private" | "/slow" => Some(directory_attrs()),
-        "/README.md" => Some(file_attrs(128)),
-        "/projects/notes.txt" => Some(file_attrs(42)),
-        "/slow/eventually.txt" => Some(file_attrs(7)),
-        "/project-link" if follow_symlink => Some(directory_attrs()),
-        "/project-link" => Some(symlink_attrs()),
-        _ => None,
-    }
+fn remote_test_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor
+        || (ancestor == "/" && path.starts_with('/'))
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_mutation_denied(path: &str) -> bool {
+    path == "/locked.txt"
+        || path.ends_with("/locked.txt")
+        || remote_test_is_same_or_descendant(path, "/private")
 }
 
 fn directory_attrs() -> FileAttributes {

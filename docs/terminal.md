@@ -1,6 +1,6 @@
 # Integrated terminal design
 
-- Product decision: Accepted by [ADR 0009](adr/0009-integrated-terminal.md)
+- Product decision: Accepted by [ADR 0011](adr/0011-integrated-terminal.md)
 - Implementation status: Local, multi-session, preferences, and verified SSH
   transport slices implemented; packaged cross-platform validation in progress
 - Target: Initial stable release

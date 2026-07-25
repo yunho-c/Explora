@@ -98,6 +98,35 @@ pub struct DirectoryRefDto {
     pub location_id: String,
     pub name: String,
     pub display_path: String,
+    pub capabilities: DirectoryCapabilitiesDto,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectoryCapabilitiesDto {
+    pub accept_move: bool,
+    pub atomic_replace: bool,
+}
+
+impl DirectoryCapabilitiesDto {
+    pub const READ_ONLY: Self = Self {
+        accept_move: false,
+        atomic_replace: false,
+    };
+
+    pub const LOCAL: Self = Self {
+        accept_move: true,
+        // Replacement stays disabled until an atomic or staged replacement
+        // strategy is implemented and covered on every supported platform.
+        atomic_replace: false,
+    };
+
+    pub const SFTP: Self = Self {
+        accept_move: true,
+        // SFTP v3 rename is no-replace, but it does not provide the stronger
+        // replacement contract required to advertise atomic replacement.
+        atomic_replace: false,
+    };
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -122,6 +151,33 @@ pub struct LocationSummaryDto {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct EntryCapabilitiesDto {
+    pub rename: bool,
+    pub move_entry: bool,
+    pub trash: bool,
+    pub delete_permanently: bool,
+}
+
+impl EntryCapabilitiesDto {
+    pub const fn local(trash_available: bool) -> Self {
+        Self {
+            rename: true,
+            move_entry: true,
+            trash: trash_available,
+            delete_permanently: true,
+        }
+    }
+
+    pub const SFTP: Self = Self {
+        rename: true,
+        move_entry: true,
+        trash: false,
+        delete_permanently: true,
+    };
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct FileEntrySummaryDto {
     pub reference: EntryRefDto,
     pub name: String,
@@ -132,6 +188,8 @@ pub struct FileEntrySummaryDto {
     pub display_path: String,
     pub directory: Option<DirectoryRefDto>,
     pub detail: Option<&'static str>,
+    pub capabilities: EntryCapabilitiesDto,
+    pub native_open: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -142,8 +200,8 @@ pub struct FileEntrySummaryDto {
 )]
 pub enum DirectoryListingEvent {
     Started {
-        directory: DirectoryRefDto,
-        parent: Option<DirectoryRefDto>,
+        directory: Box<DirectoryRefDto>,
+        parent: Option<Box<DirectoryRefDto>>,
         breadcrumbs: Vec<BreadcrumbSegmentDto>,
     },
     Entries {
@@ -159,11 +217,17 @@ pub enum DirectoryListingEvent {
 #[serde(rename_all = "camelCase")]
 pub enum ExplorerErrorCode {
     InvalidReference,
+    InvalidName,
+    Conflict,
+    SourceChanged,
+    DestinationUnavailable,
     NotFound,
     PermissionDenied,
     NotDirectory,
     Cancelled,
     Offline,
+    OutcomeUncertain,
+    PartialCompletion,
     AuthenticationFailed,
     HostKeyFailure,
     Unsupported,
@@ -182,6 +246,14 @@ pub struct ExplorerErrorDto {
 pub enum ExplorerError {
     #[error("This filesystem reference is no longer valid.")]
     InvalidReference,
+    #[error("{0}")]
+    InvalidName(String),
+    #[error("An item with that name already exists.")]
+    Conflict,
+    #[error("The source changed before the operation could finish.")]
+    SourceChanged,
+    #[error("{0}")]
+    DestinationUnavailable(String),
     #[error("The request was cancelled.")]
     Cancelled,
     #[error("Explora's filesystem state is unavailable.")]
@@ -196,11 +268,17 @@ pub enum ExplorerError {
     #[error("{0}")]
     Offline(String),
     #[error("{0}")]
+    OutcomeUncertain(String),
+    #[error("{0}")]
+    PartialCompletion(String),
+    #[error("{0}")]
     AuthenticationFailed(String),
     #[error("{0}")]
     HostKeyFailure(String),
     #[error("{0}")]
     Unsupported(String),
+    #[error("{0}")]
+    ConflictDetail(String),
     #[error("{0}")]
     InvalidConfiguration(String),
     #[error("{0}")]
@@ -220,6 +298,10 @@ impl From<ExplorerError> for ExplorerErrorDto {
     fn from(error: ExplorerError) -> Self {
         let code = match &error {
             ExplorerError::InvalidReference => ExplorerErrorCode::InvalidReference,
+            ExplorerError::InvalidName(_) => ExplorerErrorCode::InvalidName,
+            ExplorerError::Conflict => ExplorerErrorCode::Conflict,
+            ExplorerError::SourceChanged => ExplorerErrorCode::SourceChanged,
+            ExplorerError::DestinationUnavailable(_) => ExplorerErrorCode::DestinationUnavailable,
             ExplorerError::Cancelled => ExplorerErrorCode::Cancelled,
             ExplorerError::Io { kind, .. } => match kind {
                 std::io::ErrorKind::NotFound => ExplorerErrorCode::NotFound,
@@ -228,9 +310,12 @@ impl From<ExplorerError> for ExplorerErrorDto {
                 _ => ExplorerErrorCode::Unexpected,
             },
             ExplorerError::Offline(_) => ExplorerErrorCode::Offline,
+            ExplorerError::OutcomeUncertain(_) => ExplorerErrorCode::OutcomeUncertain,
+            ExplorerError::PartialCompletion(_) => ExplorerErrorCode::PartialCompletion,
             ExplorerError::AuthenticationFailed(_) => ExplorerErrorCode::AuthenticationFailed,
             ExplorerError::HostKeyFailure(_) => ExplorerErrorCode::HostKeyFailure,
             ExplorerError::Unsupported(_) => ExplorerErrorCode::Unsupported,
+            ExplorerError::ConflictDetail(_) => ExplorerErrorCode::Conflict,
             ExplorerError::InvalidConfiguration(_) => ExplorerErrorCode::InvalidConfiguration,
             ExplorerError::StateUnavailable
             | ExplorerError::ChannelClosed

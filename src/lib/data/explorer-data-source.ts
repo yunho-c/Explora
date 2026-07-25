@@ -2,9 +2,16 @@ import type {
   BreadcrumbSegment,
   DirectoryRef,
   FileEntrySummary,
+  FileOperationBatchResult,
+  FileMoveResult,
+  FileOperationPrompt,
+  FileOperationPromptResponse,
+  FileRemovalResult,
   ImagePreviewMode,
   LocationSummary,
   ManualSshTargetInput,
+  NativeOpenOutcome,
+  NativeOpenProgress,
   PreviewSummary,
   SshConnectionEvent,
   SshPromptResponse,
@@ -52,12 +59,39 @@ export interface PreparePreviewOptions {
   imageMode: ImagePreviewMode;
 }
 
+export interface OpenEntryOptions {
+  signal: AbortSignal;
+  allowLargeRemoteDownload: boolean;
+  onProgress: (progress: NativeOpenProgress) => void;
+}
+
 export interface WatchVolumesOptions {
   signal: AbortSignal;
   onSnapshot: (snapshot: VolumeSnapshot) => void;
 }
 
+export interface FileOperationOptions {
+  signal: AbortSignal;
+  onProgress?: (progress: FileOperationProgress) => void;
+  onPrompt: (
+    prompt: FileOperationPrompt,
+    respond: (response: FileOperationPromptResponse) => Promise<void>,
+  ) => void;
+}
+
+export interface FileOperationProgress {
+  completedItems: number;
+  totalItems: number;
+  completedBytes: string | null;
+  totalBytes: string | null;
+  currentItemCompleted: number | null;
+  currentItemTotal: number | null;
+}
+
+export type RemoveEntryOptions = FileOperationOptions;
+
 export interface ExplorerDataSource {
+  getNativeOpenStartupWarning(signal: AbortSignal): Promise<string | null>;
   listLocations(signal: AbortSignal): Promise<readonly LocationSummary[]>;
   watchVolumes(options: WatchVolumesOptions): Promise<void>;
   listSshTargets(signal: AbortSignal): Promise<readonly SshTargetSummary[]>;
@@ -80,8 +114,43 @@ export interface ExplorerDataSource {
     directory: DirectoryRef,
     options: ListDirectoryOptions,
   ): Promise<void>;
+  renameEntry(
+    entry: FileEntrySummary,
+    newName: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary>;
+  moveEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileMoveResult>;
+  moveEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult>;
+  trashEntry(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult>;
+  trashEntries(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult>;
+  deleteEntryPermanently(
+    entry: FileEntrySummary,
+    options: RemoveEntryOptions,
+  ): Promise<FileRemovalResult>;
+  deleteEntriesPermanently(
+    entries: readonly FileEntrySummary[],
+    options: RemoveEntryOptions,
+  ): Promise<FileOperationBatchResult>;
   getPreview(
     entry: FileEntrySummary,
     options: PreparePreviewOptions,
   ): Promise<PreparedPreview>;
+  openEntry(
+    entry: FileEntrySummary,
+    options: OpenEntryOptions,
+  ): Promise<NativeOpenOutcome>;
 }

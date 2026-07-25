@@ -1,18 +1,25 @@
 mod commands;
+mod file_operations;
 mod filesystem;
 mod local_filesystem;
+mod local_relocate;
+mod native_open;
+mod platform_trash;
 mod preferences;
 mod preview;
+mod remote_transfer;
 mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
 mod terminal;
+mod transfer;
 mod volumes;
 
 use commands::AppState;
 use filesystem::LocationRole;
 use local_filesystem::{LocalFilesystem, LocalRoot};
+use native_open::NativeOpenManager;
 use preferences::PreferencesStore;
 use serde::Serialize;
 use ssh_targets::SshTargetStore;
@@ -149,7 +156,14 @@ pub fn run() {
                 paths.app_config_dir()?.join("ssh-targets.json"),
                 paths.home_dir()?,
             )?;
-            app.manage(AppState::new(filesystem, preferences, ssh_targets, volumes));
+            let native_open = NativeOpenManager::new(paths.app_cache_dir()?.join("native-open"))?;
+            app.manage(AppState::new(
+                filesystem,
+                preferences,
+                ssh_targets,
+                volumes,
+                native_open,
+            ));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -160,6 +174,7 @@ pub fn run() {
             commands::get_user_preferences,
             commands::update_user_preferences,
             commands::list_locations,
+            commands::get_native_open_status,
             commands::list_ssh_targets,
             commands::create_ssh_target,
             commands::update_ssh_target,
@@ -175,10 +190,15 @@ pub fn run() {
             commands::resize_terminal,
             commands::acknowledge_terminal_output,
             commands::close_terminal,
+            commands::start_file_operation,
+            commands::respond_file_operation,
+            commands::cancel_file_operation,
             commands::prepare_preview,
             commands::cancel_preview,
             commands::read_preview_resource,
             commands::discard_preview_resource,
+            commands::open_entry,
+            commands::cancel_open_entry,
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
