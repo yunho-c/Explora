@@ -8,11 +8,13 @@ import {
 import { describe, expect, it, vi } from "vitest";
 
 import { ExplorerState } from "../../app/explorer-state.svelte";
+import { TerminalState } from "../../app/terminal-state.svelte";
 import {
   WindowChromeController,
   type WindowChromeAdapter,
 } from "../../app/window-chrome.svelte";
 import { DemoExplorerDataSource } from "$lib/data/demo-explorer-data-source";
+import { DemoTerminalDataSource } from "$lib/data/demo-terminal-data-source";
 import { MemoryPreferencesDataSource } from "$lib/data/memory-preferences-data-source";
 
 import ExplorerShell from "./ExplorerShell.svelte";
@@ -26,15 +28,62 @@ const browserWindowChrome = () =>
     show: async () => {},
   });
 
+const createTerminalState = (state: ExplorerState) =>
+  new TerminalState(new DemoTerminalDataSource(), () => {
+    const location = state.activeLocation;
+    const directory = state.activeDirectory;
+    if (!location || !directory) return null;
+    return {
+      locationId: location.id,
+      directoryId: location.kind === "ssh" ? null : directory.id,
+      kind: location.kind === "ssh" ? "ssh" : "local",
+      locationLabel: location.name,
+      directoryLabel: directory.displayPath,
+    };
+  });
+
 const renderShell = (state: ExplorerState) => {
   const windowChrome = browserWindowChrome();
+  const terminalState = createTerminalState(state);
   return {
     windowChrome,
-    ...render(ExplorerShell, { state, windowChrome }),
+    terminalState,
+    ...render(ExplorerShell, { state, terminalState, windowChrome }),
   };
 };
 
 describe("ExplorerShell", () => {
+  it("composes the terminal as a resizable pane above the stable status bar", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    const { terminalState } = renderShell(state);
+
+    terminalState.creating = true;
+    terminalState.visible = true;
+    expect(
+      await screen.findByRole("separator", {
+        name: "Resize integrated terminal",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Integrated terminal" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Starting terminal…")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Show or hide terminal (Ctrl+`)" }),
+    ).toHaveAttribute("aria-pressed", "true");
+
+    await fireEvent.click(
+      screen.getByRole("button", { name: "Hide terminal" }),
+    );
+    expect(
+      screen.queryByRole("region", { name: "Integrated terminal" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getAllByText(state.activeDirectory!.displayPath).length,
+    ).toBeGreaterThan(0);
+  });
+
   it("renders the loaded shell and switches between list and grid views", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();
@@ -690,7 +739,11 @@ describe("ExplorerShell", () => {
     };
     const windowChrome = new WindowChromeController(adapter);
     windowChrome.mode = "custom";
-    render(ExplorerShell, { state, windowChrome });
+    render(ExplorerShell, {
+      state,
+      terminalState: createTerminalState(state),
+      windowChrome,
+    });
 
     const shell = screen.getByRole("main", {
       name: "File explorer",

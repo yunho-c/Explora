@@ -248,6 +248,13 @@ pub struct LocalFilesystem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedTerminalDirectory {
+    pub path: PathBuf,
+    pub title: String,
+    pub context_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedLocalEntry {
     pub reference: EntryRefDto,
     pub name: String,
@@ -1130,6 +1137,56 @@ impl LocalFilesystem {
         Ok(path)
     }
 
+    pub(crate) fn resolve_terminal_directory(
+        &self,
+        directory_id: &str,
+        location_id: &str,
+    ) -> Result<AuthorizedTerminalDirectory, ExplorerError> {
+        let location = self
+            .locations
+            .read()
+            .map_err(|_| ExplorerError::StateUnavailable)?
+            .iter()
+            .find(|location| location.id == location_id && location.kind != "ssh")
+            .cloned()
+            .ok_or(ExplorerError::InvalidReference)?;
+        let root_path = self.registry.resolve(location_id, &location.root.id)?;
+        let path = self.registry.resolve(location_id, directory_id)?;
+        if !path.starts_with(&root_path) {
+            return Err(ExplorerError::InvalidReference);
+        }
+
+        let metadata = fs::symlink_metadata(&path).map_err(safe_terminal_directory_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ExplorerError::Unsupported(
+                "Terminal sessions cannot start through a symbolic link.".to_owned(),
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(ExplorerError::Io {
+                message: "The selected terminal location is not a directory.".to_owned(),
+                kind: std::io::ErrorKind::NotADirectory,
+            });
+        }
+
+        reject_symlinks_below_root(&root_path, &path)?;
+        let canonical_root = root_path
+            .canonicalize()
+            .map_err(safe_terminal_directory_error)?;
+        let canonical_path = path.canonicalize().map_err(safe_terminal_directory_error)?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(ExplorerError::InvalidReference);
+        }
+
+        Ok(AuthorizedTerminalDirectory {
+            title: directory_name(&path),
+            context_label: display_path(&path),
+            // Launch from the revalidated canonical target so a later change to
+            // an intermediate path component cannot redirect the child.
+            path: canonical_path,
+        })
+    }
+
     pub fn list_directory<F>(
         &self,
         directory_id: &str,
@@ -1778,6 +1835,30 @@ fn ensure_not_cancelled(cancelled: &AtomicBool) -> Result<(), ExplorerError> {
         Err(ExplorerError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+fn reject_symlinks_below_root(root: &Path, path: &Path) -> Result<(), ExplorerError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| ExplorerError::InvalidReference)?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(safe_terminal_directory_error)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ExplorerError::Unsupported(
+                "Terminal sessions cannot start through a symbolic link.".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_terminal_directory_error(error: std::io::Error) -> ExplorerError {
+    ExplorerError::Io {
+        message: "Explora could not revalidate the selected terminal directory.".to_owned(),
+        kind: error.kind(),
     }
 }
 
@@ -2831,6 +2912,125 @@ mod tests {
             });
 
         assert!(matches!(result, Err(ExplorerError::InvalidReference)));
+    }
+
+    #[test]
+    fn resolves_only_revalidated_authorized_terminal_directories() {
+        let (temp, filesystem, root) = fixture();
+        let mut directory = None;
+        filesystem
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        directory = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "folder")
+                            .and_then(|entry| entry.directory);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+        let directory = directory.expect("folder reference");
+
+        let authorized = filesystem
+            .resolve_terminal_directory(&directory.id, &directory.location_id)
+            .expect("authorized terminal directory");
+
+        assert_eq!(
+            authorized.path,
+            temp.path().join("folder").canonicalize().unwrap()
+        );
+        assert_eq!(authorized.title, "folder");
+        assert!(authorized.context_label.ends_with("folder"));
+    }
+
+    #[test]
+    fn terminal_directory_revalidation_rejects_changed_or_non_directory_targets() {
+        let (temp, filesystem, root) = fixture();
+        let mut entries = Vec::new();
+        filesystem
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries {
+                        entries: listed, ..
+                    } = event
+                    {
+                        entries.extend(listed);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+        let file = entries
+            .iter()
+            .find(|entry| entry.name == "notes.md")
+            .expect("file reference");
+        assert!(matches!(
+            filesystem.resolve_terminal_directory(&file.reference.id, &root.location_id),
+            Err(ExplorerError::Io {
+                kind: std::io::ErrorKind::NotADirectory,
+                ..
+            })
+        ));
+
+        let folder = entries
+            .iter()
+            .find(|entry| entry.name == "folder")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("folder reference");
+        fs::remove_dir(temp.path().join("folder")).expect("remove fixture folder");
+        assert!(matches!(
+            filesystem.resolve_terminal_directory(&folder.id, &root.location_id),
+            Err(ExplorerError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_directory_revalidation_rejects_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, filesystem, root) = fixture();
+        symlink(
+            temp.path().join("folder"),
+            temp.path().join("terminal-link"),
+        )
+        .expect("terminal symlink");
+        let mut link = None;
+        filesystem
+            .list_directory(
+                &root.id,
+                &root.location_id,
+                &AtomicBool::new(false),
+                |event| {
+                    if let DirectoryListingEvent::Entries { entries, .. } = event {
+                        link = entries
+                            .into_iter()
+                            .find(|entry| entry.name == "terminal-link")
+                            .and_then(|entry| entry.directory);
+                    }
+                    Ok(())
+                },
+            )
+            .expect("directory listing");
+
+        assert!(matches!(
+            filesystem.resolve_terminal_directory(
+                &link.expect("symlink directory reference").id,
+                &root.location_id
+            ),
+            Err(ExplorerError::Unsupported(_))
+        ));
     }
 
     #[test]

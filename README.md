@@ -67,20 +67,22 @@ no-overwrite rename and batch move plus explicitly confirmed permanent deletion;
 remote Trash remains unavailable. Cross-location and cross-backend moves copy to
 an owned partial destination, finalize and verify the copy, then remove the
 source. Multi-selection, in-memory cut/paste, and internal drag-and-drop use the
-same typed operation lifecycle. SSH authentication supports agents, standard or
-configured identity files, encrypted-key passphrases, passwords, and
-keyboard-interactive prompts. Explora uses standard `known_hosts` files, requires
-confirmation for unknown keys, and blocks changed keys. `ProxyJump` and
-`ProxyCommand` are reported as unsupported and are never silently executed.
+same typed operation lifecycle. The integrated terminal has interactive shell
+authority only inside explicit, window-owned sessions. SSH authentication
+supports agents, standard or configured identity files, encrypted-key
+passphrases, passwords, and keyboard-interactive prompts. Explora uses standard
+`known_hosts` files, requires confirmation for unknown keys, and blocks changed
+keys. `ProxyJump` and `ProxyCommand` are reported as unsupported and are never
+silently executed.
 Bounded keepalives detect dropped sessions, offline tabs retain their current
 folder and history, and an explicit reconnect resumes the same opaque directory
 reference when it is still valid. Refresh reloads the active folder without
 changing navigation history. Mounted local volumes are discovered in the Rust
 boundary and updated through native platform notifications with a bounded polling
-fallback. Sidebar layout, favorites, view mode, sorting, and SSH target visibility
-persist as versioned local preferences. File watching, hidden-file controls,
-remote content previews, and additional preview formats remain later vertical
-slices. See
+fallback. Sidebar layout, favorites, view mode, sorting, SSH target visibility,
+and terminal-pane presentation persist as versioned local preferences. File
+watching, hidden-file controls, remote content previews, and additional preview
+formats remain later vertical slices. See
 [`docs/adr/0007-versioned-user-preferences.md`](docs/adr/0007-versioned-user-preferences.md)
 and
 [`docs/adr/0008-cross-platform-volume-discovery.md`](docs/adr/0008-cross-platform-volume-discovery.md)
@@ -98,6 +100,13 @@ Filesystem mutations use typed per-entry capabilities and a Rust-owned operation
 lifecycle. See [`docs/filesystem-action.md`](docs/filesystem-action.md) and
 [`docs/adr/0010-capability-driven-filesystem-actions.md`](docs/adr/0010-capability-driven-filesystem-actions.md)
 for the complete architecture and the accepted security boundary.
+
+Terminal sessions use opaque, window-scoped IDs and Rust-owned local or verified
+SSH PTY transports. Ordered binary output, acknowledgements, bounded buffering,
+and explicit close semantics keep the WebView from receiving generic process
+authority. See [`docs/terminal.md`](docs/terminal.md) and
+[`docs/adr/0011-integrated-terminal.md`](docs/adr/0011-integrated-terminal.md)
+for the architecture and security boundary.
 
 Local preview reads are authorized by opaque entry references and performed in
 bounded Rust workers. Text previews are capped and decoded without rendering
@@ -123,6 +132,13 @@ rename and move conflicts, bounded recursive deletion, partial and uncertain
 outcomes, disconnect detection, timeouts, and reconnect continuity. The disposable SSH-agent test is
 Unix-only; the Windows Pageant and named-pipe paths remain platform-gated code
 that require Windows validation.
+
+Terminal tests additionally exercise a real local PTY, byte preservation,
+resize, exit status, process-group cleanup, verified SSH PTY negotiation,
+backpressure acknowledgements, disconnect-to-exit behavior, and no input replay.
+The macOS release app and DMG build in the current development environment.
+Interactive packaged WebView smoke testing and Linux/Windows terminal packaging
+remain required before terminal support is considered cross-platform complete.
 
 ## Prerequisites
 

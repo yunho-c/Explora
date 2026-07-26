@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use tauri::{ipc::Channel, State};
+use tauri::{
+    ipc::{Channel, Response},
+    State, WebviewWindow,
+};
 
 use crate::{
     file_operations::{
@@ -28,6 +31,10 @@ use crate::{
     preview::{metadata_result, PreviewManager},
     ssh::{SshConnectionEventDto, SshConnectionManager, SshPromptResponseDto},
     ssh_targets::{ManualSshTargetInputDto, SshTargetStore, SshTargetSummaryDto},
+    terminal::{
+        types::{TerminalCloseReason, TerminalSessionSummaryDto, TerminalSizeDto},
+        LocalTerminalLaunch, SshTerminalLaunch, TerminalCoordinator,
+    },
     volumes::{VolumeManager, VolumeSnapshotEventDto},
 };
 
@@ -37,6 +44,7 @@ pub struct AppState {
     ssh_targets: Arc<SshTargetStore>,
     ssh: Arc<SshConnectionManager>,
     preview: Arc<PreviewManager>,
+    terminal: Arc<TerminalCoordinator>,
     volumes: Arc<VolumeManager>,
     native_open: Arc<NativeOpenManager>,
     listings: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -57,6 +65,7 @@ impl AppState {
             ssh_targets: Arc::new(ssh_targets),
             ssh: Arc::new(SshConnectionManager::default()),
             preview: Arc::new(PreviewManager::default()),
+            terminal: Arc::new(TerminalCoordinator::default()),
             volumes,
             native_open: Arc::new(native_open),
             listings: Mutex::new(HashMap::new()),
@@ -94,6 +103,11 @@ impl AppState {
             cancellation.store(true, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    pub fn close_terminals_for_window(&self, window_label: &str) {
+        self.terminal
+            .close_window(window_label, TerminalCloseReason::WindowClosed);
     }
 }
 
@@ -321,6 +335,133 @@ pub fn cancel_listing(
 ) -> Result<(), ExplorerErrorDto> {
     state
         .cancel_listing(&request_id)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn create_terminal(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    request_id: String,
+    location_id: String,
+    directory_id: Option<String>,
+    size: TerminalSizeDto,
+    on_event: Channel<Response>,
+) -> Result<TerminalSessionSummaryDto, ExplorerErrorDto> {
+    validate_request_id(&request_id).map_err(ExplorerErrorDto::from)?;
+    validate_reference_id(&location_id).map_err(ExplorerErrorDto::from)?;
+    if location_id.starts_with("ssh:") {
+        size.validate().map_err(ExplorerErrorDto::from)?;
+        let opened = state
+            .ssh
+            .open_terminal(&location_id, size)
+            .await
+            .map_err(ExplorerErrorDto::from)?;
+        return state
+            .terminal
+            .create_ssh(SshTerminalLaunch {
+                window_label: window.label(),
+                location_id: &opened.location_id,
+                title: &opened.title,
+                context_label: &opened.context_label,
+                channel: opened.channel,
+                on_event,
+            })
+            .map_err(ExplorerErrorDto::from);
+    }
+    let directory_id = directory_id.ok_or(ExplorerError::InvalidReference)?;
+    validate_reference_id(&directory_id).map_err(ExplorerErrorDto::from)?;
+    size.validate().map_err(ExplorerErrorDto::from)?;
+
+    let local = state.local.clone();
+    let terminal = state.terminal.clone();
+    let window_label = window.label().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        let directory = local.resolve_terminal_directory(&directory_id, &location_id)?;
+        terminal.create_local(LocalTerminalLaunch {
+            window_label: &window_label,
+            location_id: &location_id,
+            working_directory: &directory.path,
+            title: &directory.title,
+            context_label: &directory.context_label,
+            size,
+            on_event,
+        })
+    })
+    .await
+    .map_err(|error| {
+        ExplorerErrorDto::from(ExplorerError::Unexpected(format!(
+            "The terminal startup task failed: {error}"
+        )))
+    })?
+    .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub async fn write_terminal(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    input_sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<(), ExplorerErrorDto> {
+    validate_reference_id(&session_id).map_err(ExplorerErrorDto::from)?;
+    if bytes.is_empty() || bytes.len() > crate::terminal::types::TerminalPolicy::MAX_INPUT_BYTES {
+        return Err(ExplorerErrorDto::from(ExplorerError::InvalidReference));
+    }
+    let terminal = state.terminal.clone();
+    let window_label = window.label().to_owned();
+    tauri::async_runtime::spawn_blocking(move || {
+        terminal.write(&window_label, &session_id, input_sequence, &bytes)
+    })
+    .await
+    .map_err(|error| {
+        ExplorerErrorDto::from(ExplorerError::Unexpected(format!(
+            "The terminal input task failed: {error}"
+        )))
+    })?
+    .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn resize_terminal(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    size: TerminalSizeDto,
+) -> Result<(), ExplorerErrorDto> {
+    validate_reference_id(&session_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .terminal
+        .resize(window.label(), &session_id, size)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn acknowledge_terminal_output(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    output_sequence: u64,
+) -> Result<(), ExplorerErrorDto> {
+    validate_reference_id(&session_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .terminal
+        .acknowledge(window.label(), &session_id, output_sequence)
+        .map_err(ExplorerErrorDto::from)
+}
+
+#[tauri::command]
+pub fn close_terminal(
+    window: WebviewWindow,
+    state: State<'_, AppState>,
+    session_id: String,
+    reason: TerminalCloseReason,
+) -> Result<(), ExplorerErrorDto> {
+    validate_reference_id(&session_id).map_err(ExplorerErrorDto::from)?;
+    state
+        .terminal
+        .close(window.label(), &session_id, reason)
         .map_err(ExplorerErrorDto::from)
 }
 

@@ -30,15 +30,30 @@ const validSshTargetId = (value: unknown): value is string =>
   value.length <= 512 &&
   !/\p{Cc}/u.test(value) &&
   (value.startsWith("manual:") || value.startsWith("config:"));
+const integerInRange = (
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number =>
+  typeof value === "number" &&
+  Number.isInteger(value) &&
+  value >= minimum &&
+  value <= maximum;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const parsePreferences = (value: unknown): UserPreferences => {
-  if (!isRecord(value) || !isRecord(value.layout)) {
-    throw new Error("Invalid preference response: layout must be an object.");
+  if (
+    !isRecord(value) ||
+    !isRecord(value.layout) ||
+    !isRecord(value.terminal)
+  ) {
+    throw new Error(
+      "Invalid preference response: layout and terminal must be objects.",
+    );
   }
-  const { layout } = value;
+  const { layout, terminal } = value;
   if (typeof layout.sidebarCollapsed !== "boolean") {
     throw new Error(
       "Invalid preference response: sidebarCollapsed must be a boolean.",
@@ -98,6 +113,17 @@ const parsePreferences = (value: unknown): UserPreferences => {
       "Invalid preference response: hidden SSH target IDs are malformed.",
     );
   }
+  if (
+    typeof terminal.visible !== "boolean" ||
+    !integerInRange(terminal.paneHeightPercent, 20, 70) ||
+    !integerInRange(terminal.fontSize, 10, 24) ||
+    !integerInRange(terminal.scrollback, 1_000, 50_000) ||
+    typeof terminal.screenReaderMode !== "boolean"
+  ) {
+    throw new Error(
+      "Invalid preference response: terminal preferences are malformed.",
+    );
+  }
 
   return {
     layout: {
@@ -109,6 +135,13 @@ const parsePreferences = (value: unknown): UserPreferences => {
       },
       favoriteRoles: [...favoriteRoles],
       hiddenSshTargetIds: [...layout.hiddenSshTargetIds] as string[],
+    },
+    terminal: {
+      visible: terminal.visible,
+      paneHeightPercent: terminal.paneHeightPercent,
+      fontSize: terminal.fontSize,
+      scrollback: terminal.scrollback,
+      screenReaderMode: terminal.screenReaderMode,
     },
   };
 };

@@ -30,6 +30,8 @@ excellent:
 - Create folders and copy, move, rename, drag, drop, trash, or delete files with
   clear progress and conflict handling.
 - Preview common files quickly, without opening another application.
+- Open a location-scoped terminal in a resizable bottom pane for local work and
+  for explicit shell sessions on connected SSH locations.
 - Move naturally between local and remote locations without learning a separate
   remote-file-manager workflow.
 - Recover cleanly from permission failures, disconnects, stale state, cancelled
@@ -63,14 +65,14 @@ cross-platform behavior.
 ### Stable-release boundaries
 
 The initial stable release includes polished navigation, tabs, favorites, core
-file operations, search, previews, SSH/SFTP locations, transfer progress, and
-platform packaging.
+file operations, search, previews, SSH/SFTP locations, integrated local and
+remote terminals, transfer progress, and platform packaging.
 
 The following are out of scope unless a later decision explicitly adds them:
 
 - Tags, comments, saved smart folders, and Finder-class metadata workflows.
 - Cloud-provider-specific integrations or file synchronization.
-- A terminal emulator, remote shell, text editor, or general-purpose SSH client.
+- A standalone terminal application, text editor, or general-purpose SSH client.
 - Third-party plugins or preview-provider APIs.
 - Archive creation/extraction beyond what is deliberately added and tested.
 - Full disk indexing, content indexing, or a background search daemon.
@@ -83,8 +85,10 @@ Avoid speculative abstractions for these deferred features.
 Use the following baseline unless an accepted ADR changes it:
 
 - Tauri 2 for the desktop application boundary and packaging.
-- Stable Rust for filesystem, SSH, transfer, trust, and preview orchestration.
+- Stable Rust for filesystem, SSH, transfer, trust, preview, and terminal
+  orchestration.
 - Svelte 5 with TypeScript and Vite for the UI.
+- xterm.js for terminal emulation and `portable-pty` for local pseudoterminals.
 - Bun for JavaScript dependency management and repository-level scripts.
 - Tailwind CSS 4 and stock shadcn-svelte Vega components for the UI system.
 - The platform's native facilities, reached through small Rust adapters, when
@@ -101,24 +105,28 @@ or a cloud backend merely because the frontend stack can support one.
 
 Keep privileged and backend-specific work behind a narrow Rust boundary. The
 Svelte frontend presents state and user intent; it must not receive unrestricted
-filesystem access, construct shell commands, or contain SSH implementation logic.
+filesystem access, construct shell commands or process launch requests, or
+contain SSH implementation logic. Terminal input is forwarded only to an
+existing, user-created terminal session through its opaque handle.
 
 Organize the code by these responsibilities, even if the exact directory names
 evolve:
 
 - **Domain model:** locations, entries, paths, capabilities, operations, errors,
-  conflicts, transfer progress, and preview results.
+  conflicts, transfer progress, preview results, and terminal sessions.
 - **Backends:** local filesystem and SSH/SFTP implementations of the same core
-  filesystem contract.
+  filesystem contract, plus local PTY and SSH channel implementations of the
+  terminal transport contract.
 - **Coordinators:** navigation/listing, file operations, search, transfers,
-  connection lifecycle, and previews.
+  connection lifecycle, previews, and terminal lifecycle.
 - **Platform adapters:** trash, volumes, file watching, native menus, keychain
   integration if later approved, and other OS-specific behavior.
 - **Tauri IPC:** a small set of typed, validated commands and events that translate
   between frontend DTOs and Rust domain types.
 - **Frontend features:** reusable presentation components plus feature-scoped
-  stores/actions for navigation, selection, tabs, operations, connections, and
-  previews.
+  stores/actions for navigation, selection, tabs, operations, connections,
+  previews, and terminals. Keep terminal state separate from explorer navigation
+  state even when their presentation shares the application shell.
 
 ### Core contracts
 
@@ -135,13 +143,18 @@ boundaries must remain explicit:
   contract tests.
 - A **capability set** describes operations such as trash, permanent delete,
   rename, atomic replace, symlinks, watching, seeking, permissions, and remote
-  search. The UI enables actions from capabilities, never from backend-name checks.
+  search, plus whether a location can create a terminal. The UI enables actions
+  from capabilities, never from backend-name checks.
 - A **file operation** has an ID, lifecycle state, structured progress, a
   cancellation path, and a structured result/error. Long work must not be modeled
   as a single blocking IPC response.
 - A **preview result** is bounded and typed: safe render data, a controlled stream
   or temporary resource, or metadata/unsupported status. It is never arbitrary
   executable markup.
+- A **terminal session** has an opaque ID, location/backend identity, explicit
+  lifecycle state, bounded dimensions and buffers, ordered input/output streams,
+  and a deterministic close path. Local and SSH terminal transports obey the same
+  lifecycle contract even though only the local transport owns an OS process.
 - Errors crossing IPC are structured and actionable. Preserve categories such as
   not found, permission denied, conflict, offline, host-key failure, unsupported,
   cancelled, and unexpected; do not reduce them to ad hoc strings.
@@ -160,6 +173,10 @@ operation options, sizes, and stale identifiers.
   navigates away or changes selection.
 - Bound concurrent metadata, preview, search, and transfer work. Do not start one
   task per entry without backpressure.
+- Run local PTY reads and process waits on dedicated blocking workers. Preserve
+  terminal byte ordering, batch IPC traffic, apply bounded backpressure without
+  dropping output, debounce resize events, and cap concurrent sessions and
+  scrollback memory.
 - Treat filesystem state as mutable and racy. Revalidate destructive operations
   at execution time and report changed/missing sources clearly.
 - Keep tab navigation and selection state in the frontend; keep authoritative
@@ -193,9 +210,11 @@ and cancellation.
 
 ## SSH remotes
 
-SSH locations are first-class, with SFTP as the file transport. If a server does
-not provide a compatible subsystem, show a clear unsupported-server error; do not
-fall back to parsing shell output.
+SSH locations are first-class, with SFTP as the file transport. Remote terminals
+use an explicit SSH PTY and shell channel owned by the terminal coordinator; shell
+output is never parsed to implement filesystem behavior. If a server does not
+provide a compatible SFTP subsystem, show a clear unsupported-server error for
+the file location rather than falling back to shell commands.
 
 ### OpenSSH compatibility
 
@@ -223,6 +242,11 @@ Connection establishment, authentication, host-key prompts, reconnects, and
 disconnects must have explicit UI states. A disconnect must not discard tabs or
 queued intent silently. Automatic retries must be bounded and must never repeat a
 destructive operation whose outcome is uncertain.
+
+Remote terminal sessions require a connected, SFTP-capable SSH location and reuse
+its verified host identity and in-memory authentication context. An interrupted
+shell is terminal; mark the session exited and require the user to start a new
+one. Never reconnect a shell silently or replay terminal input after uncertainty.
 
 Remote browsing should tolerate latency: stream listings, cache only appropriate
 metadata, invalidate visibly, and offer manual refresh. Remote search may use a
@@ -261,10 +285,11 @@ Avoid gratuitous gradients, glass effects, dashboards made of cards, oversized
 marketing typography, and decorative animation.
 
 The primary shell should have a location/favorites sidebar, navigation toolbar and
-path/breadcrumb surface, tab strip, main file view, and optional inspector/preview
-surface. Preserve file-view space at ordinary laptop sizes. Use shared design
-tokens for spacing, typography, radii, colors, focus, selection, and motion rather
-than one-off component values.
+path/breadcrumb surface, tab strip, main file view, optional inspector/preview
+surface, and a collapsible, resizable terminal pane at the bottom. Preserve
+file-view space at ordinary laptop sizes. Use shared design tokens for spacing,
+typography, radii, colors, focus, selection, and motion rather than one-off
+component values.
 
 - Distinguish hover, focus, selection, inactive selection, drop target, loading,
   disabled, and destructive states.
@@ -277,6 +302,14 @@ than one-off component values.
   populated view with a blank error page when an inline or banner state suffices.
 - Keep dialogs for decisions that truly block progress. Use non-modal progress for
   transfers and ordinary operations.
+- Terminal sessions remain bound to the location and launch context that created
+  them; routine file navigation must not silently change a running shell's
+  working directory. Always identify local versus remote sessions, show the
+  remote host prominently, and represent the actual remote starting directory
+  honestly when the SSH server chooses it.
+- When the terminal has focus, terminal key handling takes precedence over file
+  navigation shortcuts. Closing a pane or application with running processes must
+  make the lifecycle consequence clear and provide a keyboard-complete path.
 - Respect reduced motion, high contrast, text scaling, and OS theme. Maintain
   visible keyboard focus and WCAG AA contrast for essential text and controls.
 
@@ -302,15 +335,21 @@ macOS, Linux, and Windows are first-class targets from the start.
 ## Security requirements
 
 - Keep the Tauri command surface and capabilities/permissions allowlist minimal.
-  Do not expose a generic read-path, write-path, or shell-command escape hatch to
-  the webview.
+  Do not expose a generic read-path, write-path, process-spawn, or one-shot
+  shell-command escape hatch to the webview. Terminal IPC is limited to creating
+  a session for an authorized location, forwarding input, resizing, observing
+  ordered output/lifecycle events, and closing that session.
 - Configure a restrictive content security policy. Do not load preview content or
   application code from arbitrary remote origins.
-- Treat file names, paths, metadata, preview content, SSH banners, and remote error
-  messages as untrusted input. Escape them at every rendering boundary.
-- Never interpolate paths or user input into a shell command. Prefer library APIs;
-  if a platform command is unavoidable, pass arguments without a shell and cover
-  it with adversarial tests.
+- Treat file names, paths, metadata, preview content, terminal output and titles,
+  SSH banners, and remote error messages as untrusted input. Escape them at every
+  rendering boundary. Do not enable output-driven links, clipboard writes,
+  notifications, or other host integrations by default.
+- Never interpolate paths or user input into a shell command. Spawn the
+  platform-selected shell with an argument-vector API and set its working
+  directory from an authorized opaque directory reference. After creation, bytes
+  typed or explicitly pasted by the user may be forwarded verbatim only to that
+  session's PTY or SSH channel; they must not be reinterpreted by Explora.
 - Use least-privilege file permissions for application state, connection metadata,
   caches, and temporary files.
 - Add dependencies deliberately. Check maintenance status, platform support,
@@ -318,8 +357,8 @@ macOS, Linux, and Windows are first-class targets from the start.
   helpers.
 
 Any change to credential persistence, host verification, path authorization,
-preview isolation, IPC exposure, or destructive-operation semantics requires a
-focused security review and an ADR.
+preview isolation, terminal process/session authority, IPC exposure, or
+destructive-operation semantics requires a focused security review and an ADR.
 
 ## Code and change discipline
 
@@ -378,14 +417,16 @@ bug fix.
 
 - **Rust unit tests:** path identities, capability logic, conflict decisions,
   cancellation, transfer state machines, SSH config resolution, host-key decisions,
-  and preview limits.
+  preview limits, and terminal lifecycle/backpressure state machines.
 - **Backend contract tests:** run the same listing, metadata, streaming, mutation,
   symlink, conflict, and error expectations against a temporary local tree and a
   disposable SSH/SFTP server.
 - **Frontend component tests:** navigation, selection, keyboard behavior, loading,
-  empty/error states, operation progress, dialogs, and preview interactions.
+  empty/error states, operation progress, dialogs, preview interactions, terminal
+  focus, resizing, session tabs, and accessible status.
 - **Integration tests:** typed IPC, incremental events, cancellation, stale-result
-  rejection, reconnect behavior, and cross-backend transfers.
+  rejection, reconnect behavior, cross-backend transfers, ordered terminal I/O,
+  process exit, and cleanup.
 - **End-to-end tests:** real user workflows in a built application, including at
   least representative coverage on macOS, Linux, and Windows.
 - **Accessibility checks:** automated checks plus keyboard and screen-reader-aware
@@ -394,6 +435,14 @@ bug fix.
 SSH tests must cover agent/key authentication, passphrase/password prompts without
 secret leakage, unknown and changed host keys, aliases, reconnects, latency,
 permission failures, symlinks, interrupted transfers, and permanent deletion.
+
+Terminal tests must cover local and remote creation, opaque directory
+authorization, arbitrary byte boundaries, malformed UTF-8, resize storms, large
+and sustained output, backpressure, normal and forced exit, disconnects,
+application shutdown, session limits, multiline paste confirmation, hostile
+escape sequences, and disabled output-driven host integrations. Exercise real
+local PTYs and disposable SSH PTY/shell channels in packaged applications on each
+supported operating system; browser-only xterm tests are not native proof.
 
 Preview tests must cover each supported category plus empty, oversized, malformed,
 unsupported, renamed, changed, remote, slow, and cancelled files. Assert temporary
@@ -421,7 +470,8 @@ A change is done only when:
 For the first stable release, “done” additionally means the documented full suite
 passes, packaging is exercised on macOS, Linux, and Windows, and real local and
 SSH smoke scenarios demonstrate browsing, search, previews, core file operations,
-progress/cancellation, conflict handling, disconnect recovery, and safe deletion.
+progress/cancellation, conflict handling, disconnect recovery, safe deletion, and
+interactive terminal sessions with correct resize, exit, and cleanup behavior.
 
 ## Working agreement for agents
 

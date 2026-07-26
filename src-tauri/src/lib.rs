@@ -12,6 +12,7 @@ mod ssh;
 mod ssh_targets;
 #[cfg(test)]
 mod ssh_test_server;
+mod terminal;
 mod transfer;
 mod volumes;
 
@@ -184,6 +185,11 @@ pub fn run() {
             commands::disconnect_ssh_target,
             commands::list_directory,
             commands::cancel_listing,
+            commands::create_terminal,
+            commands::write_terminal,
+            commands::resize_terminal,
+            commands::acknowledge_terminal_output,
+            commands::close_terminal,
             commands::start_file_operation,
             commands::respond_file_operation,
             commands::cancel_file_operation,
@@ -194,6 +200,13 @@ pub fn run() {
             commands::open_entry,
             commands::cancel_open_entry,
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window
+                    .state::<AppState>()
+                    .close_terminals_for_window(window.label());
+            }
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

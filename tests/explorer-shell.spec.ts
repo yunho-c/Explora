@@ -200,6 +200,40 @@ test("previews a multipage PDF with custom canvas controls", async ({
   await expect(dialog).toBeHidden();
 });
 
+test("manages independent terminal tabs in the browser demo", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page
+    .getByRole("button", { name: "Show or hide terminal (Ctrl+`)" })
+    .click();
+  const terminal = page.getByRole("region", { name: "Integrated terminal" });
+  await expect(terminal).toBeVisible();
+  await expect(terminal.getByRole("tab")).toHaveCount(1);
+  await expect(terminal.locator(".xterm-rows")).toContainText(
+    "Explora browser demo",
+  );
+
+  await terminal.getByRole("button", { name: "New terminal" }).click();
+  await expect(terminal.getByRole("tab")).toHaveCount(2);
+  await terminal.getByRole("button", { name: "Terminal actions" }).click();
+  await page.getByRole("menuitem", { name: "Rename Terminal" }).click();
+  const rename = terminal.getByRole("textbox", {
+    name: /Rename .* terminal/,
+  });
+  await rename.fill("Build");
+  await rename.press("Enter");
+  await expect(terminal.getByRole("tab", { name: "Build" })).toBeVisible();
+
+  await terminal.getByRole("button", { name: "Hide terminal" }).click();
+  await expect(terminal).toBeHidden();
+  await page
+    .getByRole("button", { name: "Show or hide terminal (Ctrl+`)" })
+    .click();
+  await expect(terminal.getByRole("tab")).toHaveCount(2);
+});
+
 test("filters entries and follows a dark system preference", async ({
   page,
 }) => {

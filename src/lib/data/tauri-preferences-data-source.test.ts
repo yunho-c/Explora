@@ -11,6 +11,13 @@ const preferencesPayload = {
     favoriteRoles: ["home", "documents", "music"],
     hiddenSshTargetIds: ["config:archived", "manual:target-1"],
   },
+  terminal: {
+    visible: true,
+    paneHeightPercent: 38,
+    fontSize: 14,
+    scrollback: 10_000,
+    screenReaderMode: true,
+  },
 };
 
 afterEach(() => clearMocks());
@@ -35,6 +42,7 @@ describe("TauriPreferencesDataSource", () => {
 
     const snapshot = await source.getPreferences();
     expect(snapshot.preferences.layout.viewMode).toBe("grid");
+    expect(snapshot.preferences.terminal.paneHeightPercent).toBe(38);
     expect(snapshot.warning?.code).toBe("malformed");
     await source.updatePreferences({
       layout: { sidebarCollapsed: false },
@@ -106,5 +114,19 @@ describe("TauriPreferencesDataSource", () => {
     await expect(
       new TauriPreferencesDataSource().getPreferences(),
     ).rejects.toThrow("warning is malformed");
+  });
+
+  it("rejects out-of-range terminal preferences", async () => {
+    mockIPC(() => ({
+      preferences: {
+        ...preferencesPayload,
+        terminal: { ...preferencesPayload.terminal, scrollback: 100_000 },
+      },
+      warning: null,
+    }));
+
+    await expect(
+      new TauriPreferencesDataSource().getPreferences(),
+    ).rejects.toThrow("terminal preferences are malformed");
   });
 });

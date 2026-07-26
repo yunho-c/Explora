@@ -143,6 +143,13 @@ class FailingPreferencesDataSource implements PreferencesDataSource {
           ],
           hiddenSshTargetIds: [],
         },
+        terminal: {
+          visible: false,
+          paneHeightPercent: 32,
+          fontSize: 13,
+          scrollback: 5_000,
+          screenReaderMode: true,
+        },
       },
       warning: null,
     };
@@ -633,6 +640,13 @@ describe("ExplorerState", () => {
         sort: { column: "size", direction: "descending" },
         favoriteRoles: ["home", "music"],
         hiddenSshTargetIds: ["demo:render-node"],
+      },
+      terminal: {
+        visible: false,
+        paneHeightPercent: 32,
+        fontSize: 13,
+        scrollback: 5_000,
+        screenReaderMode: true,
       },
     });
     const state = new ExplorerState(new DemoExplorerDataSource(), preferences);
