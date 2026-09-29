@@ -70,6 +70,13 @@ The following are deferred:
 
 ## Current implementation
 
+New Folder also uses this lifecycle for local and SFTP directories. The
+`createFolder` directory capability gates presentation; the corresponding action
+accepts a parent reference and leaf name with an empty source collection. It
+returns `folderCreated` with a registered directory entry. Conflicts remain in
+the naming dialog for correction. See [ADR 0013](adr/0013-new-folder.md) for the
+creation boundary, security review, and cancellation semantics.
+
 Phases 1 through 8 are implemented. Native Trash and local move still require
 packaged validation on every supported platform:
 

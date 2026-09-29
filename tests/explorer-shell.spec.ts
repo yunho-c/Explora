@@ -1,5 +1,60 @@
 import { expect, test } from "@playwright/test";
 
+test("creates folders from the menu and keyboard, retains conflicts, and cancels in an empty folder", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+  await page.getByRole("button", { name: "More options" }).click();
+  await page.getByRole("menuitem", { name: "New folder", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "New folder", exact: true });
+  const input = dialog.getByLabel("Folder name");
+  await expect(input).toBeFocused();
+  await input.fill("Projects");
+  await input.press("Enter");
+  await expect(dialog.getByRole("alert")).toContainText("already exists");
+  await expect(input).toHaveValue("Projects");
+  await input.fill("Created folder");
+  await input.press("Enter");
+  await expect(dialog).toBeHidden();
+  const folder = page.getByRole("row", { name: /Created folder/ });
+  await expect(folder).toHaveAttribute("aria-selected", "true");
+  await expect(folder).toBeFocused();
+  await folder.dblclick();
+  await expect(page.getByText("This location is empty")).toBeVisible();
+  await page.getByText("This location is empty").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "New folder", exact: true }).click();
+  await input.fill("Cancelled folder");
+  await input.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("This location is empty")).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+Shift+N");
+  await input.fill("Nested folder");
+  await input.press("Enter");
+  await expect(
+    page.getByRole("row", { name: /Nested folder/ }),
+  ).toHaveAttribute("aria-selected", "true");
+});
+
+test("creates a remote folder from the grid context menu", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+  await page
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .click();
+  await expect(page.getByText("service.log", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Grid view" }).click();
+  await page
+    .getByRole("gridcell", { name: "service.log" })
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "New folder", exact: true }).click();
+  await page.getByLabel("Folder name").fill("Remote folder");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await expect(
+    page.getByRole("gridcell", { name: "Remote folder" }),
+  ).toHaveAttribute("aria-selected", "true");
+});
+
 test("navigates the demo shell and opens Quick Preview", async ({ page }) => {
   await page.goto("/");
 

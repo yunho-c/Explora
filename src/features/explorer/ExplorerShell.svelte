@@ -10,7 +10,12 @@
   import { Button } from "$lib/components/ui/button";
   import { Progress } from "$lib/components/ui/progress";
   import * as Resizable from "$lib/components/ui/resizable";
-  import { deletionShortcut, isRenameShortcut } from "$lib/platform-shortcuts";
+  import * as ContextMenu from "$lib/components/ui/context-menu";
+  import {
+    deletionShortcut,
+    isRenameShortcut,
+    isNewFolderShortcut,
+  } from "$lib/platform-shortcuts";
   import { formatFileSize } from "$lib/file-metadata";
 
   import ExplorerSidebar from "./ExplorerSidebar.svelte";
@@ -20,6 +25,7 @@
   import FileList from "./FileList.svelte";
   import FileOperationConfirmationDialog from "./FileOperationConfirmationDialog.svelte";
   import MoveDestinationDialog from "./MoveDestinationDialog.svelte";
+  import NewFolderDialog from "./NewFolderDialog.svelte";
   import NativeOpenConfirmation from "./NativeOpenConfirmation.svelte";
   import NativeOpenOperations from "./NativeOpenOperations.svelte";
   import QuickPreview from "./QuickPreview.svelte";
@@ -76,6 +82,23 @@
       target instanceof Element &&
       target.closest("[data-terminal-surface]") !== null;
     if (terminalHasFocus) return;
+
+    // The naming dialog owns Enter and Escape, including macOS Enter-to-rename.
+    if (state.newFolderParent) return;
+    if (
+      isNewFolderShortcut(event) &&
+      state.canCreateFolder &&
+      !(
+        target instanceof Element &&
+        target.closest(
+          'input, textarea, [contenteditable="true"], [role="dialog"], [role="alertdialog"]',
+        )
+      )
+    ) {
+      event.preventDefault();
+      state.startNewFolder();
+      return;
+    }
 
     if (
       isRenameShortcut(event) &&
@@ -351,20 +374,37 @@
         {/if}
 
         {#if !state.errorMessage && !state.loading && state.visibleEntries.length === 0}
-          <div class="grid min-h-72 place-items-center p-8 text-center">
-            <div>
-              <p class="font-medium">
-                {state.searchQuery
-                  ? "No matching items"
-                  : "This location is empty"}
-              </p>
-              <p class="mt-1 text-sm text-muted-foreground">
-                {state.searchQuery
-                  ? "Try a different search term."
-                  : "There are no items in this folder."}
-              </p>
-            </div>
-          </div>
+          <ContextMenu.Root>
+            <ContextMenu.Trigger>
+              <div class="grid min-h-72 place-items-center p-8 text-center">
+                <div>
+                  <p class="font-medium">
+                    {state.searchQuery
+                      ? "No matching items"
+                      : "This location is empty"}
+                  </p>
+                  <p class="mt-1 text-sm text-muted-foreground">
+                    {state.searchQuery
+                      ? "Try a different search term."
+                      : "There are no items in this folder."}
+                  </p>
+                  <Button
+                    class="mt-4"
+                    variant="outline"
+                    disabled={!state.canCreateFolder}
+                    onclick={() => state.startNewFolder()}>New folder</Button
+                  >
+                </div>
+              </div>
+            </ContextMenu.Trigger>
+            <ContextMenu.Content>
+              <ContextMenu.Item
+                disabled={!state.canCreateFolder}
+                onclick={() => state.startNewFolder()}
+                >New folder</ContextMenu.Item
+              >
+            </ContextMenu.Content>
+          </ContextMenu.Root>
         {:else if state.viewMode === "list"}
           <FileList {state} />
         {:else}
@@ -440,6 +480,7 @@
   <QuickPreview {state} />
   <FileOperationConfirmationDialog {state} />
   <MoveDestinationDialog {state} />
+  <NewFolderDialog {state} />
   <NativeOpenOperations {state} />
   <NativeOpenConfirmation {state} />
   <SshTargetDialog {state} />

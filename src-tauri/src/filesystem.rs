@@ -104,17 +104,20 @@ pub struct DirectoryRefDto {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectoryCapabilitiesDto {
+    pub create_folder: bool,
     pub accept_move: bool,
     pub atomic_replace: bool,
 }
 
 impl DirectoryCapabilitiesDto {
     pub const READ_ONLY: Self = Self {
+        create_folder: false,
         accept_move: false,
         atomic_replace: false,
     };
 
     pub const LOCAL: Self = Self {
+        create_folder: true,
         accept_move: true,
         // Replacement stays disabled until an atomic or staged replacement
         // strategy is implemented and covered on every supported platform.
@@ -122,6 +125,7 @@ impl DirectoryCapabilitiesDto {
     };
 
     pub const SFTP: Self = Self {
+        create_folder: true,
         accept_move: true,
         // SFTP v3 rename is no-replace, but it does not provide the stronger
         // replacement contract required to advertise atomic replacement.

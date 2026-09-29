@@ -459,6 +459,55 @@ impl LocalFilesystem {
         self.registry.resolve(location_id, entry_id)
     }
 
+    pub fn create_folder(
+        &self,
+        parent: &DirectoryRefDto,
+        name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        validate_entry_name(name)?;
+        ensure_not_cancelled(cancelled)?;
+        // Resolve the opaque parent again; presentation paths and client-supplied
+        // capabilities never authorize a write. Symlink destinations are rejected.
+        let parent_path = self.resolve_transfer_destination(parent)?;
+        let root = self
+            .locations()?
+            .into_iter()
+            .find(|location| location.id == parent.location_id)
+            .ok_or(ExplorerError::InvalidReference)?
+            .root;
+        let root_path = self.registry.resolve(&root.location_id, &root.id)?;
+        // A navigated descendant of a directory link is still not a write target.
+        for ancestor in parent_path
+            .ancestors()
+            .take_while(|path| path.starts_with(&root_path))
+        {
+            let metadata = fs::symlink_metadata(ancestor)
+                .map_err(|error| ExplorerError::io("inspect", ancestor, error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "Choose a folder outside symbolic links to create a new folder.".to_owned(),
+                ));
+            }
+        }
+        let path = parent_path.join(name);
+        ensure_not_cancelled(cancelled)?;
+        // A single exclusive mkdir cannot replace an existing file, folder or link.
+        fs::create_dir(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ExplorerError::Conflict
+            } else {
+                ExplorerError::Io { message: "Explora could not create the folder. Check that the parent folder is available and writable.".to_owned(), kind: error.kind() }
+            }
+        })?;
+        // Once mkdir succeeds, late cancellation must not hide the committed change.
+        self.describe_path(path, &parent.location_id).map_err(|_| {
+            ExplorerError::PartialCompletion(
+                "The folder was created, but its details could not be loaded. Refresh the parent folder before trying again.".to_owned(),
+            )
+        })
+    }
+
     pub fn rename_entry(
         &self,
         entry: &EntryRefDto,
@@ -1987,6 +2036,134 @@ mod tests {
         .expect("local filesystem");
         let root = filesystem.locations().expect("locations")[0].root.clone();
         (temp, filesystem, root)
+    }
+
+    #[test]
+    fn create_folder_registers_an_empty_navigable_folder_and_preserves_conflicts() {
+        let (temp, filesystem, root) = fixture();
+        let cancelled = AtomicBool::new(false);
+        let entry = filesystem
+            .create_folder(&root, "New folder", &cancelled)
+            .expect("create folder");
+        assert_eq!(entry.kind, "directory");
+        assert_eq!(entry.reference.location_id, root.location_id);
+        assert_ne!(entry.reference.id, root.id);
+        let directory = entry.directory.expect("navigable folder");
+        assert!(directory.capabilities.create_folder);
+        assert_eq!(
+            fs::read_dir(temp.path().join("New folder"))
+                .expect("empty folder")
+                .count(),
+            0
+        );
+        filesystem
+            .create_folder(&directory, "nested", &cancelled)
+            .expect("nested folder");
+        for name in ["New folder", "folder", "notes.md"] {
+            assert!(matches!(
+                filesystem.create_folder(&root, name, &cancelled),
+                Err(ExplorerError::Conflict)
+            ));
+        }
+        assert_eq!(
+            fs::read(temp.path().join("notes.md")).expect("unchanged file"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn create_folder_rejects_invalid_cancelled_forged_and_stale_parents() {
+        let (temp, filesystem, root) = fixture();
+        let cancelled = AtomicBool::new(false);
+        for name in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "child/nested",
+            "a\0b",
+            &"x".repeat(256),
+        ] {
+            assert!(matches!(
+                filesystem.create_folder(&root, name, &cancelled),
+                Err(ExplorerError::InvalidName(_))
+            ));
+        }
+        assert!(matches!(
+            filesystem.create_folder(&root, "cancelled", &AtomicBool::new(true)),
+            Err(ExplorerError::Cancelled)
+        ));
+        assert!(!temp.path().join("cancelled").exists());
+        let mut forged = root.clone();
+        forged.location_id = "unrelated-location".to_owned();
+        assert!(matches!(
+            filesystem.create_folder(&forged, "forged", &cancelled),
+            Err(ExplorerError::InvalidReference)
+        ));
+        // Display strings and client capabilities cannot redirect the operation.
+        forged = root.clone();
+        forged.display_path = temp.path().join("outside").display().to_string();
+        filesystem
+            .create_folder(&forged, "authorized", &cancelled)
+            .expect("opaque parent");
+        assert!(temp.path().join("authorized").is_dir());
+        let entry = filesystem
+            .create_folder(&root, "parent", &cancelled)
+            .expect("parent");
+        let parent = entry.directory.expect("directory");
+        fs::rename(temp.path().join("parent"), temp.path().join("retained"))
+            .expect("replace parent");
+        fs::create_dir(temp.path().join("parent")).expect("replacement");
+        assert!(matches!(
+            filesystem.create_folder(&parent, "child", &cancelled),
+            Err(ExplorerError::SourceChanged)
+        ));
+        assert!(!temp.path().join("parent/child").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_folder_rejects_windows_device_and_path_names() {
+        let (_temp, filesystem, root) = fixture();
+        for name in [
+            "CON",
+            "nul.txt",
+            "COM1",
+            "folder.",
+            "folder ",
+            "C:\\escape",
+            "a\\b",
+            "a:b",
+            "a?b",
+        ] {
+            assert!(
+                matches!(
+                    filesystem.create_folder(&root, name, &AtomicBool::new(false)),
+                    Err(ExplorerError::InvalidName(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_folder_never_traverses_symlink_parents() {
+        let (temp, filesystem, root) = fixture();
+        let outside = TempDir::new().expect("outside root");
+        fs::create_dir(outside.path().join("nested")).expect("outside nested");
+        std::os::unix::fs::symlink(outside.path(), temp.path().join("link"))
+            .expect("directory link");
+        for path in [temp.path().join("link"), temp.path().join("link/nested")] {
+            let parent = directory_ref(&filesystem.registry, &path, &root.location_id, None)
+                .expect("navigated parent");
+            assert!(matches!(
+                filesystem.create_folder(&parent, "escape", &AtomicBool::new(false)),
+                Err(ExplorerError::DestinationUnavailable(_))
+            ));
+        }
+        assert!(!outside.path().join("escape").exists());
+        assert!(!outside.path().join("nested/escape").exists());
     }
 
     fn transfer_fixture() -> (

@@ -29,6 +29,7 @@
           </div>
         {:else}
           <button
+            data-file-entry
             type="button"
             role="gridcell"
             aria-selected={state.isEntrySelected(entry.reference.id)}
@@ -77,6 +78,11 @@
     </div>
   </ContextMenu.Trigger>
   <ContextMenu.Content>
+    <ContextMenu.Item
+      disabled={!state.canCreateFolder}
+      onclick={() => state.startNewFolder()}>New folder</ContextMenu.Item
+    >
+    <ContextMenu.Separator />
     <ContextMenu.Item
       disabled={state.selectedEntries.length !== 1}
       onclick={() => {

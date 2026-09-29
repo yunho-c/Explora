@@ -1092,6 +1092,69 @@ impl SshSession {
         emit(DirectoryListingEvent::Complete { skipped_entries })
     }
 
+    async fn create_folder(
+        &self,
+        parent: &DirectoryRefDto,
+        name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        validate_remote_name(name)?;
+        let _guard = self.mutation_guard.lock().await;
+        ensure_not_cancelled(cancelled)?;
+        let parent_path = self.revalidate_directory(parent).await?;
+        let mut ancestor = remote_parent(&parent_path);
+        while let Some(path) = ancestor {
+            ensure_not_cancelled(cancelled)?;
+            let metadata = self
+                .sftp
+                .symlink_metadata(path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            if metadata.is_symlink() {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "Choose a folder outside symbolic links to create a new folder.".to_owned(),
+                ));
+            }
+            ancestor = remote_parent(&path);
+        }
+        let path = remote_join(&parent_path, name);
+        self.ensure_remote_destination_absent(&path).await?;
+        ensure_not_cancelled(cancelled)?;
+        // Do not race cancellation against a dispatched mutation: an acknowledgement
+        // is authoritative, and a lost acknowledgement must never trigger a retry.
+        match self.sftp.create_dir(path.clone()).await {
+            Ok(()) => {}
+            Err(error) if is_sftp_connectivity_error(&error) => {
+                self.mark_offline();
+                return Err(ExplorerError::OutcomeUncertain(
+                    "The SSH connection was lost while creating the folder. Reconnect and refresh before trying again.".to_owned(),
+                ));
+            }
+            Err(error) => {
+                // SFTP v3 servers may report an existing name as generic Failure.
+                if self.sftp.symlink_metadata(path.clone()).await.is_ok() {
+                    return Err(ExplorerError::Conflict);
+                }
+                return Err(map_sftp_error(error));
+            }
+        }
+        // Refresh the parent's fingerprint after our acknowledged mutation, so
+        // repeated creation does not invalidate its own directory reference.
+        let summary = async {
+            let metadata = self
+                .sftp
+                .symlink_metadata(parent_path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            self.paths.register_with_metadata(parent_path, &metadata)?;
+            self.summary_for_registered_path(&path).await
+        }
+        .await;
+        summary.map_err(|_| ExplorerError::PartialCompletion(
+            "The remote folder was created, but its details could not be loaded. Refresh the parent folder before trying again.".to_owned(),
+        ))
+    }
+
     async fn rename_entry(
         &self,
         source: &EntryRefDto,
@@ -2207,6 +2270,17 @@ impl SshConnectionManager {
             ));
         }
         result
+    }
+
+    pub async fn create_folder(
+        &self,
+        parent: &DirectoryRefDto,
+        name: &str,
+        cancelled: &AtomicBool,
+    ) -> Result<FileEntrySummaryDto, ExplorerError> {
+        let session = self.active_session(&parent.location_id)?;
+        let result = session.create_folder(parent, name, cancelled).await;
+        finish_remote_result(&session, result)
     }
 
     pub async fn rename_entry(

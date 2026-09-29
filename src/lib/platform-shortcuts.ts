@@ -7,6 +7,14 @@ const isMacLike = () =>
 export const isRenameShortcut = (event: KeyboardEvent) =>
   event.key === "F2" || (isMacLike() && event.key === "Enter");
 
+export const isNewFolderShortcut = (event: KeyboardEvent) =>
+  event.key.toLowerCase() === "n" &&
+  event.shiftKey &&
+  !event.altKey &&
+  (isMacLike()
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey);
+
 export const deletionShortcut = (
   event: KeyboardEvent,
 ): DeletionShortcut | null => {

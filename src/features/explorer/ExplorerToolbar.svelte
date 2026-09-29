@@ -154,7 +154,10 @@
     </DropdownMenu.Trigger>
     <DropdownMenu.Content align="end">
       <DropdownMenu.Label>Actions</DropdownMenu.Label>
-      <DropdownMenu.Item disabled>New folder</DropdownMenu.Item>
+      <DropdownMenu.Item
+        disabled={!state.canCreateFolder}
+        onclick={() => state.startNewFolder()}>New folder</DropdownMenu.Item
+      >
       <DropdownMenu.Item disabled>Connect to server</DropdownMenu.Item>
       <DropdownMenu.Separator />
       <DropdownMenu.Item

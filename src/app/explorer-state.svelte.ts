@@ -113,6 +113,11 @@ export class ExplorerState {
   renameDraft = $state("");
   renameSaving = $state(false);
   renameErrorMessage = $state<string | null>(null);
+  newFolderParent = $state<DirectoryRef | null>(null);
+  newFolderName = $state("");
+  newFolderSaving = $state(false);
+  newFolderCancelling = $state(false);
+  newFolderErrorMessage = $state<string | null>(null);
   searchQuery = $state("");
   viewMode = $state<ViewMode>("list");
   sort = $state<SortDescriptor>({ column: "name", direction: "ascending" });
@@ -147,6 +152,7 @@ export class ExplorerState {
 
   private directoryController: AbortController | null = null;
   private renameController: AbortController | null = null;
+  private newFolderController: AbortController | null = null;
   private previewController: AbortController | null = null;
   private previewDisposer: (() => void) | null = null;
   private sshConnectionController: AbortController | null = null;
@@ -209,6 +215,91 @@ export class ExplorerState {
       this.selectedEntries.length === 1 &&
       this.selectedEntries[0].capabilities.rename
     );
+  }
+
+  get canCreateFolder(): boolean {
+    return Boolean(
+      this.activeDirectory?.capabilities.createFolder &&
+      this.activeLocation?.status !== "offline" &&
+      !this.activeSshLocationOffline &&
+      !this.loading &&
+      !this.newFolderParent &&
+      !this.renameSaving &&
+      this.fileOperations.activeEntryId === null,
+    );
+  }
+
+  startNewFolder(): void {
+    if (!this.canCreateFolder || !this.activeDirectory) return;
+    this.cancelRename();
+    this.closePreview();
+    this.newFolderParent = this.activeDirectory;
+    this.newFolderName = "";
+    this.newFolderErrorMessage = null;
+    this.newFolderCancelling = false;
+  }
+
+  cancelNewFolder(): void {
+    if (this.newFolderSaving) {
+      this.newFolderCancelling = true;
+      this.newFolderController?.abort();
+      return;
+    }
+    this.newFolderParent = null;
+    this.newFolderErrorMessage = null;
+  }
+
+  async createFolder(): Promise<void> {
+    const parent = this.newFolderParent;
+    if (!parent || this.newFolderSaving) return;
+    if (!this.newFolderName) {
+      this.newFolderErrorMessage = "Enter a folder name.";
+      return;
+    }
+    const controller = new AbortController();
+    this.newFolderController = controller;
+    this.newFolderSaving = true;
+    this.newFolderErrorMessage = null;
+    try {
+      const entry = await this.dataSource.createFolder(
+        parent,
+        this.newFolderName,
+        controller.signal,
+      );
+      if (this.newFolderController !== controller) return;
+      // The operation stays bound to its original parent. Late results never
+      // insert an entry into another tab or navigate the user back to it.
+      if (
+        this.activeDirectory &&
+        isSameDirectory(this.activeDirectory, parent)
+      ) {
+        await this.refreshDirectory();
+        if (
+          this.activeDirectory &&
+          isSameDirectory(this.activeDirectory, parent) &&
+          this.entries.some(
+            (candidate) => candidate.reference.id === entry.reference.id,
+          )
+        ) {
+          this.selectEntry(entry.reference.id);
+        }
+      }
+      this.newFolderParent = null;
+    } catch (error) {
+      if (this.newFolderController !== controller) return;
+      if (isAbortError(error)) this.newFolderParent = null;
+      else
+        this.newFolderErrorMessage =
+          error instanceof Error
+            ? error.message
+            : "Explora could not create this folder.";
+    } finally {
+      if (this.newFolderController === controller) {
+        this.newFolderController = null;
+        this.newFolderSaving = false;
+        this.newFolderCancelling = false;
+      }
+    }
   }
 
   get canMoveSelection(): boolean {
@@ -369,6 +460,8 @@ export class ExplorerState {
   dispose(): void {
     this.directoryController?.abort();
     this.renameController?.abort();
+    this.newFolderController?.abort();
+    this.newFolderController = null;
     this.previewController?.abort();
     this.sshConnectionController?.abort();
     this.volumeWatchController?.abort();

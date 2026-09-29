@@ -43,6 +43,7 @@ export interface DirectoryRef extends EntryRef {
 }
 
 export interface DirectoryCapabilities {
+  createFolder: boolean;
   acceptMove: boolean;
   atomicReplace: boolean;
 }

@@ -114,6 +114,11 @@ export interface ExplorerDataSource {
     directory: DirectoryRef,
     options: ListDirectoryOptions,
   ): Promise<void>;
+  createFolder(
+    parent: DirectoryRef,
+    name: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary>;
   renameEntry(
     entry: FileEntrySummary,
     newName: string,

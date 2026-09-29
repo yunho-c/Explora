@@ -49,8 +49,16 @@ pub struct FileOperationRequestDto {
     deny_unknown_fields
 )]
 pub enum FileOperationActionDto {
-    Rename { new_name: String },
-    Move { destination: DirectoryRefDto },
+    CreateFolder {
+        parent: DirectoryRefDto,
+        name: String,
+    },
+    Rename {
+        new_name: String,
+    },
+    Move {
+        destination: DirectoryRefDto,
+    },
     Trash {},
     DeletePermanently {},
 }
@@ -58,6 +66,7 @@ pub enum FileOperationActionDto {
 impl FileOperationActionDto {
     fn kind(&self) -> FileOperationKindDto {
         match self {
+            Self::CreateFolder { .. } => FileOperationKindDto::CreateFolder,
             Self::Rename { .. } => FileOperationKindDto::Rename,
             Self::Move { .. } => FileOperationKindDto::Move,
             Self::Trash {} => FileOperationKindDto::Trash,
@@ -69,6 +78,7 @@ impl FileOperationActionDto {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum FileOperationKindDto {
+    CreateFolder,
     Rename,
     Move,
     Trash,
@@ -116,6 +126,9 @@ pub enum FileOperationPromptDto {
     rename_all_fields = "camelCase"
 )]
 pub enum FileOperationOutcomeDto {
+    FolderCreated {
+        entry: Box<FileEntrySummaryDto>,
+    },
     Renamed {
         entry: Box<FileEntrySummaryDto>,
     },
@@ -637,7 +650,7 @@ impl FileOperationCoordinator {
     ) -> Result<String, ExplorerError> {
         validate_request(&request)?;
         let action = request.action.kind();
-        let total_items = u64::try_from(request.sources.len()).map_err(|_| {
+        let total_items = u64::try_from(request.sources.len().max(1)).map_err(|_| {
             ExplorerError::InvalidConfiguration("Too many selected items.".to_owned())
         })?;
         let operation_id = Uuid::new_v4().to_string();
@@ -666,7 +679,13 @@ impl FileOperationCoordinator {
 
         let coordinator = self.clone();
         let task_operation_id = operation_id.clone();
-        let uses_remote_backend = request.sources[0].location_id.starts_with("ssh:")
+        let source_is_remote = match &request.action {
+            FileOperationActionDto::CreateFolder { parent, .. } => {
+                parent.location_id.starts_with("ssh:")
+            }
+            _ => request.sources[0].location_id.starts_with("ssh:"),
+        };
+        let uses_remote_backend = source_is_remote
             || matches!(
                 &request.action,
                 FileOperationActionDto::Move { destination }
@@ -686,7 +705,7 @@ impl FileOperationCoordinator {
                     current_item_total: None,
                     channel: on_event,
                 };
-                let result = if request.sources[0].location_id.starts_with("ssh:") {
+                let result = if source_is_remote {
                     coordinator
                         .run_remote_batch(
                             local.clone(),
@@ -769,6 +788,17 @@ impl FileOperationCoordinator {
         active: &ActiveOperation,
         events: &mut OperationEventEmitter,
     ) -> OperationTerminal {
+        if let FileOperationActionDto::CreateFolder { parent, name } = &request.action {
+            return (|| {
+                active.ensure_not_cancelled()?;
+                events.running()?;
+                self.with_execution_guard(|| local.create_folder(parent, name, &active.cancelled))
+                    .map(|entry| FileOperationOutcomeDto::FolderCreated {
+                        entry: Box::new(entry),
+                    })
+            })()
+            .into();
+        }
         if request.sources.len() == 1 {
             return self
                 .run_local_single(local, request, active, events, false)
@@ -922,6 +952,7 @@ impl FileOperationCoordinator {
 
         let source = &request.sources[0];
         match &request.action {
+            FileOperationActionDto::CreateFolder { .. } => Err(ExplorerError::InvalidReference),
             FileOperationActionDto::Rename { new_name } => self
                 .with_execution_guard(|| local.rename_entry(source, new_name, &active.cancelled))
                 .map(|entry| FileOperationOutcomeDto::Renamed {
@@ -1808,6 +1839,19 @@ impl FileOperationCoordinator {
         active: Arc<ActiveOperation>,
         events: &mut OperationEventEmitter,
     ) -> OperationTerminal {
+        if let FileOperationActionDto::CreateFolder { parent, name } = &request.action {
+            return async {
+                active.ensure_not_cancelled()?;
+                events.running()?;
+                ssh.create_folder(parent, name, &active.cancelled)
+                    .await
+                    .map(|entry| FileOperationOutcomeDto::FolderCreated {
+                        entry: Box::new(entry),
+                    })
+            }
+            .await
+            .into();
+        }
         if request.sources.len() == 1 {
             return self
                 .run_remote_single(local, ssh, request, active, events, false)
@@ -1977,6 +2021,7 @@ impl FileOperationCoordinator {
 
         let source = &request.sources[0];
         match &request.action {
+            FileOperationActionDto::CreateFolder { .. } => Err(ExplorerError::InvalidReference),
             FileOperationActionDto::Rename { new_name } => ssh
                 .rename_entry(source, new_name, &active.cancelled)
                 .await
@@ -3283,6 +3328,33 @@ async fn abandon_remote_after_error(
 }
 
 fn validate_request(request: &FileOperationRequestDto) -> Result<(), ExplorerError> {
+    if let FileOperationActionDto::CreateFolder { parent, name } = &request.action {
+        if !request.sources.is_empty() {
+            return Err(ExplorerError::InvalidConfiguration(
+                "New Folder requires a parent folder and no source entries.".to_owned(),
+            ));
+        }
+        if parent.id.is_empty()
+            || parent.id.len() > 256
+            || parent.location_id.is_empty()
+            || parent.location_id.len() > 256
+            || parent.name.len() > 1_024
+            || parent.display_path.len() > 4_096
+        {
+            return Err(ExplorerError::InvalidReference);
+        }
+        if name.is_empty()
+            || name.len() > 255
+            || name == "."
+            || name == ".."
+            || name.contains(['/', '\0'])
+        {
+            return Err(ExplorerError::InvalidName(
+                "Enter a folder name between 1 and 255 bytes without a path separator or null character.".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     if request.sources.is_empty() || request.sources.len() > MAX_OPERATION_SOURCES {
         return Err(ExplorerError::InvalidConfiguration(format!(
             "Filesystem actions require between 1 and {MAX_OPERATION_SOURCES} selected items."
@@ -3739,7 +3811,7 @@ mod tests {
                     "locationId": "home",
                     "name": "Folder",
                     "displayPath": "/untrusted/presentation",
-                    "capabilities": { "acceptMove": true, "atomicReplace": false }
+                    "capabilities": { "createFolder": true, "acceptMove": true, "atomicReplace": false }
                 }
             }
         }))
@@ -3810,6 +3882,233 @@ mod tests {
             validate_request(&batch_rename),
             Err(ExplorerError::InvalidConfiguration(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_folder_contract_runs_on_local_and_real_sftp_backends() {
+        let server = TestSshServer::start(TestAuthMode::PublicKey).await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let (temp, local, _) = fixture();
+        let local_root = local.locations().expect("locations")[0].root.clone();
+        let coordinator = Arc::new(FileOperationCoordinator::default());
+        for parent in [local_root, remote.root.clone()] {
+            for (name, terminal, error_code) in [
+                ("Created folder", "completed", None),
+                ("Created folder", "failed", Some("conflict")),
+                ("Second folder", "completed", None),
+            ] {
+                let events = Arc::new(StdMutex::new(Vec::<Value>::new()));
+                let id = coordinator
+                    .start_with_backends(
+                        local.clone(),
+                        ssh.clone(),
+                        FileOperationRequestDto {
+                            sources: vec![],
+                            action: FileOperationActionDto::CreateFolder {
+                                parent: parent.clone(),
+                                name: name.to_owned(),
+                            },
+                        },
+                        channel(events.clone()),
+                    )
+                    .expect("start creation");
+                wait_for_event(&events, terminal).await;
+                let captured = events.lock().expect("events");
+                assert_eq!(
+                    captured
+                        .iter()
+                        .map(|event| event["sequence"].as_u64().expect("sequence"))
+                        .collect::<Vec<_>>(),
+                    vec![0, 1, 2]
+                );
+                assert!(captured.iter().all(|event| event["operationId"] == id
+                    && event["action"] == "createFolder"
+                    && event["totalItems"] == 1));
+                let result = captured.last().expect("terminal event");
+                if let Some(code) = error_code {
+                    assert_eq!(result["error"]["code"], code);
+                } else {
+                    assert_eq!(result["outcome"]["kind"], "folderCreated");
+                    assert_eq!(result["outcome"]["entry"]["name"], name);
+                    assert_eq!(
+                        result["outcome"]["entry"]["reference"]["locationId"],
+                        parent.location_id
+                    );
+                    assert_eq!(
+                        result["outcome"]["entry"]["directory"]["capabilities"]["createFolder"],
+                        true
+                    );
+                    assert_eq!(result["completedItems"], 1);
+                }
+            }
+        }
+        assert!(temp.path().join("Created folder").is_dir());
+        assert!(server.path_exists("/Created folder").await);
+        let entries = remote_root_entries(&ssh, &remote).await;
+        let private = entries
+            .iter()
+            .find(|entry| entry.name == "private")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("private directory");
+        let denied = ssh
+            .create_folder(private, "forbidden", &AtomicBool::new(false))
+            .await
+            .expect_err("permission failure");
+        assert_eq!(
+            ExplorerErrorDto::from(denied).code,
+            ExplorerErrorCode::PermissionDenied
+        );
+        assert!(!server.path_exists("/private/forbidden").await);
+        assert!(matches!(
+            ssh.create_folder(&remote.root, "README.md", &AtomicBool::new(false))
+                .await,
+            Err(ExplorerError::Conflict)
+        ));
+        assert_eq!(
+            server
+                .read_file("/README.md")
+                .await
+                .expect("preserved file")
+                .len(),
+            128
+        );
+        let folder = entries
+            .iter()
+            .find(|entry| entry.name == "Created folder")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("created remote directory");
+        ssh.create_folder(folder, "nested", &AtomicBool::new(false))
+            .await
+            .expect("nested creation");
+        assert!(server.path_exists("/Created folder/nested").await);
+        let link = entries
+            .iter()
+            .find(|entry| entry.name == "project-link")
+            .and_then(|entry| entry.directory.as_ref())
+            .expect("directory symlink");
+        assert!(!link.capabilities.create_folder);
+        assert!(matches!(
+            ssh.create_folder(link, "escape", &AtomicBool::new(false))
+                .await,
+            Err(ExplorerError::DestinationUnavailable(_))
+        ));
+        assert!(matches!(
+            ssh.create_folder(&remote.root, "cancelled", &AtomicBool::new(true))
+                .await,
+            Err(ExplorerError::Cancelled)
+        ));
+        assert!(!server.path_exists("/cancelled").await);
+        let mut forged = remote.root.clone();
+        forged.id = "not-an-issued-id".to_owned();
+        assert!(matches!(
+            ssh.create_folder(&forged, "forged", &AtomicBool::new(false))
+                .await,
+            Err(ExplorerError::InvalidReference)
+        ));
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        assert!(matches!(
+            ssh.create_folder(&remote.root, "offline", &AtomicBool::new(false))
+                .await,
+            Err(ExplorerError::Offline(_))
+        ));
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_folder_cancellation_after_remote_dispatch_reports_acknowledged_success() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(150),
+        )
+        .await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = cancelled.clone();
+        let manager = ssh.clone();
+        let creation = tokio::spawn(async move {
+            manager
+                .create_folder(&remote.root, "committed", &cancel)
+                .await
+        });
+        server.wait_for_mutation().await;
+        cancelled.store(true, Ordering::Relaxed);
+        let created = creation
+            .await
+            .expect("creation task")
+            .expect("acknowledged success");
+        assert_eq!(created.name, "committed");
+        assert!(server.path_exists("/committed").await);
+        ssh.disconnect("operation-test-target")
+            .await
+            .expect("disconnect");
+        server.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_folder_remote_disconnect_reports_uncertainty_without_retry() {
+        let server = TestSshServer::start_with_delays(
+            TestAuthMode::PublicKey,
+            true,
+            Duration::ZERO,
+            Duration::from_millis(500),
+        )
+        .await;
+        let ssh = Arc::new(SshConnectionManager::default());
+        let remote = connect_remote_fixture(&server, ssh.clone()).await;
+        let manager = ssh.clone();
+        let creation = tokio::spawn(async move {
+            manager
+                .create_folder(&remote.root, "uncertain", &AtomicBool::new(false))
+                .await
+        });
+        server.wait_for_mutation().await;
+        server.disconnect_clients().await;
+        assert!(matches!(
+            creation.await.expect("creation task"),
+            Err(ExplorerError::OutcomeUncertain(_))
+        ));
+        assert!(ssh.locations().is_empty());
+        server.shutdown().await;
+    }
+
+    #[test]
+    fn create_folder_request_requires_one_parent_no_sources_and_a_bounded_leaf_name() {
+        let (_temp, local, source) = fixture();
+        let root = local.locations().expect("locations")[0].root.clone();
+        for name in [
+            "",
+            "..",
+            "../escape",
+            "/absolute",
+            "a/b",
+            "a\0b",
+            &"x".repeat(256),
+        ] {
+            assert!(matches!(
+                validate_request(&FileOperationRequestDto {
+                    sources: vec![],
+                    action: FileOperationActionDto::CreateFolder {
+                        parent: root.clone(),
+                        name: name.to_owned()
+                    }
+                }),
+                Err(ExplorerError::InvalidName(_))
+            ));
+        }
+        assert!(validate_request(&FileOperationRequestDto {
+            sources: vec![source],
+            action: FileOperationActionDto::CreateFolder {
+                parent: root,
+                name: "folder".to_owned()
+            }
+        })
+        .is_err());
     }
 
     #[test]

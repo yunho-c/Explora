@@ -161,6 +161,7 @@ const parseDirectoryRef = (value: unknown): DirectoryRef => {
     name: requireString(value, "name"),
     displayPath: requireString(value, "displayPath"),
     capabilities: {
+      createFolder: requireBoolean(value.capabilities, "createFolder"),
       acceptMove: requireBoolean(value.capabilities, "acceptMove"),
       atomicReplace: requireBoolean(value.capabilities, "atomicReplace"),
     },
@@ -414,12 +415,14 @@ const parseEntry = (value: unknown): FileEntrySummary => {
 };
 
 type FileOperationAction =
+  | { kind: "createFolder"; parent: DirectoryRef; name: string }
   | { kind: "rename"; newName: string }
   | { kind: "move"; destination: DirectoryRef }
   | { kind: "trash" }
   | { kind: "deletePermanently" };
 
 type FileOperationOutcome =
+  | { kind: "folderCreated"; entry: FileEntrySummary }
   | { kind: "renamed"; entry: FileEntrySummary }
   | FileMoveResult
   | FileRemovalResult
@@ -576,8 +579,8 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
       "Invalid filesystem response: operation outcome is malformed.",
     );
   }
-  if (value.kind === "renamed") {
-    return { kind: "renamed", entry: parseEntry(value.entry) };
+  if (value.kind === "renamed" || value.kind === "folderCreated") {
+    return { kind: value.kind, entry: parseEntry(value.entry) };
   }
   if (value.kind === "batch") {
     if (
@@ -615,7 +618,11 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
       seen.add(sourceKey);
       if (candidate.status === "completed") {
         const outcome = parseOperationOutcome(candidate.outcome);
-        if (outcome.kind === "batch" || outcome.kind === "renamed") {
+        if (
+          outcome.kind === "batch" ||
+          outcome.kind === "renamed" ||
+          outcome.kind === "folderCreated"
+        ) {
           throw new Error(
             "Invalid filesystem response: batch item outcome is unsupported.",
           );
@@ -1404,6 +1411,38 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     } finally {
       signal.removeEventListener("abort", cancel);
     }
+  }
+
+  async createFolder(
+    parent: DirectoryRef,
+    name: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    const outcome = await this.runFileOperation(
+      [],
+      { kind: "createFolder", parent, name },
+      {
+        signal,
+        onPrompt: () => {
+          throw new Error(
+            "Invalid filesystem response: folder creation requested a prompt.",
+          );
+        },
+      },
+    );
+    if (
+      outcome.kind !== "folderCreated" ||
+      outcome.entry.kind !== "directory" ||
+      !outcome.entry.directory ||
+      outcome.entry.reference.locationId !== parent.locationId ||
+      outcome.entry.reference.id === parent.id ||
+      outcome.entry.name !== name
+    ) {
+      throw new Error(
+        "Invalid filesystem response: folder creation returned an inconsistent outcome.",
+      );
+    }
+    return outcome.entry;
   }
 
   async renameEntry(

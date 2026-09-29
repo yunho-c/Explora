@@ -30,11 +30,13 @@ import type {
 } from "$lib/data/explorer-data-source";
 
 const localDirectoryCapabilities = {
+  createFolder: true,
   acceptMove: true,
   atomicReplace: false,
 } as const;
 
 const unavailableDirectoryCapabilities = {
+  createFolder: false,
   acceptMove: false,
   atomicReplace: false,
 } as const;
@@ -538,6 +540,14 @@ const wait = (duration: number, signal: AbortSignal) =>
   });
 
 export class DemoExplorerDataSource implements ExplorerDataSource {
+  private readonly entriesByDirectory: Record<string, FileEntrySummary[]> =
+    Object.fromEntries(
+      Object.entries(entriesByLocation).map(([id, entries]) => [
+        id,
+        structuredClone([...entries]),
+      ]),
+    );
+  private createdFolderSequence = 0;
   private readonly renamedEntries = new Map<string, FileEntrySummary>();
   private readonly movedParentIds = new Map<string, string>();
   private readonly removedEntryIds = new Set<string>();
@@ -729,8 +739,8 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     const root =
       roots[directory.locationId] ??
       this.dynamicRoots.get(directory.locationId);
-    const rootEntries = entriesByLocation[directory.id];
-    const isKnownChild = Object.values(entriesByLocation)
+    const rootEntries = this.entriesByDirectory[directory.id];
+    const isKnownChild = Object.values(this.entriesByDirectory)
       .flat()
       .some((entry) => entry.directory?.id === directory.id);
     const knownDirectory =
@@ -738,7 +748,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       this.dynamicRoots.has(directory.locationId) ||
       isKnownChild;
     const entries = knownDirectory
-      ? Object.entries(entriesByLocation)
+      ? Object.entries(this.entriesByDirectory)
           .flatMap(([parentId, entries]) =>
             entries.map((entry) => ({ entry, parentId })),
           )
@@ -758,16 +768,28 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     }
 
     await wait(90, signal);
+    const ancestors: DirectoryRef[] = [directory];
+    const visited = new Set([directory.id]);
+    while (ancestors[0].id !== root.id) {
+      const current = ancestors[0];
+      const parentId =
+        this.movedParentIds.get(current.id) ??
+        Object.entries(this.entriesByDirectory).find(([, entries]) =>
+          entries.some((entry) => entry.reference.id === current.id),
+        )?.[0];
+      const parent =
+        (parentId ? this.findDemoDirectory(parentId) : undefined) ?? root;
+      if (visited.has(parent.id)) break;
+      visited.add(parent.id);
+      ancestors.unshift(parent);
+    }
     onStart({
       directory,
-      parent: directory.id === root.id ? null : root,
-      breadcrumbs:
-        directory.id === root.id
-          ? [{ label: root.name, directory: root }]
-          : [
-              { label: root.name, directory: root },
-              { label: directory.name, directory },
-            ],
+      parent: ancestors.length > 1 ? ancestors[ancestors.length - 2] : null,
+      breadcrumbs: ancestors.map((ancestor) => ({
+        label: ancestor.name,
+        directory: ancestor,
+      })),
     });
     const splitAt = Math.min(4, entries.length);
     if (splitAt > 0) {
@@ -779,6 +801,76 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       onBatch({ entries: entries.slice(splitAt), replace: false });
     }
     onComplete({ skippedEntries: 0 });
+  }
+
+  async createFolder(
+    parent: DirectoryRef,
+    name: string,
+    signal: AbortSignal,
+  ): Promise<FileEntrySummary> {
+    await wait(40, signal);
+    const directory = this.findDemoDirectory(parent.id);
+    if (
+      !directory ||
+      directory.locationId !== parent.locationId ||
+      !directory.capabilities.createFolder
+    ) {
+      throw new Error("This folder cannot contain new folders.");
+    }
+    if (
+      !name ||
+      new TextEncoder().encode(name).length > 255 ||
+      name === "." ||
+      name === ".." ||
+      name.includes("/") ||
+      name.includes("\0")
+    ) {
+      throw new Error("Enter a valid folder name between 1 and 255 bytes.");
+    }
+    const siblings: FileEntrySummary[] = [];
+    await this.listDirectory(parent, {
+      signal,
+      onStart: () => {},
+      onBatch: ({ entries }) => siblings.push(...entries),
+      onComplete: () => {},
+    });
+    if (siblings.some((entry) => entry.name === name))
+      throw new Error("An item with that name already exists.");
+    const id = `created-folder-${++this.createdFolderSequence}`;
+    const displayPath = `${parent.displayPath}/${name}`;
+    const entry: FileEntrySummary = {
+      reference: { id, locationId: parent.locationId },
+      name,
+      kind: "directory",
+      contentKind: "folder",
+      size: null,
+      modifiedAt: Date.now(),
+      displayPath,
+      directory: {
+        id,
+        locationId: parent.locationId,
+        name,
+        displayPath,
+        capabilities: localDirectoryCapabilities,
+      },
+      capabilities: {
+        rename: true,
+        move: true,
+        trash:
+          (
+            locations.find((location) => location.id === parent.locationId) ??
+            this.dynamicLocations.get(parent.locationId)
+          )?.kind !== "ssh",
+        deletePermanently: true,
+      },
+      nativeOpen: "none",
+    };
+    this.entriesByDirectory[parent.id] = [
+      ...(this.entriesByDirectory[parent.id] ?? []),
+      entry,
+    ];
+    this.entriesByDirectory[id] = [];
+    return entry;
   }
 
   async renameEntry(
@@ -801,7 +893,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       throw new Error("Enter a valid file name between 1 and 255 bytes.");
     }
 
-    const siblings = Object.values(entriesByLocation)
+    const siblings = Object.values(this.entriesByDirectory)
       .find((entries) =>
         entries.some(
           (candidate) => candidate.reference.id === entry.reference.id,
@@ -859,7 +951,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
 
     const sourceParentId =
       this.movedParentIds.get(entry.reference.id) ??
-      Object.entries(entriesByLocation).find(([, entries]) =>
+      Object.entries(this.entriesByDirectory).find(([, entries]) =>
         entries.some(
           (candidate) => candidate.reference.id === entry.reference.id,
         ),
@@ -881,7 +973,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       };
     }
 
-    const destinationEntries = Object.entries(entriesByLocation)
+    const destinationEntries = Object.entries(this.entriesByDirectory)
       .flatMap(([parentId, entries]) =>
         entries.map((candidate) => ({ candidate, parentId })),
       )
@@ -1100,7 +1192,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     entry: FileEntrySummary,
     kind: FileRemovalResult["kind"],
   ): FileRemovalResult {
-    const invalidatedEntryIds = Object.values(entriesByLocation)
+    const invalidatedEntryIds = Object.values(this.entriesByDirectory)
       .flat()
       .filter(
         (candidate) =>
@@ -1182,7 +1274,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
   private findDemoDirectory(id: string): DirectoryRef | undefined {
     return (
       Object.values(roots).find((directory) => directory.id === id) ??
-      Object.values(entriesByLocation)
+      Object.values(this.entriesByDirectory)
         .flat()
         .find((entry) => entry.directory?.id === id)?.directory ??
       [...this.dynamicRoots.values()].find((directory) => directory.id === id)

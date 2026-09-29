@@ -82,6 +82,7 @@
       <Table.Body>
         {#each state.visibleEntries as entry (entry.reference.id)}
           <Table.Row
+            data-file-entry
             data-state={state.isEntrySelected(entry.reference.id)
               ? "selected"
               : undefined}
@@ -152,6 +153,11 @@
     </Table.Root>
   </ContextMenu.Trigger>
   <ContextMenu.Content>
+    <ContextMenu.Item
+      disabled={!state.canCreateFolder}
+      onclick={() => state.startNewFolder()}>New folder</ContextMenu.Item
+    >
+    <ContextMenu.Separator />
     <ContextMenu.Item
       disabled={state.selectedEntries.length !== 1}
       onclick={() => {

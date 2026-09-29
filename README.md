@@ -8,6 +8,12 @@ bounded Quick Preview for local text, source, common raster-image, and PDF files
 Local and SSH files, directories, and symlinks can be renamed, moved within one
 backend location, and permanently deleted through a capability-driven,
 cancellable Rust operation boundary. Local entries also use native Trash.
+New Folder creates empty folders in local and connected SSH/SFTP locations from
+the toolbar, file-view context menu, or Cmd+Shift+N (macOS) / Ctrl+Shift+N
+(Windows/Linux). The naming dialog preserves failed drafts, never replaces an
+existing item, and selects the created folder after success. See
+[`docs/adr/0013-new-folder.md`](docs/adr/0013-new-folder.md) for creation,
+cancellation, and remote uncertainty semantics.
 Double-click, Enter, and the Open context action launch local files with their
 default native application while Space remains Quick Preview. SSH files open as
 bounded, cancellable, read-only local snapshots; large or unknown downloads

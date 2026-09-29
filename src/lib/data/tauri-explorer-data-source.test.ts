@@ -15,7 +15,7 @@ const root: DirectoryRef = {
   locationId: "home",
   name: "Home",
   displayPath: "/Users/test",
-  capabilities: { acceptMove: true, atomicReplace: false },
+  capabilities: { createFolder: true, acceptMove: true, atomicReplace: false },
 };
 
 const locationPayload = {
@@ -71,7 +71,7 @@ const destination: DirectoryRef = {
   locationId: "home",
   name: "Archive",
   displayPath: "/Users/test/Archive",
-  capabilities: { acceptMove: true, atomicReplace: false },
+  capabilities: { createFolder: true, acceptMove: true, atomicReplace: false },
 };
 
 const sshTargetPayload = {
@@ -107,7 +107,11 @@ const volumePayload = {
     locationId: "volume:test",
     name: "Test Volume",
     displayPath: "/Volumes/Test Volume",
-    capabilities: { acceptMove: true, atomicReplace: false },
+    capabilities: {
+      createFolder: true,
+      acceptMove: true,
+      atomicReplace: false,
+    },
   },
 };
 
@@ -153,6 +157,123 @@ afterEach(() => {
 });
 
 describe("TauriExplorerDataSource", () => {
+  it("creates a folder through the operation lifecycle with an opaque parent and no sources", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload))
+        throw new Error("Expected arguments");
+      expect(Reflect.get(payload, "request")).toEqual({
+        sources: [],
+        action: { kind: "createFolder", parent: root, name: "Archive" },
+      });
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "completed",
+          operationId: "create-1",
+          sequence: 2,
+          action: "createFolder",
+          completedItems: 1,
+          totalItems: 1,
+          outcome: {
+            kind: "folderCreated",
+            entry: {
+              ...entryPayload,
+              reference: { id: destination.id, locationId: root.locationId },
+              name: "Archive",
+              kind: "directory",
+              contentKind: "folder",
+              nativeOpen: "none",
+              directory: destination,
+            },
+          },
+        },
+      ]);
+      return "create-1";
+    });
+    await expect(
+      new TauriExplorerDataSource().createFolder(
+        root,
+        "Archive",
+        new AbortController().signal,
+      ),
+    ).resolves.toMatchObject({ name: "Archive", directory: destination });
+  });
+
+  it.each(["renamed", "wrongLocation", "file", "wrongName"])(
+    "rejects inconsistent folder creation outcomes: %s",
+    async (variant) => {
+      mockIPC((command, payload) => {
+        if (command !== "start_file_operation") return null;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload))
+          throw new Error("Expected arguments");
+        sendChannelMessages(Reflect.get(payload, "onEvent"), [
+          {
+            event: "completed",
+            operationId: "create-1",
+            sequence: 2,
+            action: "createFolder",
+            completedItems: 1,
+            totalItems: 1,
+            outcome: {
+              kind: variant === "renamed" ? "renamed" : "folderCreated",
+              entry: {
+                ...entryPayload,
+                reference: {
+                  id: destination.id,
+                  locationId:
+                    variant === "wrongLocation" ? "other" : root.locationId,
+                },
+                name: variant === "wrongName" ? "Elsewhere" : "Archive",
+                kind: variant === "file" ? "file" : "directory",
+                contentKind: "folder",
+                nativeOpen: "none",
+                directory: variant === "file" ? null : destination,
+              },
+            },
+          },
+        ]);
+        return "create-1";
+      });
+      await expect(
+        new TauriExplorerDataSource().createFolder(
+          root,
+          "Archive",
+          new AbortController().signal,
+        ),
+      ).rejects.toThrow(/Invalid filesystem response/);
+    },
+  );
+
+  it("preserves typed uncertainty from a dispatched folder creation", async () => {
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload))
+        throw new Error("Expected arguments");
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "failed",
+          operationId: "create-1",
+          sequence: 2,
+          action: "createFolder",
+          completedItems: 0,
+          totalItems: 1,
+          outcome: null,
+          error: {
+            code: "outcomeUncertain",
+            message: "Reconnect and refresh before trying again.",
+          },
+        },
+      ]);
+      return "create-1";
+    });
+    await expect(
+      new TauriExplorerDataSource().createFolder(
+        root,
+        "Archive",
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: "outcomeUncertain" });
+  });
   it("validates locations and streams typed directory events", async () => {
     mockIPC((command, payload) => {
       if (command === "list_locations") return [locationPayload];

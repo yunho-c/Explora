@@ -53,6 +53,64 @@ const renderShell = (state: ExplorerState) => {
 };
 
 describe("ExplorerShell", () => {
+  it("creates a folder with the keyboard, reports conflicts accessibly, and restores selection focus", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    await fireEvent.keyDown(window, {
+      key: "N",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    const dialog = await screen.findByRole("dialog", { name: "New folder" });
+    const input = within(dialog).getByLabelText("Folder name");
+    await waitFor(() => expect(input).toHaveFocus());
+    await fireEvent.input(input, { target: { value: "Projects" } });
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Create" }),
+    );
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "already exists",
+    );
+    expect(input).toHaveAttribute("aria-invalid", "true");
+    await fireEvent.input(input, { target: { value: "New project" } });
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Create" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "New folder" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(state.selectedEntry?.name).toBe("New project");
+    await waitFor(() =>
+      expect(screen.getByRole("row", { name: /New project/ })).toHaveFocus(),
+    );
+    state.dispose();
+  });
+
+  it("keeps New Folder shortcuts out of terminal input and other dialogs", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    const { container } = renderShell(state);
+    const terminal = document.createElement("textarea");
+    terminal.setAttribute("data-terminal-surface", "");
+    container.appendChild(terminal);
+    await fireEvent.keyDown(terminal, {
+      key: "N",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    expect(state.newFolderParent).toBeNull();
+    state.startNewFolder();
+    const input = await screen.findByLabelText("Folder name");
+    const rename = vi.spyOn(state, "startRename");
+    await fireEvent.keyDown(input, { key: "F2" });
+    expect(rename).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(state.newFolderParent).toBeNull());
+    state.dispose();
+  });
   it("composes the terminal as a resizable pane above the stable status bar", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();

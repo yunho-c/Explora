@@ -51,7 +51,11 @@ class StaleResultDataSource extends DemoExplorerDataSource {
         locationId: "home",
         name: "Home",
         displayPath: "Home",
-        capabilities: { acceptMove: true, atomicReplace: false },
+        capabilities: {
+          createFolder: true,
+          acceptMove: true,
+          atomicReplace: false,
+        },
       },
       breadcrumbs: [{ label: directory.name, directory }],
     });
@@ -225,6 +229,103 @@ class PartialBatchMoveDataSource extends DemoExplorerDataSource {
 }
 
 describe("ExplorerState", () => {
+  it("creates and selects folders, preserves conflicting drafts, and navigates into the new folder", async () => {
+    const state = await initializedState();
+    state.startNewFolder();
+    state.newFolderName = "Projects";
+    await state.createFolder();
+    expect(state.newFolderErrorMessage).toMatch(/already exists/);
+    expect(state.newFolderName).toBe("Projects");
+    state.newFolderName = "Created folder";
+    await state.createFolder();
+    expect(state.newFolderParent).toBeNull();
+    expect(state.selectedEntry?.name).toBe("Created folder");
+    const id = state.selectedEntryId!;
+    await state.openEntry(id);
+    expect(state.activeDirectory?.name).toBe("Created folder");
+    expect(state.entries).toHaveLength(0);
+    state.startNewFolder();
+    state.newFolderName = "Nested";
+    await state.createFolder();
+    expect(state.selectedEntry?.name).toBe("Nested");
+    state.dispose();
+  });
+
+  it("keeps empty and invalid folder names editable and cancels without mutation", async () => {
+    const state = await initializedState();
+    const count = state.entries.length;
+    state.startNewFolder();
+    await state.createFolder();
+    expect(state.newFolderErrorMessage).toBe("Enter a folder name.");
+    state.newFolderName = "../escape";
+    await state.createFolder();
+    expect(state.newFolderErrorMessage).toMatch(/valid folder name/);
+    state.cancelNewFolder();
+    expect(state.newFolderParent).toBeNull();
+    state.startNewFolder();
+    state.newFolderName = "Cancelled";
+    const creation = state.createFolder();
+    state.cancelNewFolder();
+    await creation;
+    expect(state.entries).toHaveLength(count);
+    expect(state.newFolderParent).toBeNull();
+    state.dispose();
+  });
+
+  it("gates New Folder using directory capabilities and connection state", async () => {
+    const state = await initializedState();
+    expect(state.canCreateFolder).toBe(true);
+    state.activeTab!.directory = {
+      ...state.activeDirectory!,
+      capabilities: {
+        ...state.activeDirectory!.capabilities,
+        createFolder: false,
+      },
+    };
+    expect(state.canCreateFolder).toBe(false);
+    state.startNewFolder();
+    expect(state.newFolderParent).toBeNull();
+    await state.connectSshTarget(state.sshTargets[0].id);
+    expect(state.canCreateFolder).toBe(true);
+    state.startNewFolder();
+    state.newFolderName = "Remote folder";
+    await state.createFolder();
+    expect(state.selectedEntry?.name).toBe("Remote folder");
+    await state.disconnectSshTarget(state.activeSshTarget!.id);
+    expect(state.canCreateFolder).toBe(false);
+    state.dispose();
+  });
+
+  it("does not insert a late folder creation into another location", async () => {
+    const source = new DemoExplorerDataSource();
+    const original = source.createFolder.bind(source);
+    let complete: (() => void) | undefined;
+    vi.spyOn(source, "createFolder").mockImplementation(
+      async (parent, name, signal) => {
+        await new Promise<void>((resolve) => {
+          complete = resolve;
+        });
+        return original(parent, name, signal);
+      },
+    );
+    const state = new ExplorerState(source);
+    await state.initialize();
+    state.startNewFolder();
+    state.newFolderName = "Home folder";
+    const creation = state.createFolder();
+    await state.selectLocation("downloads");
+    complete?.();
+    await creation;
+    expect(state.activeDirectory?.locationId).toBe("downloads");
+    expect(state.entries.some((entry) => entry.name === "Home folder")).toBe(
+      false,
+    );
+    await state.selectLocation("home");
+    expect(state.entries.some((entry) => entry.name === "Home folder")).toBe(
+      true,
+    );
+    state.dispose();
+  });
   it("renames an entry while preserving selection and opaque identity", async () => {
     const state = await initializedState();
     const entry = state.entries.find(({ name }) => name === "explora-notes.md");
@@ -805,7 +906,11 @@ describe("ExplorerState", () => {
       locationId: "home",
       name: "Missing",
       displayPath: "Home/Missing",
-      capabilities: { acceptMove: true, atomicReplace: false },
+      capabilities: {
+        createFolder: true,
+        acceptMove: true,
+        atomicReplace: false,
+      },
     });
 
     expect(state.activeDirectory?.name).toBe("Home");
