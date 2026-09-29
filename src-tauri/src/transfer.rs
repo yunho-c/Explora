@@ -8,18 +8,13 @@ use std::{
 
 use uuid::Uuid;
 
+use crate::local_metadata::{self, FileIdentity};
 use crate::{filesystem::ExplorerError, local_relocate::relocate_no_replace};
 
 pub(crate) const TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 const MAX_PARTIAL_NAME_ATTEMPTS: usize = 32;
 pub(crate) const MAX_LOCAL_TRANSFER_ENTRIES: usize = 100_000;
 pub(crate) const MAX_LOCAL_TRANSFER_DEPTH: usize = 256;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct TransferFileIdentity {
-    volume: u64,
-    file: u64,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocalTransferEntryKind {
@@ -34,7 +29,7 @@ pub(crate) struct LocalTransferPlanEntry {
     pub(crate) kind: LocalTransferEntryKind,
     pub(crate) len: u64,
     modified: Option<SystemTime>,
-    identity: Option<TransferFileIdentity>,
+    identity: Option<FileIdentity>,
     permission_fingerprint: u64,
     pub(crate) link_target: Option<PathBuf>,
     pub(crate) permissions: fs::Permissions,
@@ -178,29 +173,6 @@ impl LocalTransferPlan {
 }
 
 #[cfg(unix)]
-fn transfer_file_identity(metadata: &fs::Metadata) -> Option<TransferFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    Some(TransferFileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn transfer_file_identity(metadata: &fs::Metadata) -> Option<TransferFileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-    Some(TransferFileIdentity {
-        volume: u64::from(metadata.volume_serial_number()?),
-        file: metadata.file_index()?,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn transfer_file_identity(_metadata: &fs::Metadata) -> Option<TransferFileIdentity> {
-    None
-}
-
-#[cfg(unix)]
 fn transfer_permission_fingerprint(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::PermissionsExt;
     u64::from(metadata.permissions().mode())
@@ -236,7 +208,7 @@ pub(crate) struct OwnedLocalTransferArtifact {
     finalized: bool,
     preserved: bool,
     bytes_written: u64,
-    identity: Option<TransferFileIdentity>,
+    identity: Option<FileIdentity>,
 }
 
 impl OwnedLocalTransferArtifact {
@@ -306,10 +278,7 @@ impl OwnedLocalTransferArtifact {
             }
             match options.open(&owned_path) {
                 Ok(file) => {
-                    let identity = file
-                        .metadata()
-                        .ok()
-                        .and_then(|metadata| transfer_file_identity(&metadata));
+                    let identity = local_metadata::file_identity(&file).ok().flatten();
                     return Ok(Self {
                         file: Some(file),
                         owned_path,
@@ -337,17 +306,19 @@ impl OwnedLocalTransferArtifact {
         let final_path = validate_artifact_destination(destination_directory, final_name)?;
         for _ in 0..MAX_PARTIAL_NAME_ATTEMPTS {
             let owned_path = next_partial_path(destination_directory);
-            let mut builder = DirBuilder::new();
+            let builder = DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut builder = builder;
                 builder.mode(0o700);
-            }
+                builder
+            };
             match builder.create(&owned_path) {
                 Ok(()) => {
-                    let identity = fs::symlink_metadata(&owned_path)
+                    let identity = local_metadata::symlink_metadata(&owned_path)
                         .ok()
-                        .and_then(|metadata| transfer_file_identity(&metadata));
+                        .and_then(|(_, identity)| identity);
                     return Ok(Self {
                         file: None,
                         owned_path,
@@ -379,9 +350,9 @@ impl OwnedLocalTransferArtifact {
             let owned_path = next_partial_path(destination_directory);
             match create_local_symlink(target, &owned_path, target_is_directory) {
                 Ok(()) => {
-                    let identity = fs::symlink_metadata(&owned_path)
+                    let identity = local_metadata::symlink_metadata(&owned_path)
                         .ok()
-                        .and_then(|metadata| transfer_file_identity(&metadata));
+                        .and_then(|(_, identity)| identity);
                     return Ok(Self {
                         file: None,
                         owned_path,
@@ -539,9 +510,9 @@ impl Drop for OwnedLocalTransferArtifact {
             return;
         }
         self.file.take();
-        let current_identity = fs::symlink_metadata(&self.owned_path)
+        let current_identity = local_metadata::symlink_metadata(&self.owned_path)
             .ok()
-            .and_then(|metadata| transfer_file_identity(&metadata));
+            .and_then(|(_, identity)| identity);
         if self.identity.is_some() && current_identity == self.identity {
             remove_owned_artifact(&self.owned_path, self.kind);
         }
@@ -697,7 +668,7 @@ pub(crate) fn plan_local_transfer(
                     .to_owned(),
             ));
         }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        let (metadata, identity) = local_metadata::symlink_metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ExplorerError::SourceChanged
             } else {
@@ -734,7 +705,7 @@ pub(crate) fn plan_local_transfer(
             kind,
             len: metadata.len(),
             modified: metadata.modified().ok(),
-            identity: transfer_file_identity(&metadata),
+            identity,
             permission_fingerprint: transfer_permission_fingerprint(&metadata),
             link_target,
             permissions: metadata.permissions(),
@@ -921,7 +892,7 @@ fn ensure_planned_source_entry_identity(
     entry: &LocalTransferPlanEntry,
     path: &Path,
 ) -> Result<(), ExplorerError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
+    let (metadata, identity) = local_metadata::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ExplorerError::SourceChanged
         } else {
@@ -940,7 +911,7 @@ fn ensure_planned_source_entry_identity(
     } else {
         return Err(ExplorerError::SourceChanged);
     };
-    if kind != entry.kind || transfer_file_identity(&metadata) != entry.identity {
+    if kind != entry.kind || identity != entry.identity {
         return Err(ExplorerError::SourceChanged);
     }
     if let LocalTransferEntryKind::Symlink { .. } = kind {
@@ -957,7 +928,7 @@ fn ensure_planned_source_entry_unchanged(
     entry: &LocalTransferPlanEntry,
 ) -> Result<(), ExplorerError> {
     let path = transfer_entry_path(&plan.source_root, &entry.relative_path);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+    let (metadata, identity) = local_metadata::symlink_metadata(&path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             ExplorerError::SourceChanged
         } else {
@@ -984,7 +955,7 @@ fn ensure_planned_source_entry_unchanged(
     if kind != entry.kind
         || metadata.len() != entry.len
         || metadata.modified().ok() != entry.modified
-        || transfer_file_identity(&metadata) != entry.identity
+        || identity != entry.identity
         || transfer_permission_fingerprint(&metadata) != entry.permission_fingerprint
         || link_target != entry.link_target
     {
@@ -994,12 +965,14 @@ fn ensure_planned_source_entry_unchanged(
 }
 
 fn create_owned_directory(path: &Path) -> Result<(), ExplorerError> {
-    let mut builder = DirBuilder::new();
+    let builder = DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder
         .create(path)
         .map_err(|error| ExplorerError::io("create", path, error))

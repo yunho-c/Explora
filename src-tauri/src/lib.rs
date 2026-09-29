@@ -2,6 +2,7 @@ mod commands;
 mod file_operations;
 mod filesystem;
 mod local_filesystem;
+mod local_metadata;
 mod local_relocate;
 mod native_open;
 mod platform_trash;

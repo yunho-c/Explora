@@ -17,6 +17,7 @@ use crate::filesystem::{
     EntryCapabilitiesDto, EntryRefDto, ExplorerError, FileEntrySummaryDto, LocationRole,
     LocationSummaryDto, LISTING_BATCH_SIZE,
 };
+use crate::local_metadata::{self, FileIdentity};
 use crate::local_relocate::relocate_no_replace;
 use crate::platform_trash::PlatformTrash;
 use crate::transfer::{
@@ -45,12 +46,6 @@ struct PathRegistryInner {
     identities_by_id: HashMap<String, Option<FileIdentity>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    volume: u64,
-    file: u64,
-}
-
 #[derive(Default)]
 struct PathRegistry {
     inner: Mutex<PathRegistryInner>,
@@ -58,9 +53,9 @@ struct PathRegistry {
 
 impl PathRegistry {
     fn register(&self, location_id: &str, path: PathBuf) -> Result<String, ExplorerError> {
-        let identity = fs::symlink_metadata(&path)
+        let identity = local_metadata::symlink_metadata(&path)
             .ok()
-            .and_then(|metadata| metadata_identity(&metadata));
+            .and_then(|(_, identity)| identity);
         let mut inner = self
             .inner
             .lock()
@@ -115,14 +110,13 @@ impl PathRegistry {
                 inner.identities_by_id.get(id).copied().flatten(),
             )
         };
-        let current_metadata = fs::symlink_metadata(&path).map_err(|error| {
+        let (_, current_identity) = local_metadata::symlink_metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 ExplorerError::SourceChanged
             } else {
                 ExplorerError::io("inspect", &path, error)
             }
         })?;
-        let current_identity = metadata_identity(&current_metadata);
         if expected_identity.is_some() && current_identity != expected_identity {
             return Err(ExplorerError::SourceChanged);
         }
@@ -525,17 +519,18 @@ impl LocalFilesystem {
             return self.describe_path(source_path, &entry.location_id);
         }
 
-        let source_metadata = fs::symlink_metadata(&source_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ExplorerError::SourceChanged
-            } else {
-                ExplorerError::io("inspect", &source_path, error)
-            }
-        })?;
+        let (_, source_identity) =
+            local_metadata::symlink_metadata(&source_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ExplorerError::SourceChanged
+                } else {
+                    ExplorerError::io("inspect", &source_path, error)
+                }
+            })?;
         let destination_path = parent.join(new_name);
-        match fs::symlink_metadata(&destination_path) {
-            Ok(destination_metadata) => {
-                if !same_entry(&source_metadata, &destination_metadata) {
+        match local_metadata::symlink_metadata(&destination_path) {
+            Ok((_, destination_identity)) => {
+                if source_identity.is_none() || source_identity != destination_identity {
                     return Err(ExplorerError::Conflict);
                 }
                 rename_case_only(&source_path, &destination_path)?;
@@ -1465,29 +1460,31 @@ impl LocalFilesystem {
             return Err(ExplorerError::InvalidReference);
         }
 
-        let destination_metadata = fs::symlink_metadata(&destination_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ExplorerError::DestinationUnavailable(
-                    "The destination folder is no longer available.".to_owned(),
-                )
-            } else {
-                ExplorerError::io("inspect", &destination_path, error)
-            }
-        })?;
+        let (destination_metadata, destination_identity) =
+            local_metadata::symlink_metadata(&destination_path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ExplorerError::DestinationUnavailable(
+                        "The destination folder is no longer available.".to_owned(),
+                    )
+                } else {
+                    ExplorerError::io("inspect", &destination_path, error)
+                }
+            })?;
         if !destination_metadata.file_type().is_dir() {
             return Err(ExplorerError::DestinationUnavailable(
                 "Choose a folder that can accept moved items.".to_owned(),
             ));
         }
-        let source_metadata = fs::symlink_metadata(source_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ExplorerError::SourceChanged
-            } else {
-                ExplorerError::io("inspect", source_path, error)
-            }
-        })?;
-        if metadata_identity(&source_metadata).map(|identity| identity.volume)
-            != metadata_identity(&destination_metadata).map(|identity| identity.volume)
+        let (source_metadata, source_identity) = local_metadata::symlink_metadata(source_path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    ExplorerError::SourceChanged
+                } else {
+                    ExplorerError::io("inspect", source_path, error)
+                }
+            })?;
+        if source_identity.map(|identity| identity.volume)
+            != destination_identity.map(|identity| identity.volume)
         {
             return Err(ExplorerError::Unsupported(
                 "Moving between filesystems requires a verified transfer, which is not available yet."
@@ -1668,35 +1665,6 @@ fn validate_entry_name(name: &str) -> Result<(), ExplorerError> {
     }
 
     Ok(())
-}
-
-#[cfg(unix)]
-fn metadata_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-
-    Some(FileIdentity {
-        volume: metadata.dev(),
-        file: metadata.ino(),
-    })
-}
-
-#[cfg(windows)]
-fn metadata_identity(metadata: &fs::Metadata) -> Option<FileIdentity> {
-    use std::os::windows::fs::MetadataExt;
-
-    Some(FileIdentity {
-        volume: u64::from(metadata.volume_serial_number()?),
-        file: metadata.file_index()?,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn metadata_identity(_metadata: &fs::Metadata) -> Option<FileIdentity> {
-    None
-}
-
-fn same_entry(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    metadata_identity(left).is_some() && metadata_identity(left) == metadata_identity(right)
 }
 
 fn relocate_keep_both(
