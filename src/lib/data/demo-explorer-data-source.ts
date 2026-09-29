@@ -5,6 +5,7 @@ import type {
   FileOperationBatchResult,
   FileOperationItemOutcome,
   FileMoveResult,
+  FileCopyResult,
   FileOperationConfirmation,
   FileOperationPrompt,
   FileOperationPromptResponse,
@@ -31,12 +32,14 @@ import type {
 
 const localDirectoryCapabilities = {
   createFolder: true,
+  acceptCopy: true,
   acceptMove: true,
   atomicReplace: false,
 } as const;
 
 const unavailableDirectoryCapabilities = {
   createFolder: false,
+  acceptCopy: false,
   acceptMove: false,
   atomicReplace: false,
 } as const;
@@ -250,6 +253,7 @@ const makeEntry = (
     detail,
     capabilities: {
       rename: true,
+      copy: true,
       move: true,
       trash: !remote,
       deletePermanently: true,
@@ -855,6 +859,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       },
       capabilities: {
         rename: true,
+        copy: true,
         move: true,
         trash:
           (
@@ -928,6 +933,128 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     return renamed;
   }
 
+  async copyEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileCopyResult> {
+    await wait(40, options.signal);
+    if (!entry.capabilities.copy || !destination.capabilities.acceptCopy) {
+      throw new Error("This item cannot be copied to that folder.");
+    }
+    if (
+      entry.directory &&
+      entry.reference.locationId === destination.locationId &&
+      (entry.directory.id === destination.id ||
+        destination.displayPath.startsWith(`${entry.displayPath}/`))
+    ) {
+      throw new Error(
+        "A folder cannot be copied into itself or one of its subfolders.",
+      );
+    }
+    const currentEntries = (parentId: string) =>
+      Object.entries(this.entriesByDirectory)
+        .flatMap(([id, entries]) =>
+          entries.filter(
+            (candidate) =>
+              !this.removedEntryIds.has(candidate.reference.id) &&
+              (this.movedParentIds.get(candidate.reference.id) ?? id) ===
+                parentId,
+          ),
+        )
+        .map(
+          (candidate) =>
+            this.renamedEntries.get(candidate.reference.id) ?? candidate,
+        );
+    const exists = Object.values(this.entriesByDirectory)
+      .flat()
+      .some(
+        (candidate) =>
+          candidate.reference.id === entry.reference.id &&
+          !this.removedEntryIds.has(candidate.reference.id),
+      );
+    if (!exists) throw new Error("The source is no longer available.");
+    const siblings = currentEntries(destination.id);
+    let name = entry.name;
+    if (siblings.some((candidate) => candidate.name === name)) {
+      const response = await this.awaitTransferConflict(
+        entry,
+        destination,
+        options,
+      );
+      if (response === "cancel") throw abortError();
+      if (response === "skip")
+        return {
+          kind: "copySkipped",
+          entry: entry.reference,
+          name: entry.name,
+        };
+      if (response !== "keepBoth")
+        throw new Error("The copy conflict response was not valid.");
+      let attempt = 1;
+      do {
+        const suffix = attempt === 1 ? " copy" : ` copy ${attempt}`;
+        const dot =
+          entry.kind === "directory" ? -1 : entry.name.lastIndexOf(".");
+        name =
+          dot > 0
+            ? `${entry.name.slice(0, dot)}${suffix}${entry.name.slice(dot)}`
+            : `${entry.name}${suffix}`;
+        attempt += 1;
+      } while (siblings.some((candidate) => candidate.name === name));
+    }
+    await wait(40, options.signal);
+    const clone = (
+      source: FileEntrySummary,
+      parent: DirectoryRef,
+      name = source.name,
+    ): FileEntrySummary => {
+      const id = `copied-entry-${++this.createdFolderSequence}`;
+      const displayPath = `${parent.displayPath}/${name}`;
+      const directory = source.directory
+        ? {
+            id,
+            locationId: parent.locationId,
+            name,
+            displayPath,
+            capabilities: parent.capabilities,
+          }
+        : null;
+      const copied = {
+        ...source,
+        reference: { id, locationId: parent.locationId },
+        name,
+        displayPath,
+        directory,
+      };
+      this.entriesByDirectory[parent.id] = [
+        ...(this.entriesByDirectory[parent.id] ?? []),
+        copied,
+      ];
+      if (directory && source.directory) {
+        this.entriesByDirectory[directory.id] = [];
+        for (const child of currentEntries(source.directory.id))
+          clone(child, directory);
+      }
+      return copied;
+    };
+    return {
+      kind: "copied",
+      entry: clone(entry, destination, name),
+      destination,
+    };
+  }
+
+  async copyEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    return this.runBatch(entries, options, (entry) =>
+      this.copyEntry(entry, destination, options),
+    );
+  }
+
   async moveEntry(
     entry: FileEntrySummary,
     destination: DirectoryRef,
@@ -989,7 +1116,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       );
     let name = entry.name;
     if (destinationEntries.some((candidate) => candidate.name === name)) {
-      const response = await this.awaitMoveConflict(
+      const response = await this.awaitTransferConflict(
         entry,
         destination,
         options,
@@ -1281,7 +1408,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
     );
   }
 
-  private awaitMoveConflict(
+  private awaitTransferConflict(
     entry: FileEntrySummary,
     destination: DirectoryRef,
     { signal, onPrompt }: FileOperationOptions,
@@ -1300,7 +1427,7 @@ export class DemoExplorerDataSource implements ExplorerDataSource {
       signal.addEventListener("abort", abort, { once: true });
       const prompt: FileOperationPrompt = {
         id: `demo-move-${entry.reference.id}`,
-        kind: "moveConflict",
+        kind: "transferConflict",
         title: `“${entry.name}” already exists`,
         message: `Choose how to handle the existing item in “${destination.name}”. Nothing will be replaced.`,
         targetName: entry.name,

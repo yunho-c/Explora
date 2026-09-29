@@ -1,5 +1,62 @@
 import { expect, test } from "@playwright/test";
 
+test("copies repeatedly with the keyboard and keeps source items after conflicts", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const source = page.getByRole("row", { name: /explora-notes.md/ });
+  await expect(source).toBeVisible();
+  await source.click();
+  await page.keyboard.press("ControlOrMeta+c");
+  await expect(page.getByRole("status")).toContainText("is ready to copy");
+  await page.getByRole("row", { name: /Projects/ }).dblclick();
+  await expect(page.getByText("This location is empty")).toBeVisible();
+  await page.keyboard.press("ControlOrMeta+v");
+  await expect(source).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ControlOrMeta+v");
+  const conflict = page.getByRole("dialog");
+  await expect(conflict).toContainText("already exists");
+  await conflict.getByRole("button", { name: "Keep Both" }).click();
+  await expect(
+    page.getByRole("row", { name: /explora-notes copy.md/ }),
+  ).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("ControlOrMeta+v");
+  await conflict.getByRole("button", { name: "Skip", exact: true }).click();
+  await expect(conflict).toBeHidden();
+  await page.getByRole("button", { name: "Go back", exact: true }).click();
+  await expect(source).toBeVisible();
+  await expect(page.getByRole("status")).toContainText("is ready to copy");
+});
+
+test("copies a folder to SSH from the grid and pastes into an empty folder", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(page.getByText("explora-notes.md")).toBeVisible();
+  await page.getByRole("button", { name: "Grid view" }).click();
+  await page
+    .getByRole("gridcell", { name: "Projects", exact: true })
+    .click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Copy", exact: true }).click();
+  await page
+    .getByRole("button", { name: "staging-box connected", exact: true })
+    .click();
+  await expect(
+    page.getByRole("gridcell", { name: "service.log" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "More options" }).click();
+  await page.getByRole("menuitem", { name: "New folder", exact: true }).click();
+  await page.getByLabel("Folder name").fill("Copy destination");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  await page.getByRole("gridcell", { name: "Copy destination" }).dblclick();
+  await page.getByText("This location is empty").click({ button: "right" });
+  await page.getByRole("menuitem", { name: "Paste into This Folder" }).click();
+  const copied = page.getByRole("gridcell", { name: "Projects", exact: true });
+  await expect(copied).toHaveAttribute("aria-selected", "true");
+  await copied.dblclick();
+  await expect(page.getByText("This location is empty")).toBeVisible();
+});
+
 test("creates folders from the menu and keyboard, retains conflicts, and cancels in an empty folder", async ({
   page,
 }) => {

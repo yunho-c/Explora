@@ -8,6 +8,7 @@ import type {
   FileEntrySummary,
   FileOperationBatchResult,
   FileMoveResult,
+  FileCopyResult,
   FileOperationPrompt,
   FileRemovalResult,
   ImagePreviewMode,
@@ -162,6 +163,7 @@ const parseDirectoryRef = (value: unknown): DirectoryRef => {
     displayPath: requireString(value, "displayPath"),
     capabilities: {
       createFolder: requireBoolean(value.capabilities, "createFolder"),
+      acceptCopy: requireBoolean(value.capabilities, "acceptCopy"),
       acceptMove: requireBoolean(value.capabilities, "acceptMove"),
       atomicReplace: requireBoolean(value.capabilities, "atomicReplace"),
     },
@@ -390,6 +392,7 @@ const parseEntry = (value: unknown): FileEntrySummary => {
   const capabilities = value.capabilities;
   const parsedCapabilities = {
     rename: requireBoolean(capabilities, "rename"),
+    copy: requireBoolean(capabilities, "copy"),
     move: requireBoolean(capabilities, "moveEntry"),
     trash: requireBoolean(capabilities, "trash"),
     deletePermanently: requireBoolean(capabilities, "deletePermanently"),
@@ -418,6 +421,7 @@ type FileOperationAction =
   | { kind: "createFolder"; parent: DirectoryRef; name: string }
   | { kind: "rename"; newName: string }
   | { kind: "move"; destination: DirectoryRef }
+  | { kind: "copy"; destination: DirectoryRef }
   | { kind: "trash" }
   | { kind: "deletePermanently" };
 
@@ -425,8 +429,68 @@ type FileOperationOutcome =
   | { kind: "folderCreated"; entry: FileEntrySummary }
   | { kind: "renamed"; entry: FileEntrySummary }
   | FileMoveResult
+  | FileCopyResult
   | FileRemovalResult
   | FileOperationBatchResult;
+
+const validateCopyResult = (
+  result: FileCopyResult | FileOperationBatchResult,
+  sources: readonly FileEntrySummary[],
+  destination: DirectoryRef,
+): void => {
+  const items =
+    result.kind === "batch"
+      ? result.items
+      : [
+          {
+            status: "completed" as const,
+            source: sources[0].reference,
+            outcome: result,
+          },
+        ];
+  if (items.length !== sources.length)
+    throw new Error(
+      "Invalid filesystem response: copy batch has the wrong source count.",
+    );
+  for (const [index, item] of items.entries()) {
+    const source = sources[index].reference;
+    if (
+      item.source.id !== source.id ||
+      item.source.locationId !== source.locationId
+    ) {
+      throw new Error(
+        "Invalid filesystem response: copy source does not match the request.",
+      );
+    }
+    if (item.status !== "completed") continue;
+    const outcome = item.outcome;
+    if (outcome.kind === "copied") {
+      if (
+        outcome.destination.id !== destination.id ||
+        outcome.destination.locationId !== destination.locationId ||
+        (outcome.entry.reference.id === source.id &&
+          outcome.entry.reference.locationId === source.locationId)
+      ) {
+        throw new Error(
+          "Invalid filesystem response: copy returned inconsistent destination identities.",
+        );
+      }
+    } else if (outcome.kind === "copySkipped") {
+      if (
+        outcome.entry.id !== source.id ||
+        outcome.entry.locationId !== source.locationId
+      ) {
+        throw new Error(
+          "Invalid filesystem response: skipped copy has the wrong source.",
+        );
+      }
+    } else {
+      throw new Error(
+        "Invalid filesystem response: copy returned the wrong item outcome.",
+      );
+    }
+  }
+};
 
 const parseEntryRef = (value: unknown) => {
   if (!isRecord(value)) {
@@ -533,7 +597,7 @@ const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
       confirmLabel: requireString(value, "confirmLabel"),
     };
   }
-  if (value.kind === "moveConflict") {
+  if (value.kind === "transferConflict") {
     if (!Array.isArray(value.decisions)) {
       throw new Error(
         "Invalid filesystem response: conflict decisions are malformed.",
@@ -562,7 +626,7 @@ const parseOperationPrompt = (value: unknown): FileOperationPrompt => {
     }
     return {
       id: requireString(value, "id"),
-      kind: "moveConflict",
+      kind: "transferConflict",
       title: requireString(value, "title"),
       message: requireString(value, "message"),
       targetName: requireString(value, "targetName"),
@@ -668,6 +732,26 @@ const parseOperationOutcome = (value: unknown): FileOperationOutcome => {
       );
     }
     return { kind: "batch", status: value.status, items };
+  }
+  if (value.kind === "copied") {
+    const entry = parseEntry(value.entry);
+    const destination = parseDirectoryRef(value.destination);
+    if (
+      entry.reference.locationId !== destination.locationId ||
+      entry.reference.id === destination.id
+    ) {
+      throw new Error(
+        "Invalid filesystem response: copied entry has an inconsistent destination.",
+      );
+    }
+    return { kind: "copied", entry, destination };
+  }
+  if (value.kind === "copySkipped") {
+    return {
+      kind: "copySkipped",
+      entry: parseEntryRef(value.entry),
+      name: requireString(value, "name"),
+    };
   }
   if (value.kind === "moved") {
     if (
@@ -1470,6 +1554,44 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
     return outcome.entry;
   }
 
+  async copyEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileCopyResult> {
+    const outcome = await this.runFileOperation(
+      [entry],
+      { kind: "copy", destination },
+      options,
+    );
+    if (outcome.kind !== "copied" && outcome.kind !== "copySkipped") {
+      throw new Error(
+        "Invalid filesystem response: copy returned the wrong outcome.",
+      );
+    }
+    validateCopyResult(outcome, [entry], destination);
+    return outcome;
+  }
+
+  async copyEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult> {
+    const outcome = await this.runFileOperation(
+      entries,
+      { kind: "copy", destination },
+      options,
+    );
+    if (outcome.kind !== "batch") {
+      throw new Error(
+        "Invalid filesystem response: batch copy returned the wrong outcome.",
+      );
+    }
+    validateCopyResult(outcome, entries, destination);
+    return outcome;
+  }
+
   async moveEntry(
     entry: FileEntrySummary,
     destination: DirectoryRef,
@@ -1649,7 +1771,7 @@ export class TauriExplorerDataSource implements ExplorerDataSource {
             (payload.event === "awaitingConfirmation" &&
               prompt.kind !== "permanentDelete") ||
             (payload.event === "awaitingConflict" &&
-              prompt.kind !== "moveConflict")
+              prompt.kind !== "transferConflict")
           ) {
             throw new Error(
               "Invalid filesystem response: operation prompt state is inconsistent.",

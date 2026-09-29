@@ -78,7 +78,7 @@
               disabled={pending.responding}
               onclick={() => void state.fileOperations.answerPrompt("keepBoth")}
             >
-              {pending.responding ? "Moving…" : "Keep Both"}
+              {pending.responding ? "Working…" : "Keep Both"}
             </Button>
           {/if}
         {/if}

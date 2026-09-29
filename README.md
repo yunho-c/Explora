@@ -14,6 +14,14 @@ the toolbar, file-view context menu, or Cmd+Shift+N (macOS) / Ctrl+Shift+N
 existing item, and selects the created folder after success. See
 [`docs/adr/0013-new-folder.md`](docs/adr/0013-new-folder.md) for creation,
 cancellation, and remote uncertainty semantics.
+Copy/Paste preserves files, folder trees, and supported symbolic links across
+local and SSH/SFTP locations. Use Copy/Paste in the toolbar or context menu, or
+Cmd+C/Cmd+V on macOS and Ctrl+C/Ctrl+V on Windows/Linux. Copies stay on the
+application-local clipboard for repeated pastes. Existing names offer Keep Both,
+Skip, or Cancel; nothing is overwritten. Progress and cancellation use the same
+verified transfer pipeline as moves. Clipboard interchange with other file
+managers is not yet supported. See
+[`docs/adr/0014-copy-paste.md`](docs/adr/0014-copy-paste.md).
 Double-click, Enter, and the Open context action launch local files with their
 default native application while Space remains Quick Preview. SSH files open as
 bounded, cancellable, read-only local snapshots; large or unknown downloads

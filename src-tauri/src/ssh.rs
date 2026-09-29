@@ -472,7 +472,7 @@ struct SshSession {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteMoveConflictPolicy {
+pub enum RemoteTransferConflictPolicy {
     Fail,
     KeepBoth,
 }
@@ -496,7 +496,7 @@ pub(crate) struct PreparedRemoteDestination {
     session: Arc<SshSession>,
     artifact: Option<OwnedRemoteTransferArtifact>,
     pub(crate) destination: DirectoryRefDto,
-    _mutation_guard: OwnedMutexGuard<()>,
+    _mutation_guard: Arc<OwnedMutexGuard<()>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,7 +532,7 @@ pub(crate) struct PreparedRemoteTransfer {
     pub(crate) source_parent: DirectoryRefDto,
     pub(crate) total_bytes: u64,
     pub(crate) permissions: Option<u32>,
-    _mutation_guard: OwnedMutexGuard<()>,
+    _mutation_guard: Arc<OwnedMutexGuard<()>>,
 }
 
 impl PreparedRemoteTransfer {
@@ -893,8 +893,25 @@ impl PreparedRemoteDestination {
             .take()
             .ok_or(ExplorerError::StateUnavailable)?;
         artifact.preserve();
-        let result = self.session.summary_for_registered_path(&final_path).await;
-        finish_remote_result(&self.session, result)
+        let result = async {
+            // Our partial/final creation changes the parent's fingerprint. Retain
+            // its opaque identity so another item in this batch can use it.
+            let parent_path = self.session.paths.resolve(&self.destination.id)?;
+            let metadata = self
+                .session
+                .sftp
+                .symlink_metadata(parent_path.clone())
+                .await
+                .map_err(map_sftp_error)?;
+            self.session
+                .paths
+                .register_with_metadata(parent_path, &metadata)?;
+            self.session.summary_for_registered_path(&final_path).await
+        }
+        .await;
+        finish_remote_result(&self.session, result).map_err(|_| ExplorerError::PartialCompletion(
+            "The copy was created, but its details could not be loaded. Refresh the destination before trying again.".to_owned(),
+        ))
     }
 
     pub(crate) async fn abandon(mut self) -> Result<(), ExplorerError> {
@@ -1183,7 +1200,7 @@ impl SshSession {
         &self,
         source: &EntryRefDto,
         destination: &DirectoryRefDto,
-        conflict_policy: RemoteMoveConflictPolicy,
+        conflict_policy: RemoteTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<MovedRemoteEntry, ExplorerError> {
         if destination.location_id != self.location_id {
@@ -1215,14 +1232,14 @@ impl SshSession {
 
         let original_name = remote_name(&source_path);
         let destination_entry_path = match conflict_policy {
-            RemoteMoveConflictPolicy::Fail => {
+            RemoteTransferConflictPolicy::Fail => {
                 let path = remote_join(&destination_path, &original_name);
                 self.ensure_remote_destination_absent(&path).await?;
                 ensure_not_cancelled(cancelled)?;
                 self.rename_no_replace(&source_path, &path).await?;
                 path
             }
-            RemoteMoveConflictPolicy::KeepBoth => {
+            RemoteTransferConflictPolicy::KeepBoth => {
                 let mut moved_path = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     let candidate =
@@ -2298,7 +2315,7 @@ impl SshConnectionManager {
         &self,
         source: &EntryRefDto,
         destination: &DirectoryRefDto,
-        conflict_policy: RemoteMoveConflictPolicy,
+        conflict_policy: RemoteTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<MovedRemoteEntry, ExplorerError> {
         let session = self.active_session(&source.location_id)?;
@@ -2344,7 +2361,7 @@ impl SshConnectionManager {
             source_parent: session.directory_ref(&source_parent_path, None)?,
             total_bytes,
             permissions: metadata.permissions,
-            _mutation_guard: mutation_guard,
+            _mutation_guard: Arc::new(mutation_guard),
         })
     }
 
@@ -2353,19 +2370,102 @@ impl SshConnectionManager {
         destination: &DirectoryRefDto,
         source_name: &str,
         kind: &RemoteTransferDestinationKind,
-        conflict_policy: RemoteMoveConflictPolicy,
+        conflict_policy: RemoteTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<PreparedRemoteDestination, ExplorerError> {
         validate_remote_name(source_name)?;
         let session = self.active_session(&destination.location_id)?;
         let mutation_guard = session.mutation_guard.clone().lock_owned().await;
+        self.prepare_transfer_destination_locked(
+            session,
+            Arc::new(mutation_guard),
+            destination,
+            source_name,
+            kind,
+            conflict_policy,
+            cancelled,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_destination_for_remote_transfer(
+        &self,
+        source: &PreparedRemoteTransfer,
+        destination: &DirectoryRefDto,
+        kind: &RemoteTransferDestinationKind,
+        conflict_policy: RemoteTransferConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedRemoteDestination, ExplorerError> {
+        let session = self.active_session(&destination.location_id)?;
+        let same_endpoint = session
+            .target
+            .host
+            .eq_ignore_ascii_case(&source.session.target.host)
+            && session.target.port == source.session.target.port
+            && session.target.username == source.session.target.username;
+        let guard = if Arc::ptr_eq(&session, &source.session) {
+            // Both prepared endpoints keep the same guard alive through finalization.
+            source._mutation_guard.clone()
+        } else {
+            Arc::new(session.mutation_guard.clone().lock_owned().await)
+        };
+        if same_endpoint && source.root_is_directory() {
+            let path = session.revalidate_directory(destination).await?;
+            if remote_is_same_or_descendant(&path, &source.root()?.path) {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "A folder cannot be copied into itself or one of its subfolders.".to_owned(),
+                ));
+            }
+        }
+        self.prepare_transfer_destination_locked(
+            session,
+            guard,
+            destination,
+            &source.name,
+            kind,
+            conflict_policy,
+            cancelled,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_transfer_destination_locked(
+        &self,
+        session: Arc<SshSession>,
+        mutation_guard: Arc<OwnedMutexGuard<()>>,
+        destination: &DirectoryRefDto,
+        source_name: &str,
+        kind: &RemoteTransferDestinationKind,
+        conflict_policy: RemoteTransferConflictPolicy,
+        cancelled: &AtomicBool,
+    ) -> Result<PreparedRemoteDestination, ExplorerError> {
+        validate_remote_name(source_name)?;
         ensure_not_cancelled(cancelled)?;
         let destination_path = match session.revalidate_directory(destination).await {
             Ok(path) => path,
             Err(error) => return finish_remote_result(&session, Err(error)),
         };
+        let mut ancestor = remote_parent(&destination_path);
+        while let Some(path) = ancestor {
+            ensure_not_cancelled(cancelled)?;
+            let metadata = finish_remote_result(
+                &session,
+                session
+                    .sftp
+                    .symlink_metadata(path.clone())
+                    .await
+                    .map_err(map_sftp_error),
+            )?;
+            if metadata.is_symlink() {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "Choose a destination outside symbolic links.".to_owned(),
+                ));
+            }
+            ancestor = remote_parent(&path);
+        }
         let (artifact, final_name) = match conflict_policy {
-            RemoteMoveConflictPolicy::Fail => {
+            RemoteTransferConflictPolicy::Fail => {
                 let artifact = create_remote_transfer_artifact(
                     session.sftp.clone(),
                     &destination_path,
@@ -2378,7 +2478,7 @@ impl SshConnectionManager {
                     source_name.to_owned(),
                 )
             }
-            RemoteMoveConflictPolicy::KeepBoth => {
+            RemoteTransferConflictPolicy::KeepBoth => {
                 let mut prepared = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     ensure_not_cancelled(cancelled)?;
@@ -4109,7 +4209,7 @@ mod tests {
                 .move_entry(
                     &project_note.reference,
                     &location.root,
-                    RemoteMoveConflictPolicy::Fail,
+                    RemoteTransferConflictPolicy::Fail,
                     &AtomicBool::new(false),
                 )
                 .await,
@@ -4119,7 +4219,7 @@ mod tests {
             .move_entry(
                 &project_note.reference,
                 &location.root,
-                RemoteMoveConflictPolicy::KeepBoth,
+                RemoteTransferConflictPolicy::KeepBoth,
                 &AtomicBool::new(false),
             )
             .await

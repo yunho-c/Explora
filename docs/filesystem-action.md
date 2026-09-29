@@ -1,7 +1,7 @@
 # Filesystem actions
 
 - Status: Accepted; phases 1–8 implemented; native platform validation pending
-- Scope: Rename, move, trash, and permanent deletion for local and SSH/SFTP
+- Scope: Create folders, copy, rename, move, trash, and permanent deletion for local and SSH/SFTP
   locations
 
 ## Summary
@@ -184,12 +184,15 @@ not be used to decide whether an action is enabled.
 Each entry summary should include an `EntryCapabilities` value with:
 
 - `rename`: the entry can be renamed within its current directory.
+- `copy`: the entry can be copied while preserving its source.
 - `move`: the entry can be relocated to a compatible destination.
 - `trash`: the entry can be moved to a recoverable native trash location.
 - `deletePermanently`: the entry can be deleted without recovery.
 
 Directory summaries should include destination capabilities with:
 
+- `createFolder`: an empty folder can be created in the directory.
+- `acceptCopy`: copied entries can be created in the directory.
 - `acceptMove`: entries can be moved into the directory.
 - `atomicReplace`: the backend can atomically replace a regular-file target.
 
@@ -680,6 +683,18 @@ unsupported destinations never accept the drop; deeper ancestry and mutable
 state are still revalidated by Rust. Move commands and platform cut/paste
 shortcuts provide complete keyboard alternatives, and cut state has a visible,
 screen-reader-announced status with an explicit cancel action.
+
+## Copy/Paste extension
+
+Copy/Paste is implemented through the same bounded, verified transfer pipeline
+as transfer-based moves, with source removal disabled. It supports local and SFTP
+files, trees, and supported links in every backend direction, including copying
+within one location. Independent `copy`/`acceptCopy` capabilities drive menus and
+platform keyboard shortcuts. The in-memory clipboard distinguishes copy from cut
+and retains copied sources for repeated pastes. The shared conflict prompt is
+`transferConflict`; copies return `copied` or `copySkipped`, without rebasing or
+invalidating source references. See [ADR 0014](adr/0014-copy-paste.md) for safety,
+cancellation, same-session SSH locking, and native clipboard boundaries.
 
 ## Testing strategy
 

@@ -4,6 +4,7 @@ import type {
   FileEntrySummary,
   FileOperationBatchResult,
   FileMoveResult,
+  FileCopyResult,
   FileOperationPrompt,
   FileOperationPromptResponse,
   FileRemovalResult,
@@ -193,6 +194,35 @@ export class FileOperationStore {
     const { entries, directory } = chooser;
     this.closeMoveChooser();
     await this.moveEntriesTo(entries, directory, onCompleted);
+  }
+
+  async copyEntriesTo(
+    entries: readonly FileEntrySummary[],
+    directory: DirectoryRef,
+    onCompleted: (
+      result: FileCopyResult | FileOperationBatchResult,
+    ) => void | Promise<void>,
+  ): Promise<void> {
+    if (
+      this.controller ||
+      entries.length === 0 ||
+      !directory.capabilities.acceptCopy ||
+      !entries.every((entry) => entry.capabilities.copy) ||
+      entries.some(
+        (entry) =>
+          entry.directory && isSameDirectory(entry.directory, directory),
+      )
+    )
+      return;
+    await this.runOperation(
+      entries,
+      "Copying",
+      (options) =>
+        entries.length === 1
+          ? this.dataSource.copyEntry(entries[0], directory, options)
+          : this.dataSource.copyEntries(entries, directory, options),
+      onCompleted,
+    );
   }
 
   async moveEntriesTo(

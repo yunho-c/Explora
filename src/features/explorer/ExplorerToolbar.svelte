@@ -158,6 +158,21 @@
         disabled={!state.canCreateFolder}
         onclick={() => state.startNewFolder()}>New folder</DropdownMenu.Item
       >
+      <DropdownMenu.Item
+        disabled={!state.canCopySelection ||
+          state.fileOperations.activeEntryId !== null}
+        onclick={() => state.copySelected()}>Copy</DropdownMenu.Item
+      >
+      <DropdownMenu.Item
+        disabled={!state.canCutSelection ||
+          state.fileOperations.activeEntryId !== null}
+        onclick={() => state.cutSelected()}>Cut</DropdownMenu.Item
+      >
+      <DropdownMenu.Item
+        disabled={!state.canPasteEntries ||
+          state.fileOperations.activeEntryId !== null}
+        onclick={() => void state.pasteEntries()}>Paste</DropdownMenu.Item
+      >
       <DropdownMenu.Item disabled>Connect to server</DropdownMenu.Item>
       <DropdownMenu.Separator />
       <DropdownMenu.Item

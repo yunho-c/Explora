@@ -34,3 +34,22 @@ export const deletionShortcut = (
   }
   return event.shiftKey ? "deletePermanently" : "trash";
 };
+
+export const clipboardShortcut = (
+  event: KeyboardEvent,
+): "copy" | "cut" | "paste" | null => {
+  const primary = isMacLike()
+    ? event.metaKey && !event.ctrlKey
+    : event.ctrlKey && !event.metaKey;
+  if (!primary || event.altKey || event.shiftKey) return null;
+  switch (event.key.toLowerCase()) {
+    case "c":
+      return "copy";
+    case "x":
+      return "cut";
+    case "v":
+      return "paste";
+    default:
+      return null;
+  }
+};

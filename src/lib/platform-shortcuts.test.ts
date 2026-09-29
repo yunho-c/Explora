@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   deletionShortcut,
+  clipboardShortcut,
   isRenameShortcut,
   isNewFolderShortcut,
 } from "./platform-shortcuts";
@@ -12,6 +13,50 @@ const platform = (value: string) => {
 
 describe("platform filesystem shortcuts", () => {
   afterEach(() => vi.unstubAllGlobals());
+
+  it.each(["MacIntel", "Win32", "Linux x86_64"])(
+    "uses native clipboard modifiers on %s",
+    (value) => {
+      platform(value);
+      const mac = value === "MacIntel";
+      for (const [key, action] of [
+        ["c", "copy"],
+        ["x", "cut"],
+        ["v", "paste"],
+      ]) {
+        expect(
+          clipboardShortcut(
+            new KeyboardEvent("keydown", { key, metaKey: mac, ctrlKey: !mac }),
+          ),
+        ).toBe(action);
+        expect(
+          clipboardShortcut(
+            new KeyboardEvent("keydown", { key, metaKey: !mac, ctrlKey: mac }),
+          ),
+        ).toBeNull();
+        expect(
+          clipboardShortcut(
+            new KeyboardEvent("keydown", {
+              key,
+              metaKey: mac,
+              ctrlKey: !mac,
+              shiftKey: true,
+            }),
+          ),
+        ).toBeNull();
+        expect(
+          clipboardShortcut(
+            new KeyboardEvent("keydown", {
+              key,
+              metaKey: mac,
+              ctrlKey: !mac,
+              altKey: true,
+            }),
+          ),
+        ).toBeNull();
+      }
+    },
+  );
 
   it.each(["MacIntel", "Win32", "Linux x86_64"])(
     "uses the platform modifier for New Folder on %s",

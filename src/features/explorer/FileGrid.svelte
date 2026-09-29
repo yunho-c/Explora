@@ -101,6 +101,11 @@
       onclick={() => state.startRename()}>Rename</ContextMenu.Item
     >
     <ContextMenu.Item
+      disabled={!state.canCopySelection ||
+        state.fileOperations.activeEntryId !== null}
+      onclick={() => state.copySelected()}>Copy</ContextMenu.Item
+    >
+    <ContextMenu.Item
       disabled={!state.canCutSelection ||
         state.fileOperations.activeEntryId !== null}
       onclick={() => state.cutSelected()}>Cut</ContextMenu.Item
@@ -111,9 +116,9 @@
       onclick={() => void state.openMoveSelected()}>Move…</ContextMenu.Item
     >
     <ContextMenu.Item
-      disabled={!state.canPasteCutEntries ||
+      disabled={!state.canPasteEntries ||
         state.fileOperations.activeEntryId !== null}
-      onclick={() => void state.pasteCutEntries()}
+      onclick={() => void state.pasteEntries()}
       >Paste into This Folder</ContextMenu.Item
     >
     <ContextMenu.Item

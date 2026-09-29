@@ -204,6 +204,67 @@ describe("ExplorerShell", () => {
     expect(state.selectedEntryIds).toEqual([]);
   });
 
+  it("copies and pastes from a focused grid cell", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    state.setViewMode("grid");
+    renderShell(state);
+    const source = screen.getByRole("gridcell", { name: "explora-notes.md" });
+    await fireEvent.click(source);
+    await fireEvent.keyDown(source, { key: "c", ctrlKey: true });
+    expect(state.clipboardMode).toBe("copy");
+    expect(state.clipboardEntries).toHaveLength(1);
+    await fireEvent.keyDown(source, { key: "v", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog");
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Keep Both" }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("gridcell", { name: "explora-notes copy.md" }),
+      ).toHaveAttribute("aria-selected", "true"),
+    );
+  });
+
+  it("copies with the keyboard without intercepting text, preview or terminal input", async () => {
+    const state = new ExplorerState(new DemoExplorerDataSource());
+    await state.initialize();
+    renderShell(state);
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    state.selectEntry(notes.reference.id);
+    await fireEvent.keyDown(
+      screen.getAllByRole("textbox", { name: "Search this location" })[0],
+      { key: "c", ctrlKey: true },
+    );
+    expect(state.clipboardEntries).toEqual([]);
+    await state.openPreview();
+    await fireEvent.keyDown(window, { key: "c", ctrlKey: true });
+    expect(state.clipboardEntries).toEqual([]);
+    state.closePreview();
+    const terminalSurface = document.createElement("div");
+    terminalSurface.dataset.terminalSurface = "";
+    document.body.append(terminalSurface);
+    await fireEvent.keyDown(terminalSurface, { key: "c", ctrlKey: true });
+    terminalSurface.remove();
+    expect(state.clipboardEntries).toEqual([]);
+    await fireEvent.keyDown(window, { key: "c", ctrlKey: true });
+    expect(screen.getByRole("status")).toHaveTextContent("is ready to copy");
+    expect(state.isEntryCut(notes.reference.id)).toBe(false);
+    await fireEvent.keyDown(window, { key: "v", ctrlKey: true });
+    const dialog = await screen.findByRole("dialog");
+    await fireEvent.click(
+      within(dialog).getByRole("button", { name: "Keep Both" }),
+    );
+    await waitFor(() =>
+      expect(
+        state.entries.some(({ name }) => name === "explora-notes copy.md"),
+      ).toBe(true),
+    );
+    expect(state.clipboardEntries[0].reference).toEqual(notes.reference);
+  });
+
   it("cuts and pastes multiple entries with complete keyboard alternatives", async () => {
     const state = new ExplorerState(new DemoExplorerDataSource());
     await state.initialize();
@@ -233,7 +294,7 @@ describe("ExplorerShell", () => {
     await state.openDirectory(projects.directory!);
     await fireEvent.keyDown(window, { key: "v", ctrlKey: true });
     await waitFor(() => {
-      expect(state.cutEntries).toEqual([]);
+      expect(state.clipboardEntries).toEqual([]);
       expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
       expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
     });

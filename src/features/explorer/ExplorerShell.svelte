@@ -13,6 +13,7 @@
   import * as ContextMenu from "$lib/components/ui/context-menu";
   import {
     deletionShortcut,
+    clipboardShortcut,
     isRenameShortcut,
     isNewFolderShortcut,
   } from "$lib/platform-shortcuts";
@@ -122,6 +123,7 @@
 
     const isInteractiveControl =
       target instanceof Element &&
+      !target.matches("[data-file-entry]") &&
       target.matches(
         "a[href], button, input, select, textarea, [contenteditable='true'], [role='button'], [role='checkbox'], [role='menuitem'], [role='switch']",
       );
@@ -153,31 +155,32 @@
 
     const modifier = event.metaKey || event.ctrlKey;
     const key = event.key.toLocaleLowerCase();
+    const clipboardAction = clipboardShortcut(event);
     if (
-      modifier &&
-      !event.altKey &&
-      !event.shiftKey &&
-      key === "x" &&
-      state.canCutSelection &&
       state.fileOperations.activeEntryId === null &&
-      !isPreviewText
+      !isPreviewText &&
+      !isPreviewDocument &&
+      !state.previewOpen &&
+      !(
+        target instanceof Element &&
+        target.closest('[role="dialog"], [role="alertdialog"]')
+      )
     ) {
-      event.preventDefault();
-      state.cutSelected();
-      return;
-    }
-    if (
-      modifier &&
-      !event.altKey &&
-      !event.shiftKey &&
-      key === "v" &&
-      state.canPasteCutEntries &&
-      state.fileOperations.activeEntryId === null &&
-      !isPreviewText
-    ) {
-      event.preventDefault();
-      void state.pasteCutEntries();
-      return;
+      if (clipboardAction === "copy" && state.canCopySelection) {
+        event.preventDefault();
+        state.copySelected();
+        return;
+      }
+      if (clipboardAction === "cut" && state.canCutSelection) {
+        event.preventDefault();
+        state.cutSelected();
+        return;
+      }
+      if (clipboardAction === "paste" && state.canPasteEntries) {
+        event.preventDefault();
+        void state.pasteEntries();
+        return;
+      }
     }
 
     if (key === "a" && modifier && !isPreviewText && !isPreviewDocument) {
@@ -298,22 +301,22 @@
           </div>
         {/if}
 
-        {#if state.cutEntries.length > 0}
+        {#if state.clipboardEntries.length > 0}
           <div
             class="mx-4 mt-4 flex items-center justify-between gap-3 rounded-lg border bg-muted/50 p-3 text-sm"
             role="status"
             aria-live="polite"
           >
             <span>
-              {state.cutEntries.length === 1
-                ? `“${state.cutEntries[0].name}” is ready to move.`
-                : `${state.cutEntries.length} items are ready to move.`}
+              {state.clipboardEntries.length === 1
+                ? `“${state.clipboardEntries[0].name}” is ready to ${state.clipboardMode === "copy" ? "copy" : "move"}.`
+                : `${state.clipboardEntries.length} items are ready to ${state.clipboardMode === "copy" ? "copy" : "move"}.`}
               Navigate to a destination and paste.
             </span>
             <Button
               variant="ghost"
               size="sm"
-              onclick={() => state.clearCutEntries()}>Cancel</Button
+              onclick={() => state.clearClipboard()}>Cancel</Button
             >
           </div>
         {/if}
@@ -402,6 +405,12 @@
                 disabled={!state.canCreateFolder}
                 onclick={() => state.startNewFolder()}
                 >New folder</ContextMenu.Item
+              >
+              <ContextMenu.Item
+                disabled={!state.canPasteEntries ||
+                  state.fileOperations.activeEntryId !== null}
+                onclick={() => void state.pasteEntries()}
+                >Paste into This Folder</ContextMenu.Item
               >
             </ContextMenu.Content>
           </ContextMenu.Root>

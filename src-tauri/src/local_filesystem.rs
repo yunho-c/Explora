@@ -256,7 +256,7 @@ pub struct RemovedLocalEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalMoveConflictPolicy {
+pub enum LocalTransferConflictPolicy {
     Fail,
     KeepBoth,
 }
@@ -565,7 +565,7 @@ impl LocalFilesystem {
         &self,
         entry: &EntryRefDto,
         destination: &DirectoryRefDto,
-        conflict_policy: LocalMoveConflictPolicy,
+        conflict_policy: LocalTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<MovedLocalEntry, ExplorerError> {
         ensure_not_cancelled(cancelled)?;
@@ -606,7 +606,7 @@ impl LocalFilesystem {
         let preferred_destination = destination_path.join(original_name);
         ensure_not_cancelled(cancelled)?;
         let final_destination = match fs::symlink_metadata(&preferred_destination) {
-            Ok(_) if conflict_policy == LocalMoveConflictPolicy::Fail => {
+            Ok(_) if conflict_policy == LocalTransferConflictPolicy::Fail => {
                 return Err(ExplorerError::Conflict)
             }
             Ok(_) => relocate_keep_both(
@@ -621,7 +621,7 @@ impl LocalFilesystem {
                     Ok(()) => preferred_destination,
                     Err(error)
                         if error.kind() == std::io::ErrorKind::AlreadyExists
-                            && conflict_policy == LocalMoveConflictPolicy::KeepBoth =>
+                            && conflict_policy == LocalTransferConflictPolicy::KeepBoth =>
                     {
                         relocate_keep_both(
                             &source_path,
@@ -751,17 +751,17 @@ impl LocalFilesystem {
         &self,
         destination: &DirectoryRefDto,
         source_name: &str,
-        conflict_policy: LocalMoveConflictPolicy,
+        conflict_policy: LocalTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<PreparedLocalFileDestination, ExplorerError> {
         ensure_not_cancelled(cancelled)?;
         validate_entry_name(source_name)?;
         let destination_path = self.resolve_transfer_destination(destination)?;
         let artifact = match conflict_policy {
-            LocalMoveConflictPolicy::Fail => {
+            LocalTransferConflictPolicy::Fail => {
                 OwnedLocalTransferArtifact::create_file(&destination_path, OsStr::new(source_name))?
             }
-            LocalMoveConflictPolicy::KeepBoth => {
+            LocalTransferConflictPolicy::KeepBoth => {
                 let mut artifact = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     ensure_not_cancelled(cancelled)?;
@@ -796,20 +796,20 @@ impl LocalFilesystem {
         source_name: &str,
         link_target: &Path,
         target_is_directory: bool,
-        conflict_policy: LocalMoveConflictPolicy,
+        conflict_policy: LocalTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<PreparedLocalFileDestination, ExplorerError> {
         ensure_not_cancelled(cancelled)?;
         validate_entry_name(source_name)?;
         let destination_path = self.resolve_transfer_destination(destination)?;
         let artifact = match conflict_policy {
-            LocalMoveConflictPolicy::Fail => OwnedLocalTransferArtifact::create_symlink(
+            LocalTransferConflictPolicy::Fail => OwnedLocalTransferArtifact::create_symlink(
                 &destination_path,
                 OsStr::new(source_name),
                 link_target,
                 target_is_directory,
             )?,
-            LocalMoveConflictPolicy::KeepBoth => {
+            LocalTransferConflictPolicy::KeepBoth => {
                 let mut artifact = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     ensure_not_cancelled(cancelled)?;
@@ -847,18 +847,18 @@ impl LocalFilesystem {
         &self,
         destination: &DirectoryRefDto,
         source_name: &str,
-        conflict_policy: LocalMoveConflictPolicy,
+        conflict_policy: LocalTransferConflictPolicy,
         cancelled: &AtomicBool,
     ) -> Result<PreparedLocalFileDestination, ExplorerError> {
         ensure_not_cancelled(cancelled)?;
         validate_entry_name(source_name)?;
         let destination_path = self.resolve_transfer_destination(destination)?;
         let artifact = match conflict_policy {
-            LocalMoveConflictPolicy::Fail => OwnedLocalTransferArtifact::create_directory(
+            LocalTransferConflictPolicy::Fail => OwnedLocalTransferArtifact::create_directory(
                 &destination_path,
                 OsStr::new(source_name),
             )?,
-            LocalMoveConflictPolicy::KeepBoth => {
+            LocalTransferConflictPolicy::KeepBoth => {
                 let mut artifact = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     ensure_not_cancelled(cancelled)?;
@@ -933,11 +933,35 @@ impl LocalFilesystem {
         Ok((entry, prepared.destination))
     }
 
+    #[cfg(test)]
     pub fn transfer_entry_to_local_location<F>(
         &self,
         entry: &EntryRefDto,
         destination: &DirectoryRefDto,
-        conflict_policy: LocalMoveConflictPolicy,
+        conflict_policy: LocalTransferConflictPolicy,
+        cancelled: &AtomicBool,
+        on_progress: F,
+    ) -> Result<TransferredLocalEntry, ExplorerError>
+    where
+        F: FnMut(u64, u64) -> Result<(), ExplorerError>,
+    {
+        self.transfer_entry_to_local_location_with_mode(
+            entry,
+            destination,
+            conflict_policy,
+            false,
+            cancelled,
+            on_progress,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn transfer_entry_to_local_location_with_mode<F>(
+        &self,
+        entry: &EntryRefDto,
+        destination: &DirectoryRefDto,
+        conflict_policy: LocalTransferConflictPolicy,
+        copy_only: bool,
         cancelled: &AtomicBool,
         mut on_progress: F,
     ) -> Result<TransferredLocalEntry, ExplorerError>
@@ -945,7 +969,7 @@ impl LocalFilesystem {
         F: FnMut(u64, u64) -> Result<(), ExplorerError>,
     {
         ensure_not_cancelled(cancelled)?;
-        if destination.location_id == entry.location_id {
+        if !copy_only && destination.location_id == entry.location_id {
             return Err(ExplorerError::InvalidConfiguration(
                 "A same-location move must use atomic relocation.".to_owned(),
             ));
@@ -953,6 +977,19 @@ impl LocalFilesystem {
         let (source_path, _) = self.resolve_mutation_source(entry)?;
         let transfer_plan = plan_local_transfer(&source_path, cancelled)?;
         let destination_path = self.resolve_transfer_destination(destination)?;
+        // Resolve aliases/case differences before creating any partial target.
+        // A destination inside the source would change the snapshot being copied.
+        if transfer_plan.root_is_directory() {
+            let source_canonical = fs::canonicalize(&source_path)
+                .map_err(|error| ExplorerError::io("inspect", &source_path, error))?;
+            let destination_canonical = fs::canonicalize(&destination_path)
+                .map_err(|error| ExplorerError::io("inspect", &destination_path, error))?;
+            if destination_canonical.starts_with(&source_canonical) {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "A folder cannot be copied into itself or one of its subfolders.".to_owned(),
+                ));
+            }
+        }
         let original_name = source_path
             .file_name()
             .ok_or(ExplorerError::InvalidReference)?;
@@ -974,12 +1011,12 @@ impl LocalFilesystem {
         )?;
 
         let mut artifact = match conflict_policy {
-            LocalMoveConflictPolicy::Fail => OwnedLocalTransferArtifact::create_for_plan(
+            LocalTransferConflictPolicy::Fail => OwnedLocalTransferArtifact::create_for_plan(
                 &destination_path,
                 original_name,
                 &transfer_plan,
             )?,
-            LocalMoveConflictPolicy::KeepBoth => {
+            LocalTransferConflictPolicy::KeepBoth => {
                 let mut artifact = None;
                 for attempt in 1..=MAX_KEEP_BOTH_ATTEMPTS {
                     ensure_not_cancelled(cancelled)?;
@@ -1024,6 +1061,19 @@ impl LocalFilesystem {
         revalidate_local_transfer_source(&transfer_plan, cancelled)?;
         ensure_not_cancelled(cancelled)?;
         let final_path = artifact.preserve();
+        if copy_only {
+            let entry = self.describe_path(final_path, &destination.location_id).map_err(|_| {
+                ExplorerError::PartialCompletion(
+                    "The copy was created, but its details could not be loaded. Refresh the destination before trying again.".to_owned(),
+                )
+            })?;
+            return Ok(TransferredLocalEntry {
+                entry,
+                source_parent,
+                destination: destination_ref,
+                invalidated_entry_ids: Vec::new(),
+            });
+        }
         // Cancellation stops before deletion. From here the coordinator must
         // establish a real result; removing only the verified snapshot also
         // prevents a late-arriving child from being deleted without a copy.
@@ -1526,6 +1576,18 @@ impl LocalFilesystem {
             return Err(ExplorerError::DestinationUnavailable(
                 "Choose a folder that can accept moved items.".to_owned(),
             ));
+        }
+        for ancestor in destination_path
+            .ancestors()
+            .take_while(|path| path.starts_with(&root_path))
+        {
+            let metadata = fs::symlink_metadata(ancestor)
+                .map_err(|error| ExplorerError::io("inspect", ancestor, error))?;
+            if metadata.file_type().is_symlink() {
+                return Err(ExplorerError::DestinationUnavailable(
+                    "Choose a destination outside symbolic links.".to_owned(),
+                ));
+            }
         }
         Ok(destination_path)
     }
@@ -2184,6 +2246,161 @@ mod tests {
     }
 
     #[test]
+    fn copy_action_local_rejects_descendants_and_preserves_tree_identity() {
+        let (temp, filesystem, root, destination, _) = transfer_fixture();
+        let tree_path = temp.path().join("source/tree");
+        fs::create_dir_all(tree_path.join("nested/empty")).expect("tree");
+        fs::write(tree_path.join("nested/file"), b"contents").expect("child");
+        let tree = filesystem
+            .describe_path(tree_path.clone(), &root.location_id)
+            .expect("tree");
+        let nested = filesystem
+            .describe_path(tree_path.join("nested"), &root.location_id)
+            .expect("nested");
+        for target in [
+            tree.directory.clone().expect("dir"),
+            nested.directory.clone().expect("dir"),
+        ] {
+            assert!(matches!(
+                filesystem.transfer_entry_to_local_location_with_mode(
+                    &tree.reference,
+                    &target,
+                    LocalTransferConflictPolicy::Fail,
+                    true,
+                    &AtomicBool::new(false),
+                    |_, _| Ok(())
+                ),
+                Err(ExplorerError::DestinationUnavailable(_))
+            ));
+        }
+        let copied = filesystem
+            .transfer_entry_to_local_location_with_mode(
+                &tree.reference,
+                &destination,
+                LocalTransferConflictPolicy::Fail,
+                true,
+                &AtomicBool::new(false),
+                |_, _| Ok(()),
+            )
+            .expect("copy tree");
+        assert!(copied.invalidated_entry_ids.is_empty());
+        assert_ne!(copied.entry.reference.id, tree.reference.id);
+        assert_eq!(
+            fs::read(temp.path().join("destination/tree/nested/file")).expect("copy child"),
+            b"contents"
+        );
+        assert!(temp.path().join("destination/tree/nested/empty").is_dir());
+        filesystem
+            .rename_entry(&nested.reference, "retained", &AtomicBool::new(false))
+            .expect("source subtree tokens retained");
+        assert!(tree_path.join("retained/file").exists());
+    }
+
+    #[test]
+    fn copy_action_local_cancellation_and_stale_sources_leave_no_destination() {
+        let (temp, filesystem, _, destination, source) = transfer_fixture();
+        let cancelled = AtomicBool::new(false);
+        let result = filesystem.transfer_entry_to_local_location_with_mode(
+            &source,
+            &destination,
+            LocalTransferConflictPolicy::Fail,
+            true,
+            &cancelled,
+            |completed, _| {
+                if completed > 0 {
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(ExplorerError::Cancelled)));
+        assert_eq!(
+            fs::read_dir(temp.path().join("destination"))
+                .expect("destination")
+                .count(),
+            0
+        );
+        assert_eq!(
+            fs::read(temp.path().join("source/large.bin")).expect("source"),
+            vec![0x2a; 300_000]
+        );
+        fs::rename(
+            temp.path().join("source/large.bin"),
+            temp.path().join("source/original.bin"),
+        )
+        .expect("retain source");
+        fs::write(temp.path().join("source/large.bin"), b"replacement").expect("replacement");
+        assert!(matches!(
+            filesystem.transfer_entry_to_local_location_with_mode(
+                &source,
+                &destination,
+                LocalTransferConflictPolicy::Fail,
+                true,
+                &AtomicBool::new(false),
+                |_, _| Ok(())
+            ),
+            Err(ExplorerError::SourceChanged)
+        ));
+        assert_eq!(
+            fs::read(temp.path().join("source/large.bin")).expect("replacement retained"),
+            b"replacement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_action_local_preserves_links_and_rejects_destination_link_ancestors() {
+        let (temp, filesystem, root, destination, source) = transfer_fixture();
+        std::os::unix::fs::symlink("missing-target", temp.path().join("source/link"))
+            .expect("broken link");
+        let link = filesystem
+            .describe_path(temp.path().join("source/link"), &root.location_id)
+            .expect("link");
+        filesystem
+            .transfer_entry_to_local_location_with_mode(
+                &link.reference,
+                &destination,
+                LocalTransferConflictPolicy::Fail,
+                true,
+                &AtomicBool::new(false),
+                |_, _| Ok(()),
+            )
+            .expect("copy link");
+        assert_eq!(
+            fs::read_link(temp.path().join("destination/link")).expect("copied target"),
+            PathBuf::from("missing-target")
+        );
+        assert!(fs::symlink_metadata(temp.path().join("source/link"))
+            .expect("source")
+            .is_symlink());
+        fs::create_dir(temp.path().join("destination/nested")).expect("nested");
+        std::os::unix::fs::symlink(
+            temp.path().join("destination"),
+            temp.path().join("source/alias"),
+        )
+        .expect("directory alias");
+        let alias = directory_ref(
+            &filesystem.registry,
+            &temp.path().join("source/alias/nested"),
+            &root.location_id,
+            None,
+        )
+        .expect("alias");
+        assert!(matches!(
+            filesystem.transfer_entry_to_local_location_with_mode(
+                &source,
+                &alias,
+                LocalTransferConflictPolicy::Fail,
+                true,
+                &AtomicBool::new(false),
+                |_, _| Ok(())
+            ),
+            Err(ExplorerError::DestinationUnavailable(_))
+        ));
+        assert!(!temp.path().join("destination/nested/large.bin").exists());
+    }
+
+    #[test]
     fn transfers_a_regular_file_between_local_locations_without_overwriting() {
         let (temp, filesystem, source_root, destination_root, entry) = transfer_fixture();
         let progress = Mutex::new(Vec::new());
@@ -2191,7 +2408,7 @@ mod tests {
             .transfer_entry_to_local_location(
                 &entry,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
                 |completed, total| {
                     progress.lock().expect("progress").push((completed, total));
@@ -2225,7 +2442,7 @@ mod tests {
             filesystem.transfer_entry_to_local_location(
                 &entry,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &cancelled,
                 |_, _| Ok(())
             ),
@@ -2247,7 +2464,7 @@ mod tests {
             filesystem.transfer_entry_to_local_location(
                 &entry,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &cancelled,
                 |completed, total| {
                     if completed == total {
@@ -2275,7 +2492,7 @@ mod tests {
             filesystem.transfer_entry_to_local_location(
                 &entry,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
                 |completed, total| {
                     if completed == total {
@@ -2328,7 +2545,7 @@ mod tests {
             .transfer_entry_to_local_location(
                 &album.reference,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
                 |completed, total| {
                     progress.lock().expect("progress").push((completed, total));
@@ -2376,7 +2593,7 @@ mod tests {
             filesystem.transfer_entry_to_local_location(
                 &archive.reference,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &cancelled,
                 |completed, _| {
                     if completed > 0 {
@@ -2415,7 +2632,7 @@ mod tests {
             filesystem.transfer_entry_to_local_location(
                 &report.reference,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
                 |_, _| Ok(())
             ),
@@ -2432,7 +2649,7 @@ mod tests {
             .transfer_entry_to_local_location(
                 &report.reference,
                 &destination_root,
-                LocalMoveConflictPolicy::KeepBoth,
+                LocalTransferConflictPolicy::KeepBoth,
                 &AtomicBool::new(false),
                 |_, _| Ok(()),
             )
@@ -2462,7 +2679,7 @@ mod tests {
             .transfer_entry_to_local_location(
                 &link.reference,
                 &destination_root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
                 |_, _| Ok(()),
             )
@@ -2683,7 +2900,7 @@ mod tests {
             .move_entry(
                 &source.reference,
                 destination,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
             )
             .expect("move file");
@@ -2726,7 +2943,7 @@ mod tests {
             .move_entry(
                 &source.reference,
                 &destination,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
             )
             .expect("move directory");
@@ -2760,7 +2977,7 @@ mod tests {
             filesystem.move_entry(
                 &source.reference,
                 destination,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
             ),
             Err(ExplorerError::Conflict)
@@ -2775,7 +2992,7 @@ mod tests {
             .move_entry(
                 &source.reference,
                 destination,
-                LocalMoveConflictPolicy::KeepBoth,
+                LocalTransferConflictPolicy::KeepBoth,
                 &AtomicBool::new(false),
             )
             .expect("keep both move");
@@ -2811,7 +3028,7 @@ mod tests {
             filesystem.move_entry(
                 &folder.reference,
                 &child,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
             ),
             Err(ExplorerError::DestinationUnavailable(_))
@@ -2821,7 +3038,7 @@ mod tests {
             filesystem.move_entry(
                 &folder.reference,
                 &root,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &cancelled,
             ),
             Err(ExplorerError::Cancelled)
@@ -2853,7 +3070,7 @@ mod tests {
             filesystem.move_entry(
                 &source.reference,
                 &destination,
-                LocalMoveConflictPolicy::Fail,
+                LocalTransferConflictPolicy::Fail,
                 &AtomicBool::new(false),
             ),
             Err(ExplorerError::DestinationUnavailable(_))

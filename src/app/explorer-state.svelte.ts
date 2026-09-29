@@ -5,6 +5,7 @@ import type {
   FileEntrySummary,
   FileOperationBatchResult,
   FileMoveResult,
+  FileCopyResult,
   FileRemovalResult,
   ImagePreviewMode,
   LocationSummary,
@@ -106,8 +107,9 @@ export class ExplorerState {
   parentDirectory = $state<DirectoryRef | null>(null);
   selectedEntryId = $state<string | null>(null);
   selectedEntryIds = $state<string[]>([]);
-  cutEntries = $state<FileEntrySummary[]>([]);
-  cutSourceParent = $state<DirectoryRef | null>(null);
+  clipboardMode = $state<"cut" | "copy">("cut");
+  clipboardEntries = $state<FileEntrySummary[]>([]);
+  clipboardSourceParent = $state<DirectoryRef | null>(null);
   dropTargetDirectoryKey = $state<string | null>(null);
   renamingEntryId = $state<string | null>(null);
   renameDraft = $state("");
@@ -150,6 +152,10 @@ export class ExplorerState {
   connectingTargetId = $state<string | null>(null);
   sshConnectionMessage = $state<string | null>(null);
 
+  private listingCopies: {
+    directory: DirectoryRef;
+    entries: FileEntrySummary[];
+  } | null = null;
   private directoryController: AbortController | null = null;
   private renameController: AbortController | null = null;
   private newFolderController: AbortController | null = null;
@@ -329,18 +335,32 @@ export class ExplorerState {
     return this.canMoveSelection;
   }
 
-  get canPasteCutEntries(): boolean {
+  get canCopySelection(): boolean {
+    return (
+      this.selectedEntries.length > 0 &&
+      this.selectedEntries.every((entry) => entry.capabilities.copy)
+    );
+  }
+
+  get canPasteEntries(): boolean {
     const destination = this.activeDirectory;
-    const sourceParent = this.cutSourceParent;
+    const sourceParent = this.clipboardSourceParent;
     return Boolean(
       destination &&
       sourceParent &&
-      this.cutEntries.length > 0 &&
-      destination.capabilities.acceptMove &&
-      !isSameDirectory(destination, sourceParent) &&
-      this.cutEntries.every(
+      this.clipboardEntries.length > 0 &&
+      (this.clipboardMode === "copy"
+        ? destination.capabilities.acceptCopy
+        : destination.capabilities.acceptMove) &&
+      !this.loading &&
+      !this.activeSshLocationOffline &&
+      (this.clipboardMode === "copy" ||
+        !isSameDirectory(destination, sourceParent)) &&
+      this.clipboardEntries.every(
         (entry) =>
-          entry.capabilities.move &&
+          (this.clipboardMode === "copy"
+            ? entry.capabilities.copy
+            : entry.capabilities.move) &&
           (!entry.directory || !isSameDirectory(entry.directory, destination)),
       ),
     );
@@ -1209,7 +1229,26 @@ export class ExplorerState {
   }
 
   isEntryCut(entryId: string): boolean {
-    return this.cutEntries.some(({ reference }) => reference.id === entryId);
+    return (
+      this.clipboardMode === "cut" &&
+      this.clipboardEntries.some(({ reference }) => reference.id === entryId)
+    );
+  }
+
+  copySelected(entryId = this.selectedEntryId): void {
+    const entries = this.entriesForSelectionAction(entryId);
+    const sourceParent = this.activeDirectory;
+    if (
+      this.fileOperations.activeEntryId !== null ||
+      !sourceParent ||
+      entries.length === 0 ||
+      !entries.every((entry) => entry.capabilities.copy)
+    )
+      return;
+    this.clipboardMode = "copy";
+    this.clipboardEntries = entries.map((entry) => ({ ...entry }));
+    this.clipboardSourceParent = sourceParent;
+    this.fileOperations.clearError();
   }
 
   cutSelected(entryId = this.selectedEntryId): void {
@@ -1222,20 +1261,27 @@ export class ExplorerState {
       !entries.every((entry) => entry.capabilities.move)
     )
       return;
-    this.cutEntries = entries.map((entry) => ({ ...entry }));
-    this.cutSourceParent = sourceParent;
+    this.clipboardMode = "cut";
+    this.clipboardEntries = entries.map((entry) => ({ ...entry }));
+    this.clipboardSourceParent = sourceParent;
     this.fileOperations.clearError();
   }
 
-  clearCutEntries(): void {
-    this.cutEntries = [];
-    this.cutSourceParent = null;
+  clearClipboard(): void {
+    this.clipboardEntries = [];
+    this.clipboardSourceParent = null;
   }
 
-  async pasteCutEntries(): Promise<void> {
+  async pasteEntries(): Promise<void> {
     const destination = this.activeDirectory;
-    if (!destination || !this.canPasteCutEntries) return;
-    const entries = [...this.cutEntries];
+    if (!destination || !this.canPasteEntries) return;
+    const entries = [...this.clipboardEntries];
+    if (this.clipboardMode === "copy") {
+      await this.fileOperations.copyEntriesTo(entries, destination, (result) =>
+        this.reconcileCopyOperationResult(result),
+      );
+      return;
+    }
     await this.fileOperations.moveEntriesTo(
       entries,
       destination,
@@ -1483,6 +1529,50 @@ export class ExplorerState {
     }
   }
 
+  private async reconcileCopyOperationResult(
+    result: FileCopyResult | FileOperationBatchResult,
+  ): Promise<void> {
+    const copies =
+      result.kind === "batch"
+        ? result.items.flatMap((item) =>
+            item.status === "completed" && item.outcome.kind === "copied"
+              ? [item.outcome]
+              : [],
+          )
+        : result.kind === "copied"
+          ? [result]
+          : [];
+    if (this.listingCopies) {
+      this.listingCopies.entries.push(
+        ...copies
+          .filter(
+            (copy) =>
+              this.listingCopies &&
+              isSameDirectory(copy.destination, this.listingCopies.directory),
+          )
+          .map((copy) => copy.entry),
+      );
+    }
+    const visible = copies.filter(
+      (copy) =>
+        this.activeDirectory &&
+        isSameDirectory(this.activeDirectory, copy.destination),
+    );
+    if (visible.length === 0) return;
+    // Reconcile only the currently displayed destination; a late completion must
+    // never navigate back or remove the copied source from tabs/history/preview.
+    const copiedIds = new SvelteSet(
+      visible.map((copy) => copy.entry.reference.id),
+    );
+    this.entries = [
+      ...this.entries.filter((entry) => !copiedIds.has(entry.reference.id)),
+      ...visible.map((copy) => copy.entry),
+    ];
+    this.selectedEntryIds = visible.map((copy) => copy.entry.reference.id);
+    this.selectedEntryId = this.selectedEntryIds.at(-1) ?? null;
+    this.selectionAnchorId = this.selectedEntryIds[0] ?? null;
+  }
+
   private async reconcileMoveOperationResult(
     result: FileMoveResult | FileOperationBatchResult,
   ): Promise<void> {
@@ -1516,11 +1606,11 @@ export class ExplorerState {
         }
       }
     }
-    this.cutEntries = this.cutEntries.filter(
+    this.clipboardEntries = this.clipboardEntries.filter(
       (entry) =>
         !moved.has(`${entry.reference.locationId}\u0000${entry.reference.id}`),
     );
-    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+    if (this.clipboardEntries.length === 0) this.clipboardSourceParent = null;
   }
 
   private async reconcileRemovedEntry(
@@ -1528,12 +1618,12 @@ export class ExplorerState {
     sourceParent: DirectoryRef,
   ): Promise<void> {
     const invalidated = new SvelteSet(result.invalidatedEntryIds);
-    this.cutEntries = this.cutEntries.filter(
+    this.clipboardEntries = this.clipboardEntries.filter(
       (entry) =>
         entry.reference.locationId !== result.entry.locationId ||
         !invalidated.has(entry.reference.id),
     );
-    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+    if (this.clipboardEntries.length === 0) this.clipboardSourceParent = null;
     const orderedEntries = this.visibleEntries;
     const removedIndex = orderedEntries.findIndex(({ reference }) =>
       invalidated.has(reference.id),
@@ -1619,13 +1709,13 @@ export class ExplorerState {
     const activeTab = this.activeTab;
     const rebased = new SvelteSet(result.rebasedEntryIds);
     const invalidated = new SvelteSet(result.invalidatedEntryIds);
-    this.cutEntries = this.cutEntries.filter(
+    this.clipboardEntries = this.clipboardEntries.filter(
       (entry) =>
         entry.reference.locationId !== result.sourceParent.locationId ||
         (entry.reference.id !== result.entry.reference.id &&
           !invalidated.has(entry.reference.id)),
     );
-    if (this.cutEntries.length === 0) this.cutSourceParent = null;
+    if (this.clipboardEntries.length === 0) this.clipboardSourceParent = null;
     const sourceIndex = this.visibleEntries.findIndex(
       ({ reference }) =>
         reference.id === result.entry.reference.id ||
@@ -1904,6 +1994,11 @@ export class ExplorerState {
     this.directoryController?.abort();
     const controller = new AbortController();
     this.directoryController = controller;
+    const copiedDuringListing = {
+      directory: target,
+      entries: [] as FileEntrySummary[],
+    };
+    this.listingCopies = copiedDuringListing;
     this.loading = true;
     this.errorMessage = null;
     this.warningMessage = null;
@@ -1923,7 +2018,16 @@ export class ExplorerState {
         },
         onBatch: ({ entries, replace }) => {
           if (this.directoryController !== controller) return;
-          this.entries = replace ? [...entries] : [...this.entries, ...entries];
+          const listed = replace ? [...entries] : [...this.entries, ...entries];
+          // A listing snapshot taken before a copy committed must not erase the
+          // acknowledged destination entries when a later batch arrives.
+          const copiedIds = new SvelteSet(
+            copiedDuringListing.entries.map((entry) => entry.reference.id),
+          );
+          this.entries = [
+            ...listed.filter((entry) => !copiedIds.has(entry.reference.id)),
+            ...copiedDuringListing.entries,
+          ];
         },
         onComplete: ({ skippedEntries }) => {
           if (this.directoryController !== controller || skippedEntries === 0)
@@ -1941,7 +2045,28 @@ export class ExplorerState {
             : "This directory could not be loaded.";
       }
     } finally {
-      if (this.directoryController === controller) this.loading = false;
+      if (this.directoryController === controller) {
+        this.loading = false;
+        this.listingCopies = null;
+        if (
+          copiedDuringListing.entries.length > 0 &&
+          this.activeDirectory &&
+          isSameDirectory(this.activeDirectory, copiedDuringListing.directory)
+        ) {
+          const copiedIds = new SvelteSet(
+            copiedDuringListing.entries.map((entry) => entry.reference.id),
+          );
+          this.entries = [
+            ...this.entries.filter(
+              (entry) => !copiedIds.has(entry.reference.id),
+            ),
+            ...copiedDuringListing.entries,
+          ];
+          this.selectedEntryIds = [...copiedIds];
+          this.selectedEntryId = this.selectedEntryIds.at(-1) ?? null;
+          this.selectionAnchorId = this.selectedEntryIds[0] ?? null;
+        }
+      }
     }
 
     return started;

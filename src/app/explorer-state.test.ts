@@ -53,6 +53,7 @@ class StaleResultDataSource extends DemoExplorerDataSource {
         displayPath: "Home",
         capabilities: {
           createFolder: true,
+          acceptCopy: true,
           acceptMove: true,
           atomicReplace: false,
         },
@@ -487,6 +488,221 @@ describe("ExplorerState", () => {
     expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
   });
 
+  it.each(["partial", "cancelled"])(
+    "retains copied sources and completed items after a %s batch",
+    async (status) => {
+      const data = new DemoExplorerDataSource();
+      const original = data.copyEntry.bind(data);
+      const started = vi.fn();
+      vi.spyOn(data, "copyEntry").mockImplementation(
+        async (entry, destination, options) => {
+          started();
+          if (started.mock.calls.length === 2) {
+            if (status === "partial")
+              throw new Error("The second source could not be read.");
+            await new Promise<void>((_resolve, reject) => {
+              options.signal.addEventListener(
+                "abort",
+                () => {
+                  const error = new Error("Cancelled");
+                  error.name = "AbortError";
+                  reject(error);
+                },
+                { once: true },
+              );
+            });
+          }
+          return original(entry, destination, options);
+        },
+      );
+      const state = new ExplorerState(data);
+      await state.initialize();
+      const selected = state.entries.filter(
+        ({ name }) =>
+          name === "explora-notes.md" || name === "summer-light.jpg",
+      );
+      const projects = state.entries.find(({ name }) => name === "Projects")!;
+      state.selectEntry(selected[0].reference.id);
+      state.selectEntry(selected[1].reference.id, { toggle: true });
+      state.copySelected();
+      await state.openDirectory(projects.directory!);
+      const paste = state.pasteEntries();
+      if (status === "cancelled") {
+        await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(2));
+        state.fileOperations.cancelActive();
+      }
+      await paste;
+      expect(state.entries).toHaveLength(1);
+      expect(state.selectedEntries).toHaveLength(1);
+      expect(state.clipboardEntries).toHaveLength(2);
+      if (status === "partial")
+        expect(state.fileOperations.errorMessage).toContain(
+          "1 of 2 items could not be completed",
+        );
+      state.dispose();
+    },
+  );
+
+  it("copies a multi-selection without cutting it and retains sources for repeated paste", async () => {
+    const state = await initializedState();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const image = state.entries.find(
+      ({ name }) => name === "summer-light.jpg",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    const home = state.activeDirectory!;
+    state.selectEntry(notes.reference.id);
+    state.selectEntry(image.reference.id, { toggle: true });
+    state.copySelected();
+    expect(state.clipboardMode).toBe("copy");
+    expect(state.isEntryCut(notes.reference.id)).toBe(false);
+    expect(state.canPasteEntries).toBe(true);
+    await state.openDirectory(projects.directory!);
+    await state.pasteEntries();
+    expect(state.selectedEntries.map(({ name }) => name)).toEqual(
+      expect.arrayContaining([notes.name, image.name]),
+    );
+    expect(state.clipboardEntries).toHaveLength(2);
+    expect(
+      state.entries.find(({ name }) => name === notes.name)?.reference.id,
+    ).not.toBe(notes.reference.id);
+    await state.openDirectory(home);
+    expect(
+      state.entries.find(({ name }) => name === notes.name)?.reference,
+    ).toEqual(notes.reference);
+    expect(
+      state.entries.find(({ name }) => name === image.name)?.reference,
+    ).toEqual(image.reference);
+    await state.openDirectory(projects.directory!);
+    const repeat = state.pasteEntries();
+    await vi.waitFor(() =>
+      expect(state.fileOperations.pendingPrompt).not.toBeNull(),
+    );
+    await state.fileOperations.answerPrompt("keepBoth");
+    await vi.waitFor(() =>
+      expect(state.fileOperations.pendingPrompt).not.toBeNull(),
+    );
+    await state.fileOperations.answerPrompt("skip");
+    await repeat;
+    expect(state.entries.some(({ name }) => name.includes(" copy."))).toBe(
+      true,
+    );
+    expect(state.clipboardEntries).toHaveLength(2);
+    state.dispose();
+  });
+
+  it("copies into the source folder with explicit keep-both, skip and cancellation", async () => {
+    const state = await initializedState();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    state.selectEntry(notes.reference.id);
+    state.cutSelected();
+    expect(state.canPasteEntries).toBe(false);
+    state.copySelected();
+    expect(state.canPasteEntries).toBe(true);
+    for (const decision of ["skip", "cancel", "keepBoth"] as const) {
+      const paste = state.pasteEntries();
+      await vi.waitFor(() =>
+        expect(state.fileOperations.pendingPrompt).not.toBeNull(),
+      );
+      await state.fileOperations.answerPrompt(decision);
+      await paste;
+      expect(
+        state.entries.find(({ name }) => name === notes.name)?.reference,
+      ).toEqual(notes.reference);
+      expect(state.clipboardEntries[0].reference).toEqual(notes.reference);
+    }
+    expect(
+      state.entries.some(({ name }) => name === "explora-notes copy.md"),
+    ).toBe(true);
+    state.cutSelected();
+    expect(state.clipboardMode).toBe("cut");
+    state.clearClipboard();
+    expect(state.canPasteEntries).toBe(false);
+    state.dispose();
+  });
+
+  it("retains a committed copy when an older directory listing arrives afterward", async () => {
+    const data = new DemoExplorerDataSource();
+    const state = new ExplorerState(data);
+    await state.initialize();
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    state.copySelected();
+    await state.openDirectory(projects.directory!);
+    let releaseListing: (() => void) | undefined;
+    vi.spyOn(data, "listDirectory").mockImplementation(
+      async (directory, options) => {
+        options.onStart({ directory, parent: null, breadcrumbs: [] });
+        await new Promise<void>((resolve) => {
+          releaseListing = resolve;
+        });
+        options.onBatch({ entries: [], replace: true });
+        options.onComplete({ skippedEntries: 0 });
+      },
+    );
+    const paste = state.pasteEntries();
+    const refresh = state.refreshDirectory();
+    await paste;
+    releaseListing!();
+    await refresh;
+    expect(state.entries.map(({ name }) => name)).toContain(notes.name);
+    expect(state.selectedEntries.map(({ name }) => name)).toContain(notes.name);
+    state.dispose();
+  });
+
+  it("leaves navigation alone when a copy completes in a different folder", async () => {
+    let finish: (() => void) | undefined;
+    const data = new DemoExplorerDataSource();
+    const copy = data.copyEntry.bind(data);
+    vi.spyOn(data, "copyEntry").mockImplementation(async (...args) => {
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      return copy(...args);
+    });
+    const state = new ExplorerState(data);
+    await state.initialize();
+    const home = state.activeDirectory!;
+    const notes = state.entries.find(
+      ({ name }) => name === "explora-notes.md",
+    )!;
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    state.selectEntry(notes.reference.id);
+    state.copySelected();
+    await state.openDirectory(projects.directory!);
+    const paste = state.pasteEntries();
+    await state.openDirectory(home);
+    state.selectEntry(notes.reference.id);
+    finish!();
+    await paste;
+    expect(state.activeDirectory?.id).toBe(home.id);
+    expect(state.selectedEntryId).toBe(notes.reference.id);
+    expect(state.clipboardEntries).toHaveLength(1);
+    await state.openDirectory(projects.directory!);
+    expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
+    state.dispose();
+  });
+
+  it("uses copy capabilities independently of move capabilities and rejects offline or self destinations", async () => {
+    const state = await initializedState();
+    const projects = state.entries.find(({ name }) => name === "Projects")!;
+    projects.capabilities.move = false;
+    state.selectEntry(projects.reference.id);
+    expect(state.canCopySelection).toBe(true);
+    expect(state.canCutSelection).toBe(false);
+    state.copySelected();
+    await state.openDirectory(projects.directory!);
+    expect(state.canPasteEntries).toBe(false);
+    state.dispose();
+  });
+
   it("cuts a multi-selection and pastes it through the batch move API", async () => {
     const state = await initializedState();
     const notes = state.entries.find(
@@ -500,17 +716,17 @@ describe("ExplorerState", () => {
     state.selectEntry(image.reference.id, { toggle: true });
 
     state.cutSelected();
-    expect(state.cutEntries.map(({ name }) => name)).toEqual(
+    expect(state.clipboardEntries.map(({ name }) => name)).toEqual(
       expect.arrayContaining([notes.name, image.name]),
     );
-    expect(state.cutEntries).toHaveLength(2);
-    expect(state.canPasteCutEntries).toBe(false);
+    expect(state.clipboardEntries).toHaveLength(2);
+    expect(state.canPasteEntries).toBe(false);
 
     await state.openDirectory(projects.directory!);
-    expect(state.canPasteCutEntries).toBe(true);
-    await state.pasteCutEntries();
+    expect(state.canPasteEntries).toBe(true);
+    await state.pasteEntries();
 
-    expect(state.cutEntries).toEqual([]);
+    expect(state.clipboardEntries).toEqual([]);
     expect(state.entries.some(({ name }) => name === notes.name)).toBe(true);
     expect(state.entries.some(({ name }) => name === image.name)).toBe(true);
     expect(state.fileOperations.errorMessage).toBeNull();
@@ -529,13 +745,13 @@ describe("ExplorerState", () => {
     state.selectEntry(notes.reference.id);
     state.selectEntry(image.reference.id, { toggle: true });
     state.cutSelected();
-    const attempted = [...state.cutEntries];
+    const attempted = [...state.clipboardEntries];
 
     await state.openDirectory(projects.directory!);
-    await state.pasteCutEntries();
+    await state.pasteEntries();
 
-    expect(state.cutEntries).toHaveLength(1);
-    expect(state.cutEntries[0].reference).toEqual(attempted[1].reference);
+    expect(state.clipboardEntries).toHaveLength(1);
+    expect(state.clipboardEntries[0].reference).toEqual(attempted[1].reference);
     expect(state.fileOperations.errorMessage).toContain(
       "1 of 2 items could not be completed",
     );
@@ -908,6 +1124,7 @@ describe("ExplorerState", () => {
       displayPath: "Home/Missing",
       capabilities: {
         createFolder: true,
+        acceptCopy: true,
         acceptMove: true,
         atomicReplace: false,
       },

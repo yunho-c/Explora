@@ -44,6 +44,7 @@ export interface DirectoryRef extends EntryRef {
 
 export interface DirectoryCapabilities {
   createFolder: boolean;
+  acceptCopy: boolean;
   acceptMove: boolean;
   atomicReplace: boolean;
 }
@@ -131,6 +132,7 @@ export type SshPromptResponse =
 
 export interface EntryCapabilities {
   rename: boolean;
+  copy: boolean;
   move: boolean;
   trash: boolean;
   deletePermanently: boolean;
@@ -162,7 +164,7 @@ export type FileOperationPrompt =
     }
   | {
       id: string;
-      kind: "moveConflict";
+      kind: "transferConflict";
       title: string;
       message: string;
       targetName: string;
@@ -196,6 +198,10 @@ export type FileMoveResult =
       name: string;
     };
 
+export type FileCopyResult =
+  | { kind: "copied"; entry: FileEntrySummary; destination: DirectoryRef }
+  | { kind: "copySkipped"; entry: EntryRef; name: string };
+
 export interface FileRemovalResult {
   kind: "trashed" | "deletedPermanently";
   entry: EntryRef;
@@ -208,7 +214,8 @@ export interface FileOperationItemError {
   message: string;
 }
 
-export type FileOperationItemOutcome = FileMoveResult | FileRemovalResult;
+export type FileOperationItemOutcome =
+  FileMoveResult | FileCopyResult | FileRemovalResult;
 
 export type FileOperationBatchItem =
   | {

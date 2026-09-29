@@ -15,7 +15,12 @@ const root: DirectoryRef = {
   locationId: "home",
   name: "Home",
   displayPath: "/Users/test",
-  capabilities: { createFolder: true, acceptMove: true, atomicReplace: false },
+  capabilities: {
+    createFolder: true,
+    acceptCopy: true,
+    acceptMove: true,
+    atomicReplace: false,
+  },
 };
 
 const locationPayload = {
@@ -41,6 +46,7 @@ const entryPayload = {
   detail: null,
   capabilities: {
     rename: true,
+    copy: true,
     moveEntry: true,
     trash: true,
     deletePermanently: true,
@@ -59,6 +65,7 @@ const previewEntry: FileEntrySummary = {
   directory: null,
   capabilities: {
     rename: true,
+    copy: true,
     move: true,
     trash: true,
     deletePermanently: true,
@@ -71,7 +78,12 @@ const destination: DirectoryRef = {
   locationId: "home",
   name: "Archive",
   displayPath: "/Users/test/Archive",
-  capabilities: { createFolder: true, acceptMove: true, atomicReplace: false },
+  capabilities: {
+    createFolder: true,
+    acceptCopy: true,
+    acceptMove: true,
+    atomicReplace: false,
+  },
 };
 
 const sshTargetPayload = {
@@ -109,6 +121,7 @@ const volumePayload = {
     displayPath: "/Volumes/Test Volume",
     capabilities: {
       createFolder: true,
+      acceptCopy: true,
       acceptMove: true,
       atomicReplace: false,
     },
@@ -394,6 +407,130 @@ describe("TauriExplorerDataSource", () => {
     });
   });
 
+  it.each([
+    "valid",
+    "sameIdentity",
+    "wrongDestination",
+    "wrongBackend",
+    "missingCapability",
+  ])(
+    "validates copy protocol identities and capabilities: %s",
+    async (variant) => {
+      mockIPC((command, payload) => {
+        if (command !== "start_file_operation") return null;
+        if (!payload || typeof payload !== "object" || Array.isArray(payload))
+          throw new Error("Expected operation arguments");
+        expect(Reflect.get(payload, "request")).toEqual({
+          sources: [entryPayload.reference],
+          action: { kind: "copy", destination },
+        });
+        sendChannelMessages(Reflect.get(payload, "onEvent"), [
+          {
+            event: "completed",
+            operationId: "copy-test",
+            sequence: 0,
+            action: "copy",
+            completedItems: 1,
+            totalItems: 1,
+            outcome: {
+              kind: "copied",
+              destination: variant === "wrongDestination" ? root : destination,
+              entry: {
+                ...entryPayload,
+                reference:
+                  variant === "sameIdentity"
+                    ? entryPayload.reference
+                    : {
+                        id: "copied-token",
+                        locationId:
+                          variant === "wrongBackend"
+                            ? "forged"
+                            : destination.locationId,
+                      },
+                capabilities:
+                  variant === "missingCapability"
+                    ? { ...entryPayload.capabilities, copy: undefined }
+                    : entryPayload.capabilities,
+              },
+            },
+          },
+        ]);
+        return "copy-test";
+      });
+      const result = new TauriExplorerDataSource().copyEntry(
+        previewEntry,
+        destination,
+        { signal: new AbortController().signal, onPrompt: vi.fn() },
+      );
+      if (variant === "valid")
+        await expect(result).resolves.toMatchObject({
+          kind: "copied",
+          entry: { reference: { id: "copied-token" } },
+        });
+      else await expect(result).rejects.toThrow("Invalid filesystem response");
+    },
+  );
+
+  it("retains completed copies in a cancelled batch and validates source ordering", async () => {
+    const second = {
+      ...previewEntry,
+      reference: { id: "second-source", locationId: "home" },
+    };
+    mockIPC((command, payload) => {
+      if (command !== "start_file_operation") return null;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload))
+        throw new Error("Expected operation arguments");
+      sendChannelMessages(Reflect.get(payload, "onEvent"), [
+        {
+          event: "cancelled",
+          operationId: "copy-batch",
+          sequence: 0,
+          action: "copy",
+          completedItems: 1,
+          totalItems: 2,
+          outcome: {
+            kind: "batch",
+            status: "cancelled",
+            items: [
+              {
+                status: "completed",
+                source: previewEntry.reference,
+                outcome: {
+                  kind: "copied",
+                  destination,
+                  entry: {
+                    ...entryPayload,
+                    reference: {
+                      id: "copy-result",
+                      locationId: destination.locationId,
+                    },
+                  },
+                },
+              },
+              { status: "cancelled", source: second.reference },
+            ],
+          },
+        },
+      ]);
+      return "copy-batch";
+    });
+    const options = { signal: new AbortController().signal, onPrompt: vi.fn() };
+    await expect(
+      new TauriExplorerDataSource().copyEntries(
+        [previewEntry, second],
+        destination,
+        options,
+      ),
+    ).resolves.toMatchObject({ kind: "batch", status: "cancelled" });
+    await expect(
+      new TauriExplorerDataSource().copyEntries(
+        [second, previewEntry],
+        destination,
+        options,
+      ),
+    ).rejects.toThrow("copy source does not match");
+  });
+
   it("moves through the typed operation protocol and validates rebased identities", async () => {
     mockIPC((command, payload) => {
       if (command !== "start_file_operation") return null;
@@ -604,7 +741,7 @@ describe("TauriExplorerDataSource", () => {
               totalItems: 1,
               prompt: {
                 id: "prompt-move",
-                kind: "moveConflict",
+                kind: "transferConflict",
                 title: "“notes.md” already exists",
                 message: "Nothing will be replaced.",
                 targetName: "notes.md",
@@ -673,7 +810,7 @@ describe("TauriExplorerDataSource", () => {
         },
       },
     );
-    await vi.waitFor(() => expect(prompt?.[0].kind).toBe("moveConflict"));
+    await vi.waitFor(() => expect(prompt?.[0].kind).toBe("transferConflict"));
     await prompt?.[1]("keepBoth");
     await expect(move).resolves.toMatchObject({
       kind: "moved",

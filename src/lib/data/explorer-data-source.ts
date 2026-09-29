@@ -4,6 +4,7 @@ import type {
   FileEntrySummary,
   FileOperationBatchResult,
   FileMoveResult,
+  FileCopyResult,
   FileOperationPrompt,
   FileOperationPromptResponse,
   FileRemovalResult,
@@ -124,6 +125,16 @@ export interface ExplorerDataSource {
     newName: string,
     signal: AbortSignal,
   ): Promise<FileEntrySummary>;
+  copyEntry(
+    entry: FileEntrySummary,
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileCopyResult>;
+  copyEntries(
+    entries: readonly FileEntrySummary[],
+    destination: DirectoryRef,
+    options: FileOperationOptions,
+  ): Promise<FileOperationBatchResult>;
   moveEntry(
     entry: FileEntrySummary,
     destination: DirectoryRef,
